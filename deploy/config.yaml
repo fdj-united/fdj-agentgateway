@@ -1,0 +1,101 @@
+frontendPolicies:
+  accessLog:
+    add:
+      mcp.tool: 'mcp.tool.name'
+      mcp.target: 'mcp.tool.target'
+      mcp.session: 'mcp.session.id'
+      user: 'request.headers["X-User-Email"]'
+      status: 'response.status_code'
+
+binds:
+# MCP server 1 — MS365 Teams (stable backend)
+- port: 3001
+  listeners:
+  - routes:
+    - policies:
+        cors:
+          allowOrigins:
+          - http://localhost:3080
+          - "*"
+          allowHeaders:
+          - mcp-protocol-version
+          - content-type
+          - cache-control
+          - authorization
+          exposeHeaders:
+          - Mcp-Session-Id
+        mcpAuthorization:
+          rules:
+          - 'mcp.tool.target == "ms365-teams"'
+      backends:
+      - mcp:
+          targets:
+          - name: ms365-teams
+            mcp:
+              host: https://m365.kindcoast-e367d61d.switzerlandnorth.azurecontainerapps.io/mcp
+            policies:
+              backendTLS:
+                insecure: true
+
+# MCP server 2 — MS365 Dev
+- port: 3002
+  listeners:
+  - routes:
+    - policies:
+        cors:
+          allowOrigins:
+          - http://localhost:3080
+          - "null"
+          allowHeaders:
+          - mcp-protocol-version
+          - content-type
+          - cache-control
+          - authorization
+          exposeHeaders:
+          - Mcp-Session-Id
+        mcpAuthorization:
+          rules:
+          - 'mcp.tool.name in ["get-chat", "list-chat-messages"]'
+        mcpConfirmation:
+          ttlSeconds: 120
+          rules:
+          - 'mcp.tool.name == "get-chat"'
+      backends:
+      - mcp:
+          targets:
+          - name: ms365-dev
+            mcp:
+              host: https://ms365-mcp-dev.kindredgroup.com/mcp
+            policies:
+              backendTLS:
+                insecure: true
+
+
+# MCP server 3 — MS365 Dev
+- port: 3003
+  listeners:
+  - routes:
+    - policies:
+        cors:
+          allowOrigins:
+          - http://localhost:3080
+          - "null"
+          allowHeaders:
+          - mcp-protocol-version
+          - content-type
+          - cache-control
+          - authorization
+          exposeHeaders:
+          - Mcp-Session-Id
+        mcpAuthorization:
+          rules:
+          - 'mcp.tool.name in ["get-chat-message", "upload-file0content"]'
+      backends:
+      - mcp:
+          targets:
+          - name: ms365-prod
+            mcp:
+              host: https://ms365-mcp-dev.kindredgroup.com/mcp
+            policies:
+              backendTLS:
+                insecure: true

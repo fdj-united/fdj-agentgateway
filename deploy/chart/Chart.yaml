@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kait-gateway
+description: Standalone agentgateway deployment - LibreChat to MS365 MCP proxy
+type: application
+version: 0.1.0
+appVersion: "v1.1.0"

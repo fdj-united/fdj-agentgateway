@@ -1,0 +1,34 @@
+configmap:
+  name: agentgateway-config
+  namespace: default
+  cors:
+    allowOrigins: []
+    allowHeaders:
+      - "mcp-protocol-version"
+      - "content-type"
+      - "cache-control"
+      - "authorization"
+    exposeHeaders:
+      - "Mcp-Session-Id"
+  mcpBackends: []
+
+deployment:
+  name: agentgateway
+  namespace: default
+  replicas: 1
+  image: ghcr.io/agentgateway/agentgateway:v1.1.0
+  resources: {}
+
+service:
+  name: agentgateway
+  namespace: default
+  ports:
+    - name: mcp
+      port: 3000
+      targetPort: 3000
+    - name: admin
+      port: 15000
+      targetPort: 15000
+    - name: metrics
+      port: 15020
+      targetPort: 15020
