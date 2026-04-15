@@ -196,6 +196,8 @@ async fn apply_backend_policies(
 		// Applied elsewhere
 		mcp_authorization: _,
 		// Applied elsewhere
+		mcp_confirmation: _,
+		// Applied elsewhere
 		mcp_authentication: _,
 		// Applied elsewhere
 		inference_routing: _,

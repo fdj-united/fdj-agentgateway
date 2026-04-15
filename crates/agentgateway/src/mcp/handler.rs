@@ -7,7 +7,7 @@ use crate::http::sessionpersistence::MCPSession;
 use crate::mcp;
 use crate::mcp::FailureMode;
 use crate::mcp::mergestream::{MergeFn, Messages};
-use crate::mcp::rbac::{CelExecWrapper, McpAuthorizationSet};
+use crate::mcp::rbac::{CelExecWrapper, McpAuthorizationSet, McpConfirmationSet};
 use crate::mcp::router::McpBackendGroup;
 use crate::mcp::streamablehttp::ServerSseMessage;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
@@ -41,17 +41,19 @@ fn resource_name(default_target_name: Option<&String>, target: &str, name: &str)
 pub struct Relay {
 	upstreams: Arc<upstream::UpstreamGroup>,
 	pub policies: McpAuthorizationSet,
+	pub confirmation: McpConfirmationSet,
 }
 
 pub struct RelayInputs {
 	pub backend: McpBackendGroup,
 	pub policies: McpAuthorizationSet,
+	pub confirmation: McpConfirmationSet,
 	pub client: PolicyClient,
 }
 
 impl RelayInputs {
 	pub fn build_new_connections(self) -> Result<Relay, mcp::Error> {
-		Relay::new(self.backend, self.policies, self.client)
+		Relay::new(self.backend, self.policies, self.confirmation, self.client)
 	}
 }
 
@@ -59,17 +61,20 @@ impl Relay {
 	pub fn new(
 		backend: McpBackendGroup,
 		policies: McpAuthorizationSet,
+		confirmation: McpConfirmationSet,
 		client: PolicyClient,
 	) -> Result<Self, mcp::Error> {
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(client, backend)?),
 			policies,
+			confirmation,
 		})
 	}
 	pub fn with_policies(&self, policies: McpAuthorizationSet) -> Self {
 		Self {
 			upstreams: self.upstreams.clone(),
 			policies,
+			confirmation: self.confirmation.clone(),
 		}
 	}
 
@@ -553,7 +558,7 @@ pub fn setup_request_log(
 	(_span, log, cel)
 }
 
-fn messages_to_response(
+pub(crate) fn messages_to_response(
 	id: RequestId,
 	stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,
 	mcp_log: Option<AsyncLog<MCPInfo>>,

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ::cel::Value;
 use ::cel::objects::{KeyRef, MapValue};
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,63 @@ impl CelExecWrapper {
 }
 #[derive(Clone, Debug)]
 pub struct McpAuthorizationSet(RuleSets);
+
+/// Configuration for two-phase tool-call confirmation.
+/// When a tool call matches the CEL rules, the gateway intercepts it, returns a
+/// preview to the LLM, and only forwards the actual call after the user confirms.
+#[apply(schema!)]
+pub struct McpConfirmation {
+	#[serde(flatten)]
+	pub rules: RuleSet,
+	/// Seconds the pending approval stays valid. Defaults to 120.
+	#[serde(rename = "ttlSeconds", default)]
+	pub ttl_seconds: Option<u64>,
+}
+
+impl McpConfirmation {
+	pub fn into_parts(self) -> (RuleSet, Option<u64>) {
+		(self.rules, self.ttl_seconds)
+	}
+}
+
+/// Runtime collection of confirmation rules, built from one or more
+/// [`McpConfirmation`] policy entries.
+#[derive(Clone, Debug)]
+pub struct McpConfirmationSet {
+	rules: RuleSets,
+	/// How long a pending approval remains valid before expiring.
+	pub ttl: Duration,
+}
+
+impl McpConfirmationSet {
+	pub fn new(rules: RuleSets, ttl: Duration) -> Self {
+		Self { rules, ttl }
+	}
+
+	/// Returns `true` when this tool call should go through two-phase confirmation.
+	pub fn requires_confirmation(&self, res: &ResourceType, cel: &CelExecWrapper) -> bool {
+		// Empty rule set → no tools need confirmation.
+		if self.rules.is_empty() {
+			return false;
+		}
+		let mcp = crate::mcp::MCPInfo::from(res);
+		let exec = crate::cel::Executor::new_mcp_request(&cel.0, &mcp);
+		self.rules.validate(&exec)
+	}
+
+	pub fn register(&self, cel: &mut ContextBuilder) {
+		self.rules.register(cel);
+	}
+}
+
+impl Default for McpConfirmationSet {
+	fn default() -> Self {
+		Self {
+			rules: RuleSets::from(Vec::new()),
+			ttl: Duration::from_secs(120),
+		}
+	}
+}
 
 impl McpAuthorizationSet {
 	pub fn new(rs: RuleSets) -> Self {

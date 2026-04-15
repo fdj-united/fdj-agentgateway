@@ -1656,6 +1656,7 @@ fn test_openapi_targets_emit_stateless_session_state() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1704,6 +1705,7 @@ fn test_sse_targets_emit_stateless_session_state() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1749,6 +1751,7 @@ async fn test_stdio_targets_remain_non_stateless() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1772,6 +1775,7 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 			failure_mode: FailureMode::FailOpen,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1805,6 +1809,7 @@ fn test_set_sessions_matches_by_target_name() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1854,6 +1859,7 @@ fn test_set_sessions_rejects_mismatched_target_set() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1898,6 +1904,7 @@ fn test_merge_initialize_merges_upstream_instructions_when_multiplexing() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1972,6 +1979,7 @@ fn test_merge_initialize_no_instructions_when_multiplexing() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -2023,6 +2031,7 @@ fn test_merge_initialize_forwards_single_backend_without_multiplexing() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},

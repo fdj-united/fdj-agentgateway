@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ::http::StatusCode;
 use ::http::header::CONTENT_TYPE;
@@ -10,12 +11,14 @@ use anyhow::anyhow;
 use futures_util::StreamExt;
 use headers::HeaderMapExt;
 use rmcp::model::{
-	ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, Implementation,
-	ProtocolVersion, RequestId, ServerJsonRpcMessage,
+	CallToolResult, ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest,
+	ConstString, Content, Implementation, ProtocolVersion, RequestId, ServerJsonRpcMessage,
+	ServerResult,
 };
 use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
 use sse_stream::{KeepAlive, Sse, SseBody, SseStream};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Mutex;
 
 use crate::http::Response;
 use crate::mcp::handler::{Relay, RelayInputs};
@@ -26,12 +29,37 @@ use crate::mcp::{ClientError, rbac};
 use crate::proxy::ProxyError;
 use crate::{mcp, *};
 
+/// A tool call intercepted by the two-phase confirmation flow.
+/// Stored per-session, keyed by the fully-qualified tool name (e.g. `ms365-teams_send-message`).
+/// Single-use: consumed on Phase 2.
+#[derive(Debug, Clone)]
+struct PendingApproval {
+	expires_at: Instant,
+}
+
+impl PendingApproval {
+	fn new(ttl: std::time::Duration) -> Self {
+		Self {
+			expires_at: Instant::now() + ttl,
+		}
+	}
+
+	fn is_expired(&self) -> bool {
+		Instant::now() > self.expires_at
+	}
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
 	encoder: http::sessionpersistence::Encoder,
 	relay: Arc<Relay>,
 	pub id: Arc<str>,
 	tx: Option<Sender<ServerJsonRpcMessage>>,
+	/// Pending two-phase confirmations, keyed by fully-qualified tool name.
+	/// Arc allows the HashMap to be shared across Session clones (same session, multiple requests).
+	pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+	/// Whether this session was created in stateful mode (confirmation requires statefulness).
+	is_stateful: bool,
 }
 
 impl Session {
@@ -83,6 +111,7 @@ impl Session {
 
 	pub fn with_inputs(mut self, inputs: RelayInputs) -> Self {
 		self.relay = Arc::new(self.relay.with_policies(inputs.policies));
+		// pending_approvals and is_stateful are intentionally preserved across with_inputs calls
 		self
 	}
 
@@ -284,20 +313,80 @@ impl Session {
 						let call_arguments = ctr.params.arguments.clone();
 						log.non_atomic_mutate(|l| {
 							l.set_tool(service_name.to_string(), tool.to_string());
-							l.capture_call_arguments(call_arguments);
+							l.capture_call_arguments(call_arguments.clone());
 						});
-						if !self.relay.policies.validate(
-							&rbac::ResourceType::Tool(rbac::ResourceId::new(
-								service_name.to_string(),
-								tool.to_string(),
-							)),
-							&cel,
-						) {
+						let resource = rbac::ResourceType::Tool(rbac::ResourceId::new(
+							service_name.to_string(),
+							tool.to_string(),
+						));
+						if !self.relay.policies.validate(&resource, &cel) {
 							return Err(UpstreamError::Authorization {
 								resource_type: "tool".to_string(),
 								resource_name: name.to_string(),
 							});
 						}
+
+						// ── Two-phase confirmation ───────────────────────────────
+						if self.is_stateful
+							&& self.relay.confirmation.requires_confirmation(&resource, &cel)
+						{
+							let mut approvals = self.pending_approvals.lock().await;
+							// Use the original qualified name as the key so tools with
+							// the same short name on different services don't collide.
+							let key = name.to_string();
+
+							if let Some(pending) = approvals.get(&key) {
+								if pending.is_expired() {
+									// Expired: remove and fall through to Phase 1
+									approvals.remove(&key);
+								} else {
+									// Phase 2: approval found → consume it and proceed
+									approvals.remove(&key);
+									drop(approvals);
+									let tn = tool.to_string();
+									ctr.params.name = tn.into();
+									return self
+										.relay
+										.send_single(r, ctx, service_name, Some(log.clone()))
+										.await;
+								}
+							}
+
+							// Phase 1: no valid pending approval → intercept and ask for confirmation
+							let preview = build_preview(tool, call_arguments.as_ref());
+							let ttl = self.relay.confirmation.ttl;
+							approvals.insert(key, PendingApproval::new(ttl));
+							drop(approvals);
+
+							let payload = serde_json::json!({
+								"confirmationRequired": true,
+								"preview": preview,
+								"expiresInSeconds": ttl.as_secs(),
+								"instruction": concat!(
+									"STOP. Do NOT re-call this tool automatically. ",
+									"Show the preview above to the user and ask: ",
+									"\"Do you confirm this operation? (yes/no)\". ",
+									"Only re-call this tool with IDENTICAL arguments after the ",
+									"user explicitly replies \"yes\". ",
+									"Do NOT modify the arguments in any way."
+								)
+							});
+							let text = serde_json::to_string_pretty(&payload)
+								.unwrap_or_default();
+							let msg = ServerJsonRpcMessage::response(
+								ServerResult::CallToolResult(CallToolResult::success(vec![
+									Content::text(text),
+								])),
+								r.id.clone(),
+							);
+							use futures_util::stream;
+							return crate::mcp::handler::messages_to_response(
+								r.id,
+								stream::once(async move { Ok(msg) }),
+								None,
+							);
+						}
+						// ── End two-phase confirmation ───────────────────────────
 
 						let tn = tool.to_string();
 						ctr.params.name = tn.into();
@@ -461,6 +550,8 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
 		};
 		let mut sm = self.sessions.write().expect("write lock");
 		sm.insert(id.to_string(), sess.clone());
@@ -477,6 +568,8 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
 		}
 	}
 
@@ -489,6 +582,8 @@ impl SessionManager {
 	/// Unlike create_session, this does NOT register the session in the session manager.
 	/// The caller is responsible for calling session.delete_session() when done
 	/// to clean up upstream resources (e.g., stdio processes).
+	/// NOTE: two-phase confirmation is disabled for stateless sessions because
+	/// the session state is not preserved between requests.
 	pub fn create_stateless_session(&self, relay: Relay) -> Session {
 		let id = session_id();
 		Session {
@@ -496,6 +591,8 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: false,
 		}
 	}
 
@@ -509,6 +606,8 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: Some(tx),
 			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
 		};
 		let mut sm = self.sessions.write().expect("write lock");
 		sm.insert(id.to_string(), sess.clone());
@@ -604,6 +703,26 @@ impl sse_stream::Timer for TokioSseTimer {
 		let this = self.project();
 		this.sleep.reset(tokio::time::Instant::from_std(when));
 	}
+}
+
+/// Build a human-readable preview string for the confirmation prompt.
+fn build_preview(
+	tool_name: &str,
+	args: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> String {
+	let mut lines = vec![format!("Tool: {tool_name}")];
+	if let Some(map) = args {
+		for (k, v) in map {
+			let display = match v {
+				serde_json::Value::String(s) if s.len() > 200 => {
+					format!("{}…", &s[..200])
+				},
+				other => other.to_string(),
+			};
+			lines.push(format!("  {k}: {display}"));
+		}
+	}
+	lines.join("\n")
 }
 
 fn get_client_info() -> ClientInfo {

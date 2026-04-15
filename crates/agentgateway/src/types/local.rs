@@ -17,7 +17,7 @@ use crate::llm::policy::PromptGuard;
 use crate::llm::{AIBackend, AIProvider, LocalModelAIProvider, NamedAIProvider};
 use crate::llm::{anthropic, openai};
 use crate::mcp::FailureMode;
-use crate::mcp::McpAuthorization;
+use crate::mcp::{McpAuthorization, McpConfirmation};
 use crate::store::LocalWorkload;
 use crate::types::agent::{
 	A2aPolicy, Authorization, Backend, BackendKey, BackendPolicy, BackendReference,
@@ -664,6 +664,7 @@ impl LocalBackend {
 			.map(|p| LocalBackendPolicies {
 				simple: p.simple,
 				mcp_authorization: p.mcp_authorization,
+				mcp_confirmation: p.mcp_confirmation,
 				a2a: None,
 				ai: None,
 			})
@@ -1114,6 +1115,10 @@ pub struct MCPLocalBackendPolicies {
 	/// Authorization policies for MCP access.
 	#[serde(default)]
 	pub mcp_authorization: Option<McpAuthorization>,
+	/// Two-phase confirmation policy: tools matching the CEL rules require user
+	/// confirmation before the gateway forwards the call upstream.
+	#[serde(default)]
+	pub mcp_confirmation: Option<McpConfirmation>,
 }
 
 #[apply(schema_de!)]
@@ -1125,6 +1130,10 @@ pub struct LocalBackendPolicies {
 	/// Authorization policies for MCP access.
 	#[serde(default)]
 	pub mcp_authorization: Option<McpAuthorization>,
+	/// Two-phase confirmation policy: tools matching the CEL rules require user
+	/// confirmation before the gateway forwards the call upstream.
+	#[serde(default)]
+	pub mcp_confirmation: Option<McpConfirmation>,
 	/// Mark this traffic as A2A to enable A2A processing and telemetry.
 	#[serde(default)]
 	pub a2a: Option<A2aPolicy>,
@@ -1150,6 +1159,7 @@ impl LocalBackendPolicies {
 					backend_tunnel,
 				},
 			mcp_authorization,
+			mcp_confirmation,
 			a2a,
 			ai,
 		} = self;
@@ -1177,6 +1187,9 @@ impl LocalBackendPolicies {
 		}
 		if let Some(p) = mcp_authorization {
 			pols.push(BackendPolicy::McpAuthorization(p))
+		}
+		if let Some(p) = mcp_confirmation {
+			pols.push(BackendPolicy::McpConfirmation(p))
 		}
 		if let Some(p) = a2a {
 			pols.push(BackendPolicy::A2a(p))
@@ -1286,6 +1299,9 @@ pub struct FilterOrPolicy {
 	/// Authorization policies for MCP access.
 	#[serde(default)]
 	mcp_authorization: Option<McpAuthorization>,
+	/// Two-phase confirmation policy for MCP tool calls.
+	#[serde(default)]
+	mcp_confirmation: Option<McpConfirmation>,
 	/// Authorization policies for HTTP access.
 	#[serde(default)]
 	authorization: Option<Authorization>,
@@ -2420,6 +2436,7 @@ pub(crate) async fn split_policies(
 		direct_response,
 		cors,
 		mcp_authorization,
+		mcp_confirmation,
 		mcp_authentication,
 		a2a,
 		ai,
@@ -2467,6 +2484,9 @@ pub(crate) async fn split_policies(
 	// Backend policies
 	if let Some(p) = mcp_authorization {
 		backend_policies.push(BackendPolicy::McpAuthorization(p))
+	}
+	if let Some(p) = mcp_confirmation {
+		backend_policies.push(BackendPolicy::McpConfirmation(p))
 	}
 	if let Some(p) = mcp_authentication {
 		let authn: McpAuthentication = p.translate(client.clone()).await?;
