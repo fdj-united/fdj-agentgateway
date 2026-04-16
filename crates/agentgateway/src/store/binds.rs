@@ -10,7 +10,7 @@ use crate::http::ext_proc::InferenceRouting;
 use crate::http::oidc;
 use crate::http::{ext_authz, ext_proc, filters, health, remoteratelimit, retry, timeout};
 use crate::llm::policy::ResponseGuard;
-use crate::mcp::{McpAuthorizationSet, McpConfirmationSet};
+use crate::mcp::{McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{
 	A2aPolicy, Backend, BackendKey, BackendPolicy, BackendTargetRef, BackendWithPolicies, Bind,
@@ -151,6 +151,7 @@ pub struct BackendPolicies {
 
 	pub mcp_authorization: Option<McpAuthorizationSet>,
 	pub mcp_confirmation: Option<McpConfirmationSet>,
+	pub mcp_rate_limit: Option<McpRateLimitSet>,
 	pub mcp_authentication: Option<McpAuthentication>,
 
 	pub http: Option<types::backend::HTTP>,
@@ -185,6 +186,7 @@ impl BackendPolicies {
 			// TODO: is this right??
 			mcp_authorization: other.mcp_authorization.or(self.mcp_authorization),
 			mcp_confirmation: other.mcp_confirmation.or(self.mcp_confirmation),
+			mcp_rate_limit: other.mcp_rate_limit.or(self.mcp_rate_limit),
 			mcp_authentication: other.mcp_authentication.or(self.mcp_authentication),
 			inference_routing: other.inference_routing.or(self.inference_routing),
 			http: other.http.or(self.http),
@@ -738,6 +740,8 @@ impl Store {
 		let mut mcp_authz = Vec::new();
 		// (rule_set, ttl_seconds) pairs collected before building McpConfirmationSet
 		let mut mcp_confirm: Vec<(crate::http::authorization::RuleSet, Option<u64>)> = Vec::new();
+		// (rule_set, max_calls, window_seconds) triples for McpRateLimitSet
+		let mut mcp_rate: Vec<(crate::http::authorization::RuleSet, u32, u64)> = Vec::new();
 		let mut pol = BackendPolicies::default();
 		for rule in rules {
 			match &rule {
@@ -801,6 +805,10 @@ impl Store {
 					let (rs, ttl) = p.clone().into_parts();
 					mcp_confirm.push((rs, ttl));
 				},
+				BackendPolicy::McpRateLimit(p) => {
+					let (rs, max_calls, window_seconds) = p.clone().into_parts();
+					mcp_rate.push((rs, max_calls, window_seconds));
+				},
 				BackendPolicy::McpAuthentication(p) => {
 					pol.mcp_authentication.get_or_insert_with(|| p.clone());
 				},
@@ -808,6 +816,17 @@ impl Store {
 		}
 		if !mcp_authz.is_empty() {
 			pol.mcp_authorization = Some(McpAuthorizationSet::new(mcp_authz.into()));
+		}
+		if !mcp_rate.is_empty() {
+			// Use the first explicitly set values; these don't merge meaningfully.
+			let max_calls = mcp_rate[0].1;
+			let window_secs = mcp_rate[0].2;
+			let rule_sets: Vec<_> = mcp_rate.into_iter().map(|(rs, _, _)| rs).collect();
+			pol.mcp_rate_limit = Some(McpRateLimitSet::new(
+				rule_sets.into(),
+				max_calls,
+				std::time::Duration::from_secs(window_secs),
+			));
 		}
 		if !mcp_confirm.is_empty() {
 			// Use the first explicitly set TTL; fall back to the default (120s).

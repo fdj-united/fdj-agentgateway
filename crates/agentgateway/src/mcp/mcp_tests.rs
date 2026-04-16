@@ -1657,6 +1657,7 @@ fn test_openapi_targets_emit_stateless_session_state() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1706,6 +1707,7 @@ fn test_sse_targets_emit_stateless_session_state() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1752,6 +1754,7 @@ async fn test_stdio_targets_remain_non_stateless() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1776,6 +1779,7 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1810,6 +1814,7 @@ fn test_set_sessions_matches_by_target_name() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1860,6 +1865,7 @@ fn test_set_sessions_rejects_mismatched_target_set() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1905,6 +1911,7 @@ fn test_merge_initialize_merges_upstream_instructions_when_multiplexing() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1980,6 +1987,7 @@ fn test_merge_initialize_no_instructions_when_multiplexing() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -2032,6 +2040,7 @@ fn test_merge_initialize_forwards_single_backend_without_multiplexing() {
 		},
 		empty_mcp_policies(),
 		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},

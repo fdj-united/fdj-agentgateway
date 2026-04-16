@@ -80,6 +80,65 @@ impl McpConfirmationSet {
 	}
 }
 
+/// Configuration for per-session tool-call rate limiting.
+/// Tools matching the CEL rules are counted per session; once `max_calls` is
+/// reached within `window_seconds` the gateway returns an error response.
+#[apply(schema!)]
+pub struct McpRateLimit {
+	#[serde(flatten)]
+	pub rules: RuleSet,
+	/// Maximum number of matching tool calls allowed within the window.
+	#[serde(rename = "maxCalls")]
+	pub max_calls: u32,
+	/// Duration of the sliding window in seconds.
+	#[serde(rename = "windowSeconds")]
+	pub window_seconds: u64,
+}
+
+impl McpRateLimit {
+	pub fn into_parts(self) -> (RuleSet, u32, u64) {
+		(self.rules, self.max_calls, self.window_seconds)
+	}
+}
+
+/// Runtime rate-limit policy, built from one or more [`McpRateLimit`] entries.
+#[derive(Clone, Debug)]
+pub struct McpRateLimitSet {
+	rules: RuleSets,
+	pub max_calls: u32,
+	pub window: Duration,
+}
+
+impl McpRateLimitSet {
+	pub fn new(rules: RuleSets, max_calls: u32, window: Duration) -> Self {
+		Self { rules, max_calls, window }
+	}
+
+	/// Returns `true` when this tool call should be counted against the rate limit.
+	pub fn is_limited(&self, res: &ResourceType, cel: &CelExecWrapper) -> bool {
+		if self.rules.is_empty() {
+			return false;
+		}
+		let mcp = crate::mcp::MCPInfo::from(res);
+		let exec = crate::cel::Executor::new_mcp_request(&cel.0, &mcp);
+		self.rules.validate(&exec)
+	}
+
+	pub fn register(&self, cel: &mut ContextBuilder) {
+		self.rules.register(cel);
+	}
+}
+
+impl Default for McpRateLimitSet {
+	fn default() -> Self {
+		Self {
+			rules: RuleSets::from(Vec::new()),
+			max_calls: u32::MAX,
+			window: Duration::from_secs(60),
+		}
+	}
+}
+
 impl Default for McpConfirmationSet {
 	fn default() -> Self {
 		Self {

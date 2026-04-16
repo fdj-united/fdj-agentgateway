@@ -111,6 +111,9 @@ impl App {
 		let confirmation_policies = backend_policies
 			.mcp_confirmation
 			.unwrap_or_default();
+		let rate_limit_policies = backend_policies
+			.mcp_rate_limit
+			.unwrap_or_default();
 		let authn = backend_policies.mcp_authentication;
 
 		// Store an empty value, we will populate each field async
@@ -122,6 +125,7 @@ impl App {
 
 		authorization_policies.register(log.cel.ctx());
 		confirmation_policies.register(log.cel.ctx());
+		rate_limit_policies.register(log.cel.ctx());
 		log.cel.ctx().maybe_buffer_request_body(&mut req).await;
 
 		// `response` is not valid here, since we run authz first
@@ -146,6 +150,7 @@ impl App {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
 					confirmation: confirmation_policies.clone(),
+					rate_limit: rate_limit_policies.clone(),
 					client: client.clone(),
 				},
 			))
@@ -163,6 +168,7 @@ impl App {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
 					confirmation: confirmation_policies.clone(),
+					rate_limit: rate_limit_policies.clone(),
 					client: client.clone(),
 				},
 			))

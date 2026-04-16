@@ -17,7 +17,7 @@ use crate::llm::policy::PromptGuard;
 use crate::llm::{AIBackend, AIProvider, LocalModelAIProvider, NamedAIProvider};
 use crate::llm::{anthropic, openai};
 use crate::mcp::FailureMode;
-use crate::mcp::{McpAuthorization, McpConfirmation};
+use crate::mcp::{McpAuthorization, McpConfirmation, McpRateLimit};
 use crate::store::LocalWorkload;
 use crate::types::agent::{
 	A2aPolicy, Authorization, Backend, BackendKey, BackendPolicy, BackendReference,
@@ -665,6 +665,7 @@ impl LocalBackend {
 				simple: p.simple,
 				mcp_authorization: p.mcp_authorization,
 				mcp_confirmation: p.mcp_confirmation,
+				mcp_rate_limit: p.mcp_rate_limit,
 				a2a: None,
 				ai: None,
 			})
@@ -1119,6 +1120,9 @@ pub struct MCPLocalBackendPolicies {
 	/// confirmation before the gateway forwards the call upstream.
 	#[serde(default)]
 	pub mcp_confirmation: Option<McpConfirmation>,
+	/// Per-session rate limit for MCP tool calls.
+	#[serde(default)]
+	pub mcp_rate_limit: Option<McpRateLimit>,
 }
 
 #[apply(schema_de!)]
@@ -1134,6 +1138,9 @@ pub struct LocalBackendPolicies {
 	/// confirmation before the gateway forwards the call upstream.
 	#[serde(default)]
 	pub mcp_confirmation: Option<McpConfirmation>,
+	/// Per-session rate limit for MCP tool calls.
+	#[serde(default)]
+	pub mcp_rate_limit: Option<McpRateLimit>,
 	/// Mark this traffic as A2A to enable A2A processing and telemetry.
 	#[serde(default)]
 	pub a2a: Option<A2aPolicy>,
@@ -1160,6 +1167,7 @@ impl LocalBackendPolicies {
 				},
 			mcp_authorization,
 			mcp_confirmation,
+			mcp_rate_limit,
 			a2a,
 			ai,
 		} = self;
@@ -1190,6 +1198,9 @@ impl LocalBackendPolicies {
 		}
 		if let Some(p) = mcp_confirmation {
 			pols.push(BackendPolicy::McpConfirmation(p))
+		}
+		if let Some(p) = mcp_rate_limit {
+			pols.push(BackendPolicy::McpRateLimit(p))
 		}
 		if let Some(p) = a2a {
 			pols.push(BackendPolicy::A2a(p))
@@ -1302,6 +1313,9 @@ pub struct FilterOrPolicy {
 	/// Two-phase confirmation policy for MCP tool calls.
 	#[serde(default)]
 	mcp_confirmation: Option<McpConfirmation>,
+	/// Per-session rate limit for MCP tool calls.
+	#[serde(default)]
+	mcp_rate_limit: Option<McpRateLimit>,
 	/// Authorization policies for HTTP access.
 	#[serde(default)]
 	authorization: Option<Authorization>,
@@ -2437,6 +2451,7 @@ pub(crate) async fn split_policies(
 		cors,
 		mcp_authorization,
 		mcp_confirmation,
+		mcp_rate_limit,
 		mcp_authentication,
 		a2a,
 		ai,
@@ -2487,6 +2502,9 @@ pub(crate) async fn split_policies(
 	}
 	if let Some(p) = mcp_confirmation {
 		backend_policies.push(BackendPolicy::McpConfirmation(p))
+	}
+	if let Some(p) = mcp_rate_limit {
+		backend_policies.push(BackendPolicy::McpRateLimit(p))
 	}
 	if let Some(p) = mcp_authentication {
 		let authn: McpAuthentication = p.translate(client.clone()).await?;

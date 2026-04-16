@@ -60,6 +60,11 @@ binds:
           ttlSeconds: 120
           rules:
           - 'mcp.tool.name == "get-chat"'
+        mcpRateLimit:
+          maxCalls: 5
+          windowSeconds: 60
+          rules:
+          - 'mcp.tool.name in ["get-chat", "list-chat-messages"]'
       backends:
       - mcp:
           targets:
@@ -71,7 +76,10 @@ binds:
                 insecure: true
 
 
-# MCP server 3 — MS365 Dev
+# MCP server 3 — Atlassian Cloud (Confluence)
+# No mcpAuthentication: the gateway transparently proxies Atlassian's OAuth
+# flow (well-known endpoints, 401 challenges) so LibreChat can authenticate
+# directly with Atlassian's authorization server.
 - port: 3003
   listeners:
   - routes:
@@ -79,7 +87,7 @@ binds:
         cors:
           allowOrigins:
           - http://localhost:3080
-          - "null"
+          - "*"
           allowHeaders:
           - mcp-protocol-version
           - content-type
@@ -89,13 +97,13 @@ binds:
           - Mcp-Session-Id
         mcpAuthorization:
           rules:
-          - 'mcp.tool.name in ["get-chat-message", "upload-file0content"]'
+          - 'mcp.tool.name in ["createConfluenceFooterComment", "createConfluenceInlineComment", "createConfluencePage", "getConfluencePage", "getConfluencePageDescendants", "getConfluencePageFooterComments", "getConfluencePageInlineComments", "getConfluenceSpaces", "getPagesInConfluenceSpace", "searchConfluenceUsingCql", "updateConfluencePage"]'
       backends:
       - mcp:
           targets:
-          - name: ms365-prod
+          - name: atlassian
             mcp:
-              host: https://ms365-mcp-dev.kindredgroup.com/mcp
+              host: https://mcp.atlassian.com/v1/mcp
             policies:
               backendTLS:
                 insecure: true

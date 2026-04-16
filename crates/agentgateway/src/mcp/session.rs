@@ -29,6 +29,31 @@ use crate::mcp::{ClientError, rbac};
 use crate::proxy::ProxyError;
 use crate::{mcp, *};
 
+/// Per-tool call counter for the rate limit window.
+#[derive(Debug, Clone)]
+struct RateLimitEntry {
+	count: u32,
+	window_started_at: Instant,
+}
+
+impl RateLimitEntry {
+	fn new() -> Self {
+		Self { count: 1, window_started_at: Instant::now() }
+	}
+
+	/// Returns whether the window has expired and resets it if so.
+	/// Returns the current count (after incrementing if still in window).
+	fn increment_or_reset(&mut self, window: std::time::Duration) -> u32 {
+		if Instant::now().duration_since(self.window_started_at) >= window {
+			self.count = 1;
+			self.window_started_at = Instant::now();
+		} else {
+			self.count += 1;
+		}
+		self.count
+	}
+}
+
 /// A tool call intercepted by the two-phase confirmation flow.
 /// Stored per-session, keyed by the fully-qualified tool name (e.g. `ms365-teams_send-message`).
 /// Single-use: consumed on Phase 2.
@@ -58,6 +83,8 @@ pub struct Session {
 	/// Pending two-phase confirmations, keyed by fully-qualified tool name.
 	/// Arc allows the HashMap to be shared across Session clones (same session, multiple requests).
 	pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+	/// Per-tool call counters for rate limiting, keyed by fully-qualified tool name.
+	tool_call_counts: Arc<Mutex<HashMap<String, RateLimitEntry>>>,
 	/// Whether this session was created in stateful mode (confirmation requires statefulness).
 	is_stateful: bool,
 }
@@ -326,6 +353,46 @@ impl Session {
 							});
 						}
 
+						// ── Per-session rate limit ───────────────────────────────
+						if self.is_stateful
+							&& self.relay.rate_limit.is_limited(&resource, &cel)
+						{
+							let mut counts = self.tool_call_counts.lock().await;
+							let count = counts
+								.entry(name.to_string())
+								.or_insert_with(RateLimitEntry::new)
+								.increment_or_reset(self.relay.rate_limit.window);
+
+							if count > self.relay.rate_limit.max_calls {
+								drop(counts);
+								let payload = serde_json::json!({
+									"error": "rate_limit_exceeded",
+									"message": format!(
+										"Tool '{}' has been called {} times within the {}s window. Maximum allowed: {}.",
+										tool,
+										count,
+										self.relay.rate_limit.window.as_secs(),
+										self.relay.rate_limit.max_calls,
+									)
+								});
+								let text = serde_json::to_string_pretty(&payload)
+									.unwrap_or_default();
+								let msg = ServerJsonRpcMessage::response(
+									ServerResult::CallToolResult(CallToolResult::success(vec![
+										Content::text(text),
+									])),
+									r.id.clone(),
+								);
+								use futures_util::stream;
+								return crate::mcp::handler::messages_to_response(
+									r.id,
+									stream::once(async move { Ok(msg) }),
+									None,
+								);
+							}
+						}
+						// ── End rate limit ───────────────────────────────────────
+
 						// ── Two-phase confirmation ───────────────────────────────
 						if self.is_stateful
 							&& self.relay.confirmation.requires_confirmation(&resource, &cel)
@@ -551,6 +618,7 @@ impl SessionManager {
 			tx: None,
 			encoder: self.encoder.clone(),
 			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
 			is_stateful: true,
 		};
 		let mut sm = self.sessions.write().expect("write lock");
@@ -569,6 +637,7 @@ impl SessionManager {
 			tx: None,
 			encoder: self.encoder.clone(),
 			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
 			is_stateful: true,
 		}
 	}
@@ -592,6 +661,7 @@ impl SessionManager {
 			tx: None,
 			encoder: self.encoder.clone(),
 			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
 			is_stateful: false,
 		}
 	}
@@ -607,6 +677,7 @@ impl SessionManager {
 			tx: Some(tx),
 			encoder: self.encoder.clone(),
 			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
 			is_stateful: true,
 		};
 		let mut sm = self.sessions.write().expect("write lock");
