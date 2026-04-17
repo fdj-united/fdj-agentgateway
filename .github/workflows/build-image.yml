@@ -1,0 +1,47 @@
+name: Build & Push Image (linux/amd64 only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. 1.1.0-fdj.1)'
+        required: true
+        type: string
+
+env:
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/agentgateway
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push
+      uses: docker/build-push-action@v6
+      with:
+        push: true
+        platforms: linux/amd64
+        tags: |
+          ${{ env.REGISTRY_IMAGE }}:v${{ inputs.version }}
+          ${{ env.REGISTRY_IMAGE }}:latest
+        build-args: |
+          VERSION=${{ inputs.version }}
+          GIT_REVISION=${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
