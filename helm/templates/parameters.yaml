@@ -1,0 +1,27 @@
+{{- if and .Values.image.registry .Values.image.repository }}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayParameters
+metadata:
+  name: custom-proxy-image
+  namespace: {{ .Values.gateway.namespace }}
+spec:
+  image:
+    registry: {{ .Values.image.registry }}
+    repository: {{ .Values.image.repository }}
+    {{- if .Values.image.tag }}
+    tag: {{ .Values.image.tag }}
+    {{- end }}
+    pullPolicy: {{ .Values.image.pullPolicy }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.gateway.gatewayClassName }}
+spec:
+  controllerName: agentgateway.dev/agentgateway
+  parametersRef:
+    group: agentgateway.dev
+    kind: AgentgatewayParameters
+    name: custom-proxy-image
+    namespace: {{ .Values.gateway.namespace }}
+{{- end }}

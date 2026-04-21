@@ -1,0 +1,6 @@
+apiVersion: v2
+name: agentgateway
+description: Agentgateway deployment using Kubernetes Gateway API CRDs
+type: application
+version: 0.0.1
+appVersion: "v1.1.0"
