@@ -31,7 +31,7 @@ def extractCleanVersion() {
     }
 
     // No tags found — fall back to version from Chart.yaml
-    def chartVersion = sh(script: "grep '^version:' deploy-k8s/helm/Chart.yaml | awk '{print \$2}'", returnStdout: true).trim()
+    def chartVersion = sh(script: "grep '^version:' helm/Chart.yaml | awk '{print \$2}'", returnStdout: true).trim()
     if (chartVersion) {
         return chartVersion
     }
@@ -58,7 +58,7 @@ genericPod([
         version = extractCleanVersion()
 
         // Read the Docker image reference from image.properties
-        def props = readProperties file: 'deploy-k8s/image.properties'
+        def props = readProperties file: 'image.properties'
         imageRegistry = props.IMAGE_REGISTRY
         imageRepository = props.IMAGE_REPOSITORY
         imageTag = props.IMAGE_TAG
@@ -80,12 +80,12 @@ genericPod([
 
             // Bake the Docker image reference into values.yaml before packaging
             sh """
-                sed -i 's|^  registry:.*|  registry: ${imageRegistry}|' deploy-k8s/helm/values.yaml
-                sed -i 's|^  repository:.*|  repository: ${imageRepository}|' deploy-k8s/helm/values.yaml
-                sed -i 's|^  tag:.*|  tag: ${imageTag}|' deploy-k8s/helm/values.yaml
+                sed -i 's|^  registry:.*|  registry: ${imageRegistry}|' helm/values.yaml
+                sed -i 's|^  repository:.*|  repository: ${imageRepository}|' helm/values.yaml
+                sed -i 's|^  tag:.*|  tag: ${imageTag}|' helm/values.yaml
             """
 
-            sh "helm package --app-version ${version} --version ${version} deploy-k8s/helm"
+            sh "helm package --app-version ${version} --version ${version} helm"
 
             withCredentials([usernamePassword(
                 credentialsId: 'artifactory-helm-deploy',
