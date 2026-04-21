@@ -1,34 +1,42 @@
 @Library('jenkins-shared-library')_
 
-// Helper to extract clean version from the git describe
-static String extractCleanVersion(script) {
-    if (script.env.VERSION?.trim()) {
-        return script.env.VERSION.trim()
+// Helper to extract clean version from git describe
+def extractCleanVersion() {
+    if (env.VERSION?.trim()) {
+        return env.VERSION.trim()
     }
 
-    def gitVersion = script.sh(script: "git describe --tags --always", returnStdout: true).trim()
+    def gitVersion = sh(script: "git describe --tags --always", returnStdout: true).trim()
 
-    def matcher = gitVersion =~ /^.*?(\d+)\.(\d+)\.(\d+)(?:-(\d+))?(?:-g[0-9a-f]+)?$/
+    // Try to parse semver from git describe output (e.g. v0.0.1-3-gabcdef)
+    def version = sh(
+        script: """
+            echo '${gitVersion}' | sed -n 's/^.*\\([0-9]\\+\\)\\.\\([0-9]\\+\\)\\.\\([0-9]\\+\\)\\(-\\([0-9]\\+\\)\\)\\?.*\$/\\1.\\2.\\3.\\5/p'
+        """,
+        returnStdout: true
+    ).trim()
 
-    if (matcher.matches()) {
-        def major = matcher.group(1).toInteger()
-        def minor = matcher.group(2).toInteger()
-        def patch = matcher.group(3).toInteger()
-        def commitsAfterTag = matcher.group(4)
+    if (version) {
+        def parts = version.tokenize('.')
+        def major = parts[0]
+        def minor = parts[1]
+        def patch = parts[2].toInteger()
+        def commitsAfter = parts.size() > 3 ? parts[3] : ''
 
-        if (commitsAfterTag) {
+        if (commitsAfter) {
             patch = patch + 1
         }
 
         return "${major}.${minor}.${patch}"
     }
 
-    def fallback = gitVersion =~ /(\d+\.\d+\.\d+)/
-    if (fallback.find()) {
-        return fallback.group(1)
+    // No tags found — fall back to version from Chart.yaml
+    def chartVersion = sh(script: "grep '^version:' deploy-k8s/helm/Chart.yaml | awk '{print \$2}'", returnStdout: true).trim()
+    if (chartVersion) {
+        return chartVersion
     }
 
-    return "0.0.0"
+    return "0.0.1"
 }
 
 genericPod([
@@ -47,7 +55,7 @@ genericPod([
             extensions: scm.extensions + [[$class: 'CloneOption', noTags: false, shallow: false]],
             userRemoteConfigs: scm.userRemoteConfigs
         ])
-        version = extractCleanVersion(this)
+        version = extractCleanVersion()
 
         // Read the Docker image reference from image.properties
         def props = readProperties file: 'deploy-k8s/image.properties'
@@ -72,23 +80,34 @@ genericPod([
 
             // Bake the Docker image reference into values.yaml before packaging
             sh """
-                sed -i 's|^  registry:.*|  registry: ${imageRegistry}|' helm/values.yaml
-                sed -i 's|^  repository:.*|  repository: ${imageRepository}|' helm/values.yaml
-                sed -i 's|^  tag:.*|  tag: ${imageTag}|' helm/values.yaml
+                sed -i 's|^  registry:.*|  registry: ${imageRegistry}|' deploy-k8s/helm/values.yaml
+                sed -i 's|^  repository:.*|  repository: ${imageRepository}|' deploy-k8s/helm/values.yaml
+                sed -i 's|^  tag:.*|  tag: ${imageTag}|' deploy-k8s/helm/values.yaml
             """
 
-            sh "helm package --app-version ${version} --version ${version} helm"
+            sh "helm package --app-version ${version} --version ${version} deploy-k8s/helm"
 
             withCredentials([usernamePassword(
                 credentialsId: 'artifactory-helm-deploy',
                 usernameVariable: 'HELM_USER',
                 passwordVariable: 'HELM_PASSWORD'
             )]) {
-                sh """
-                    curl -f -u \${HELM_USER}:\${HELM_PASSWORD} \
-                         -T ${chartName}-${version}.tgz \
-                         'https://jfrog.kindredgroup.com/artifactory/charts-dev/${chartName}-${version}.tgz'
-                """
+                def uploadStatus = sh(
+                    script: """
+                        curl -s -o /dev/null -w '%{http_code}' -u \${HELM_USER}:\${HELM_PASSWORD} \
+                             -T ${chartName}-${version}.tgz \
+                             'https://jfrog.kindredgroup.com/artifactory/charts-dev/${chartName}-${version}.tgz'
+                    """,
+                    returnStdout: true
+                ).trim()
+
+                if (uploadStatus == '201' || uploadStatus == '200') {
+                    echo "Chart uploaded successfully (${uploadStatus})"
+                } else if (uploadStatus == '409') {
+                    echo "Chart version ${version} already exists in JFrog — skipping upload"
+                } else {
+                    error "Chart upload failed with HTTP ${uploadStatus}"
+                }
             }
 
             sh "rm -f ${chartName}-${version}.tgz"
