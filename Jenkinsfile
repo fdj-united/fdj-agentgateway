@@ -43,10 +43,12 @@ genericPod([
     "docker": "jfrog.kindredgroup.com/docker/docker:latest"
 ]) {
     def version
-    def chartName = "agentgateway"
+    def chartName = "kindred-mcp-gateway"
     def imageRegistry
     def imageRepository
     def imageTag
+    def jfrogRegistry = "jfrog.kindredgroup.com/docker-dev"
+    def jfrogRepositoryPrefix = "kindred/aie"
 
     stage('Checkout') {
         checkout([
@@ -65,10 +67,42 @@ genericPod([
 
         echo "==================================="
         echo "Chart version: ${version}"
-        echo "Docker image: ${imageRegistry}/${imageRepository}:${imageTag}"
+        echo "Source image:  ${imageRegistry}/${imageRepository}:${imageTag}"
         echo "==================================="
 
         env.VERSION = version
+    }
+
+    stage('Push Docker Image') {
+        container('docker') {
+            // Derive the image name from the source repository (e.g. "fdj-united/agentgateway" -> "agentgateway")
+            def imageName = imageRepository.tokenize('/').last()
+            def sourceImage = "${imageRegistry}/${imageRepository}:${imageTag}"
+            def targetRepository = "${jfrogRepositoryPrefix}/${imageName}"
+            def targetImage = "${jfrogRegistry}/${targetRepository}:${imageTag}"
+
+            echo "Mirroring image:"
+            echo "  source: ${sourceImage}"
+            echo "  target: ${targetImage}"
+
+            sh "docker pull ${sourceImage}"
+            sh "docker tag ${sourceImage} ${targetImage}"
+
+            docker.withRegistry("https://${jfrogRegistry}", 'artifactory-docker-deploy') {
+                def image = docker.image(targetImage)
+                image.push(imageTag)
+                if (env.BRANCH_NAME == 'master') {
+                    image.push('latest')
+                    echo "Also pushed: ${jfrogRegistry}/${targetRepository}:latest"
+                }
+            }
+
+            // Repoint the chart at the JFrog copy so the packaged values.yaml uses the mirrored image
+            imageRegistry = jfrogRegistry
+            imageRepository = targetRepository
+
+            echo "Chart will reference: ${imageRegistry}/${imageRepository}:${imageTag}"
+        }
     }
 
     stage('Helm Package And Publish') {
@@ -85,7 +119,11 @@ genericPod([
                 sed -i 's|^  tag:.*|  tag: ${imageTag}|' helm/values.yaml
             """
 
-            sh "helm package --app-version ${version} --version ${version} helm"
+            // Fetch subchart dependencies (e.g. the upstream agentgateway control plane)
+            // and vendor them into helm/charts/ so the published .tgz is self-contained.
+            sh "helm dependency update helm"
+
+            sh "helm package --app-version ${imageTag} --version ${version} helm"
 
             withCredentials([usernamePassword(
                 credentialsId: 'artifactory-helm-deploy',
@@ -125,7 +163,7 @@ genericPod([
                     git config user.email "dummy.robobuild@kindredgroup.com"
                     git config user.name "Robo creating releases"
                     git tag -a v${version} -m "Release v${version}" || echo "Tag v${version} already exists, skipping"
-                    git push https://\${GIT_USER}:\${GIT_PASSWORD}@bitbucket.kindredgroup.com/bitbucket/scm/mcp/agentgateway.git v${version} || echo "Tag already pushed"
+                    git push https://\${GIT_USER}:\${GIT_PASSWORD}@bitbucket.kindredgroup.com/bitbucket/scm/mcp/kindred-mcp-gateway.git v${version} || echo "Tag already pushed"
                 """
             }
         } else {
