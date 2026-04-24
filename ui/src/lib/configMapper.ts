@@ -120,7 +120,9 @@ function mapToListener(
   a2aPolicyTargets: A2aPolicyTarget[]
 ): Listener {
   return {
-    name: listenerData.name,
+    // xDS/config_dump emits the listener name under `listenerName`; local
+    // configs flatten it into `name`. Prefer `listenerName`, fall back to `name`.
+    name: listenerData.listenerName || listenerData.name,
     hostname: listenerData.hostname,
     protocol: listenerData.protocol as ListenerProtocol,
     tls: mapToTlsConfig(listenerData.tls),
