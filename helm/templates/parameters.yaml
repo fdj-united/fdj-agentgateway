@@ -12,6 +12,16 @@ spec:
     tag: {{ .Values.image.tag }}
     {{- end }}
     pullPolicy: {{ .Values.image.pullPolicy }}
+  {{- if .Values.image.pullSecrets }}
+  deployment:
+    spec:
+      template:
+        spec:
+          imagePullSecrets:
+            {{- range .Values.image.pullSecrets }}
+            - name: {{ . }}
+            {{- end }}
+  {{- end }}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass

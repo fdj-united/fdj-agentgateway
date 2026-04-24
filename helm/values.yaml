@@ -3,10 +3,11 @@ image:
   repository: ""
   tag: ""
   pullPolicy: IfNotPresent
+  pullSecrets: []
 
 gateway:
   name: agentgateway-proxy
-  namespace: agentgateway-system
+  namespace: agentgateway
   gatewayClassName: agentgateway
   listener:
     name: http
@@ -20,3 +21,9 @@ cors:
   exposeHeaders: []
 
 backends: []
+
+# Subchart: upstream agentgateway control plane
+agentgateway:
+  discoveryNamespaceSelectors:
+    - matchLabels:
+        kubernetes.io/metadata.name: agentgateway
