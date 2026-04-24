@@ -3,7 +3,7 @@ apiVersion: agentgateway.dev/v1alpha1
 kind: AgentgatewayParameters
 metadata:
   name: custom-proxy-image
-  namespace: {{ .Values.gateway.namespace }}
+  namespace: {{ .Release.Namespace }}
 spec:
   image:
     registry: {{ .Values.image.registry }}
@@ -33,5 +33,5 @@ spec:
     group: agentgateway.dev
     kind: AgentgatewayParameters
     name: custom-proxy-image
-    namespace: {{ .Values.gateway.namespace }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}
