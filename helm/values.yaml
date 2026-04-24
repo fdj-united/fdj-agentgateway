@@ -7,7 +7,6 @@ image:
 
 gateway:
   name: agentgateway-proxy
-  namespace: agentgateway
   gatewayClassName: agentgateway
   listener:
     name: http
@@ -23,7 +22,4 @@ cors:
 backends: []
 
 # Subchart: upstream agentgateway control plane
-agentgateway:
-  discoveryNamespaceSelectors:
-    - matchLabels:
-        kubernetes.io/metadata.name: agentgateway
+agentgateway: {}
