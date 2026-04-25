@@ -39,11 +39,44 @@ export function configDumpToLocalConfig(configDump: any): LocalConfig {
   // routes during mapping.
   const a2aPolicyTargets = buildA2aPolicyTargets(configDump.policies || []);
 
-  localConfig.binds = (configDump.binds || []).map((bind: any) =>
-    mapToBind(bind, backends as Backend[], a2aPolicyTargets)
+  // The proxy may report multiple bind entries that share the same OS-level
+  // address (e.g. one synthesized from the Gateway resource with no routes,
+  // and one from rawConfig.binds carrying the actual routes). Only one socket
+  // can listen per port, so collapse them into a single Bind keyed by port,
+  // merging listeners by name and preferring entries that have routes.
+  localConfig.binds = mergeBindsByPort(
+    (configDump.binds || []).map((bind: any) =>
+      mapToBind(bind, backends as Backend[], a2aPolicyTargets)
+    )
   );
 
   return localConfig;
+}
+
+function mergeBindsByPort(binds: Bind[]): Bind[] {
+  const byPort = new Map<number, Bind>();
+  for (const bind of binds) {
+    const existing = byPort.get(bind.port);
+    if (!existing) {
+      byPort.set(bind.port, { ...bind, listeners: [...bind.listeners] });
+      continue;
+    }
+    for (const incoming of bind.listeners) {
+      const idx = existing.listeners.findIndex((l) => l.name === incoming.name);
+      if (idx === -1) {
+        existing.listeners.push(incoming);
+        continue;
+      }
+      // Prefer the listener with routes; if both have routes, keep the
+      // existing one (already-merged result wins to remain stable).
+      const existingHasRoutes = (existing.listeners[idx].routes?.length ?? 0) > 0;
+      const incomingHasRoutes = (incoming.routes?.length ?? 0) > 0;
+      if (incomingHasRoutes && !existingHasRoutes) {
+        existing.listeners[idx] = incoming;
+      }
+    }
+  }
+  return Array.from(byPort.values());
 }
 
 // Structured representation of an A2A policy target, mirroring the Rust

@@ -55,7 +55,11 @@ impl RateLimitEntry {
 }
 
 /// A tool call intercepted by the two-phase confirmation flow.
-/// Stored per-session, keyed by the fully-qualified tool name (e.g. `ms365-teams_send-message`).
+/// Stored per-session, keyed by `(tool_name, args_hash)` so that:
+///   - parallel calls with different args each get their own pending entry
+///     (they no longer collide on tool-name alone), and
+///   - a confirmation re-call only matches when the LLM re-issues IDENTICAL
+///     args, defeating attempts to swap recipient/payload after approval.
 /// Single-use: consumed on Phase 2.
 #[derive(Debug, Clone)]
 struct PendingApproval {
@@ -74,13 +78,66 @@ impl PendingApproval {
 	}
 }
 
+/// Order-independent hash of a JSON value: object keys are sorted before hashing
+/// so two semantically-equal arg maps produce the same hash regardless of how
+/// the LLM serialized them.
+fn hash_value(v: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
+	use serde_json::Value;
+	use std::hash::Hash;
+	match v {
+		Value::Null => 0u8.hash(hasher),
+		Value::Bool(b) => {
+			1u8.hash(hasher);
+			b.hash(hasher);
+		},
+		Value::Number(n) => {
+			2u8.hash(hasher);
+			n.to_string().hash(hasher);
+		},
+		Value::String(s) => {
+			3u8.hash(hasher);
+			s.hash(hasher);
+		},
+		Value::Array(arr) => {
+			4u8.hash(hasher);
+			arr.len().hash(hasher);
+			for item in arr {
+				hash_value(item, hasher);
+			}
+		},
+		Value::Object(map) => {
+			5u8.hash(hasher);
+			let mut keys: Vec<&String> = map.keys().collect();
+			keys.sort();
+			keys.len().hash(hasher);
+			for k in keys {
+				k.hash(hasher);
+				hash_value(map.get(k).unwrap(), hasher);
+			}
+		},
+	}
+}
+
+fn hash_args(args: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	match args {
+		Some(map) => {
+			let v = serde_json::Value::Object(map.clone());
+			hash_value(&v, &mut hasher);
+		},
+		None => 0u8.hash(&mut hasher),
+	}
+	hasher.finish()
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
 	encoder: http::sessionpersistence::Encoder,
 	relay: Arc<Relay>,
 	pub id: Arc<str>,
 	tx: Option<Sender<ServerJsonRpcMessage>>,
-	/// Pending two-phase confirmations, keyed by fully-qualified tool name.
+	/// Pending two-phase confirmations, keyed by `<tool-name>|<args-hash>`.
 	/// Arc allows the HashMap to be shared across Session clones (same session, multiple requests).
 	pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
 	/// Per-tool call counters for rate limiting, keyed by fully-qualified tool name.
@@ -397,21 +454,24 @@ impl Session {
 						if self.is_stateful
 							&& self.relay.confirmation.requires_confirmation(&resource, &cel)
 						{
+							// Build the call key from (tool name, args hash). Different parallel
+							// calls with different args get separate pending entries; a confirmation
+							// re-call only matches when the LLM re-issues IDENTICAL args.
+							let key = format!("{}|{:016x}", name, hash_args(call_arguments.as_ref()));
+
 							let mut approvals = self.pending_approvals.lock().await;
-							// Use the original qualified name as the key so tools with
-							// the same short name on different services don't collide.
-							let key = name.to_string();
 
 							if let Some(pending) = approvals.get(&key) {
 								if pending.is_expired() {
-									// Expired: remove and fall through to Phase 1
+									// Expired → drop it and fall through to Phase 1
 									approvals.remove(&key);
 								} else {
-									// Phase 2: approval found → consume it and proceed
+									// Phase 2: matching pending → consume and execute upstream
 									approvals.remove(&key);
 									drop(approvals);
 									let tn = tool.to_string();
 									ctr.params.name = tn.into();
+									self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
 									return self
 										.relay
 										.send_single(r, ctx, service_name, Some(log.clone()))
@@ -419,11 +479,12 @@ impl Session {
 								}
 							}
 
-							// Phase 1: no valid pending approval → intercept and ask for confirmation
-							let preview = build_preview(tool, call_arguments.as_ref());
+							// Phase 1: store pending for this exact (tool, args) call signature
 							let ttl = self.relay.confirmation.ttl;
 							approvals.insert(key, PendingApproval::new(ttl));
 							drop(approvals);
+
+							let preview = build_preview(tool, call_arguments.as_ref());
 
 							let payload = serde_json::json!({
 								"confirmationRequired": true,
@@ -457,6 +518,7 @@ impl Session {
 
 						let tn = tool.to_string();
 						ctr.params.name = tn.into();
+						self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
 						self
 							.relay
 							.send_single(r, ctx, service_name, Some(log.clone()))

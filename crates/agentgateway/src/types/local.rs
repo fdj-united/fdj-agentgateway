@@ -17,7 +17,7 @@ use crate::llm::policy::PromptGuard;
 use crate::llm::{AIBackend, AIProvider, LocalModelAIProvider, NamedAIProvider};
 use crate::llm::{anthropic, openai};
 use crate::mcp::FailureMode;
-use crate::mcp::{McpAuthorization, McpConfirmation, McpRateLimit};
+use crate::mcp::{McpArgRewrite, McpAuthorization, McpConfirmation, McpRateLimit};
 use crate::store::LocalWorkload;
 use crate::types::agent::{
 	A2aPolicy, Authorization, Backend, BackendKey, BackendPolicy, BackendReference,
@@ -666,6 +666,7 @@ impl LocalBackend {
 				mcp_authorization: p.mcp_authorization,
 				mcp_confirmation: p.mcp_confirmation,
 				mcp_rate_limit: p.mcp_rate_limit,
+				mcp_arg_rewrite: p.mcp_arg_rewrite,
 				a2a: None,
 				ai: None,
 			})
@@ -1123,6 +1124,9 @@ pub struct MCPLocalBackendPolicies {
 	/// Per-session rate limit for MCP tool calls.
 	#[serde(default)]
 	pub mcp_rate_limit: Option<McpRateLimit>,
+	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
+	#[serde(default)]
+	pub mcp_arg_rewrite: Option<McpArgRewrite>,
 }
 
 #[apply(schema_de!)]
@@ -1141,6 +1145,9 @@ pub struct LocalBackendPolicies {
 	/// Per-session rate limit for MCP tool calls.
 	#[serde(default)]
 	pub mcp_rate_limit: Option<McpRateLimit>,
+	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
+	#[serde(default)]
+	pub mcp_arg_rewrite: Option<McpArgRewrite>,
 	/// Mark this traffic as A2A to enable A2A processing and telemetry.
 	#[serde(default)]
 	pub a2a: Option<A2aPolicy>,
@@ -1168,6 +1175,7 @@ impl LocalBackendPolicies {
 			mcp_authorization,
 			mcp_confirmation,
 			mcp_rate_limit,
+			mcp_arg_rewrite,
 			a2a,
 			ai,
 		} = self;
@@ -1201,6 +1209,9 @@ impl LocalBackendPolicies {
 		}
 		if let Some(p) = mcp_rate_limit {
 			pols.push(BackendPolicy::McpRateLimit(p))
+		}
+		if let Some(p) = mcp_arg_rewrite {
+			pols.push(BackendPolicy::McpArgRewrite(p))
 		}
 		if let Some(p) = a2a {
 			pols.push(BackendPolicy::A2a(p))
@@ -1316,6 +1327,9 @@ pub struct FilterOrPolicy {
 	/// Per-session rate limit for MCP tool calls.
 	#[serde(default)]
 	mcp_rate_limit: Option<McpRateLimit>,
+	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
+	#[serde(default)]
+	mcp_arg_rewrite: Option<McpArgRewrite>,
 	/// Authorization policies for HTTP access.
 	#[serde(default)]
 	authorization: Option<Authorization>,
@@ -2452,6 +2466,7 @@ pub(crate) async fn split_policies(
 		mcp_authorization,
 		mcp_confirmation,
 		mcp_rate_limit,
+		mcp_arg_rewrite,
 		mcp_authentication,
 		a2a,
 		ai,
@@ -2505,6 +2520,9 @@ pub(crate) async fn split_policies(
 	}
 	if let Some(p) = mcp_rate_limit {
 		backend_policies.push(BackendPolicy::McpRateLimit(p))
+	}
+	if let Some(p) = mcp_arg_rewrite {
+		backend_policies.push(BackendPolicy::McpArgRewrite(p))
 	}
 	if let Some(p) = mcp_authentication {
 		let authn: McpAuthentication = p.translate(client.clone()).await?;

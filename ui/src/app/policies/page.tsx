@@ -221,7 +221,13 @@ export default function PoliciesPage() {
                 const headerLabel = p.name
                   ? `${p.name.kind ?? ""} ${p.name.namespace ?? ""}/${p.name.name ?? ""}`.trim()
                   : p.key;
-                const badge = isService ? "Service" : isBackend ? "Backend" : isGateway ? "Gateway" : "Other";
+                const badge = isService
+                  ? "Service"
+                  : isBackend
+                    ? "Backend"
+                    : isGateway
+                      ? "Gateway"
+                      : "Other";
                 return (
                   <Card key={p.key}>
                     <CardHeader className="pb-2">

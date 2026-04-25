@@ -10,7 +10,7 @@ use crate::http::ext_proc::InferenceRouting;
 use crate::http::oidc;
 use crate::http::{ext_authz, ext_proc, filters, health, remoteratelimit, retry, timeout};
 use crate::llm::policy::ResponseGuard;
-use crate::mcp::{McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet};
+use crate::mcp::{McpArgRewriteSet, McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{
 	A2aPolicy, Backend, BackendKey, BackendPolicy, BackendTargetRef, BackendWithPolicies, Bind,
@@ -152,6 +152,7 @@ pub struct BackendPolicies {
 	pub mcp_authorization: Option<McpAuthorizationSet>,
 	pub mcp_confirmation: Option<McpConfirmationSet>,
 	pub mcp_rate_limit: Option<McpRateLimitSet>,
+	pub mcp_arg_rewrite: Option<McpArgRewriteSet>,
 	pub mcp_authentication: Option<McpAuthentication>,
 
 	pub http: Option<types::backend::HTTP>,
@@ -187,6 +188,7 @@ impl BackendPolicies {
 			mcp_authorization: other.mcp_authorization.or(self.mcp_authorization),
 			mcp_confirmation: other.mcp_confirmation.or(self.mcp_confirmation),
 			mcp_rate_limit: other.mcp_rate_limit.or(self.mcp_rate_limit),
+			mcp_arg_rewrite: other.mcp_arg_rewrite.or(self.mcp_arg_rewrite),
 			mcp_authentication: other.mcp_authentication.or(self.mcp_authentication),
 			inference_routing: other.inference_routing.or(self.inference_routing),
 			http: other.http.or(self.http),
@@ -742,6 +744,8 @@ impl Store {
 		let mut mcp_confirm: Vec<(crate::http::authorization::RuleSet, Option<u64>)> = Vec::new();
 		// (rule_set, max_calls, window_seconds) triples for McpRateLimitSet
 		let mut mcp_rate: Vec<(crate::http::authorization::RuleSet, u32, u64)> = Vec::new();
+		// All ArgRewriteRule entries collected from one or more McpArgRewrite policies
+		let mut mcp_arg_rewrite: Vec<crate::mcp::ArgRewriteRule> = Vec::new();
 		let mut pol = BackendPolicies::default();
 		for rule in rules {
 			match &rule {
@@ -809,6 +813,10 @@ impl Store {
 					let (rs, max_calls, window_seconds) = p.clone().into_parts();
 					mcp_rate.push((rs, max_calls, window_seconds));
 				},
+				BackendPolicy::McpArgRewrite(p) => {
+					// Rules from multiple policies concatenate, applied in order.
+					mcp_arg_rewrite.extend(p.clone().into_inner());
+				},
 				BackendPolicy::McpAuthentication(p) => {
 					pol.mcp_authentication.get_or_insert_with(|| p.clone());
 				},
@@ -839,6 +847,9 @@ impl Store {
 				rule_sets.into(),
 				std::time::Duration::from_secs(ttl_secs),
 			));
+		}
+		if !mcp_arg_rewrite.is_empty() {
+			pol.mcp_arg_rewrite = Some(McpArgRewriteSet::new(mcp_arg_rewrite));
 		}
 		pol
 	}

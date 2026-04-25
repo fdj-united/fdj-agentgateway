@@ -22,10 +22,10 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Agentgateway Dashboard",
-  description: "Agentgateway Dashboard",
+  title: "MCP-Gateway Dashboard",
+  description: "MCP-Gateway Dashboard",
   icons: {
-    icon: "/ui/favicon.svg",
+    icon: "/ui/favicon.png",
   },
 };
 

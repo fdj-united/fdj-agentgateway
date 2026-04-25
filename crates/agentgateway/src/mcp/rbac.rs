@@ -139,6 +139,132 @@ impl Default for McpRateLimitSet {
 	}
 }
 
+/// Per-backend rule that mutates a string field of a tool call's arguments
+/// just before the request is forwarded upstream. Used for things like
+/// appending a "sent via $TAG" footer to outbound message bodies.
+///
+/// The `tools` list is exact-match on the SHORT tool name (after multiplexing
+/// resolution). `path` is a dot-separated JSON path inside `arguments`. The
+/// path must resolve to a string; if it doesn't (missing, non-string, or any
+/// intermediate non-object), the rule is skipped silently — we never inject
+/// fields the upstream's tool schema doesn't expect.
+#[apply(schema!)]
+pub struct ArgRewriteRule {
+	/// Tool names this rule applies to (short name after multiplexing).
+	pub tools: Vec<String>,
+	/// Dot-separated path inside the call's `arguments` map.
+	pub path: String,
+	/// How to combine `value` with the existing string at `path`. Defaults to `append`.
+	#[serde(default)]
+	pub op: RewriteOp,
+	/// The text used by the operation. For `wrap`, may contain `{original}`
+	/// which is substituted with the current value before assignment.
+	pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum RewriteOp {
+	Append,
+	Prepend,
+	Replace,
+	Wrap,
+}
+
+impl Default for RewriteOp {
+	fn default() -> Self {
+		Self::Append
+	}
+}
+
+/// Configuration for argument rewrites applied per backend.
+#[apply(schema!)]
+pub struct McpArgRewrite {
+	pub rules: Vec<ArgRewriteRule>,
+}
+
+impl McpArgRewrite {
+	pub fn into_inner(self) -> Vec<ArgRewriteRule> {
+		self.rules
+	}
+}
+
+/// Runtime view of merged argument-rewrite rules from one or more
+/// [`McpArgRewrite`] entries attached to a backend.
+#[derive(Clone, Debug, Default)]
+pub struct McpArgRewriteSet {
+	rules: Vec<ArgRewriteRule>,
+}
+
+impl McpArgRewriteSet {
+	pub fn new(rules: Vec<ArgRewriteRule>) -> Self {
+		Self { rules }
+	}
+
+	/// Apply every matching rule to `args` in-order.
+	/// `tool_name` is the SHORT name (post-multiplexing).
+	/// `args` is mutated in place; on a no-op (path not found / wrong type)
+	/// the call is left untouched and a debug line is emitted.
+	pub fn apply(
+		&self,
+		tool_name: &str,
+		args: &mut Option<serde_json::Map<String, serde_json::Value>>,
+	) {
+		if self.rules.is_empty() {
+			return;
+		}
+		let Some(map) = args.as_mut() else {
+			return;
+		};
+		for rule in &self.rules {
+			if !rule.tools.iter().any(|t| t == tool_name) {
+				continue;
+			}
+			let Some(target) = walk_to_string_mut(map, &rule.path) else {
+				tracing::debug!(
+					"mcpArgRewrite: skipping rule for tool {} — path '{}' not found or not a string",
+					tool_name,
+					rule.path
+				);
+				continue;
+			};
+			match rule.op {
+				RewriteOp::Append => target.push_str(&rule.value),
+				RewriteOp::Prepend => *target = format!("{}{}", rule.value, target),
+				RewriteOp::Replace => *target = rule.value.clone(),
+				RewriteOp::Wrap => {
+					let original = std::mem::take(target);
+					*target = rule.value.replace("{original}", &original);
+				},
+			}
+		}
+	}
+}
+
+/// Resolve a dot-separated path to a mutable `&mut String` inside a JSON map.
+/// Returns `None` if any segment doesn't exist, an intermediate value isn't
+/// an object, or the leaf isn't a string.
+fn walk_to_string_mut<'a>(
+	args: &'a mut serde_json::Map<String, serde_json::Value>,
+	path: &str,
+) -> Option<&'a mut String> {
+	let mut parts = path.split('.');
+	let first = parts.next()?;
+	let mut current: &mut serde_json::Value = args.get_mut(first)?;
+	for part in parts {
+		let map = match current {
+			serde_json::Value::Object(m) => m,
+			_ => return None,
+		};
+		current = map.get_mut(part)?;
+	}
+	match current {
+		serde_json::Value::String(s) => Some(s),
+		_ => None,
+	}
+}
+
 impl Default for McpConfirmationSet {
 	fn default() -> Self {
 		Self {

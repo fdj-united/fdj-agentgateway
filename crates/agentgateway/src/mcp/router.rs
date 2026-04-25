@@ -114,6 +114,9 @@ impl App {
 		let rate_limit_policies = backend_policies
 			.mcp_rate_limit
 			.unwrap_or_default();
+		let arg_rewrite_policies = backend_policies
+			.mcp_arg_rewrite
+			.unwrap_or_default();
 		let authn = backend_policies.mcp_authentication;
 
 		// Store an empty value, we will populate each field async
@@ -151,6 +154,7 @@ impl App {
 					policies: authorization_policies.clone(),
 					confirmation: confirmation_policies.clone(),
 					rate_limit: rate_limit_policies.clone(),
+					arg_rewrite: arg_rewrite_policies.clone(),
 					client: client.clone(),
 				},
 			))
@@ -169,6 +173,7 @@ impl App {
 					policies: authorization_policies.clone(),
 					confirmation: confirmation_policies.clone(),
 					rate_limit: rate_limit_policies.clone(),
+					arg_rewrite: arg_rewrite_policies.clone(),
 					client: client.clone(),
 				},
 			))
