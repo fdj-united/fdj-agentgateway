@@ -34,4 +34,4 @@ listeners: []
 agentgateway:
   discoveryNamespaceSelectors:
     - matchLabels:
-        kubernetes.io/metadata.name: agentgateway
+        kubernetes.io/metadata.name: kindred-mcp-gateway
