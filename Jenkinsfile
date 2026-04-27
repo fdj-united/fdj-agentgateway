@@ -1,6 +1,6 @@
 @Library('jenkins-shared-library')_
 
-// Helper to extract clean version from git describe
+// Helper which extract clean version from git describe
 def extractCleanVersion() {
     if (env.VERSION?.trim()) {
         return env.VERSION.trim()
