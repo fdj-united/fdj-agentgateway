@@ -48,7 +48,7 @@ genericPod([
     def imageRepository
     def imageTag
     def jfrogRegistry = "jfrog.kindredgroup.com/docker-dev"
-    def jfrogRepositoryPrefix = "kindred/aie"
+    def jfrogRepositoryPrefix = "kindred/dde"
 
     stage('Checkout') {
         checkout([
