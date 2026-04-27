@@ -1,0 +1,43 @@
+{{- if .Values.ingress.enabled }}
+{{- $svcName := printf "%s-agentgateway-proxy" .Release.Name | trunc 63 }}
+{{- $hosts := list }}
+{{- range .Values.listeners }}
+  {{- if .ingress }}{{- if .ingress.host }}
+    {{- $hosts = append $hosts .ingress.host }}
+  {{- end }}{{- end }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-public
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if and .Values.ingress.tls.enabled $hosts }}
+  tls:
+    - hosts:
+        {{- range $hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ .Values.ingress.tls.secretName | quote }}
+  {{- end }}
+  rules:
+    {{- range .Values.listeners }}
+    {{- if .ingress }}{{- if .ingress.host }}
+    - host: {{ .ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agentgateway-proxy        # the controller-spawned proxy Service
+                port:
+                  number: {{ .port }}
+    {{- end }}{{- end }}
+    {{- end }}
+{{- end }}
