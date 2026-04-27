@@ -30,5 +30,8 @@ cors:
 
 listeners: []
 
-# Subchart: upstream agentgateway control plane (manages proxy pod lifecycle).
-agentgateway: {}
+
+agentgateway:
+  discoveryNamespaceSelectors:
+    - matchLabels:
+        kubernetes.io/metadata.name: kindred-mcp-gateway
