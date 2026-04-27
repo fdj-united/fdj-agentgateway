@@ -1,10 +1,10 @@
-{{- if and .Values.image.registry .Values.image.repository }}
 apiVersion: agentgateway.dev/v1alpha1
 kind: AgentgatewayParameters
 metadata:
-  name: custom-proxy-image
+  name: {{ .Values.gateway.gatewayClassName }}-params
   namespace: {{ .Release.Namespace }}
 spec:
+  {{- if and .Values.image.registry .Values.image.repository }}
   image:
     registry: {{ .Values.image.registry }}
     repository: {{ .Values.image.repository }}
@@ -12,6 +12,7 @@ spec:
     tag: {{ .Values.image.tag }}
     {{- end }}
     pullPolicy: {{ .Values.image.pullPolicy }}
+  {{- end }}
   {{- if .Values.image.pullSecrets }}
   deployment:
     spec:
@@ -22,6 +23,124 @@ spec:
             - name: {{ . }}
             {{- end }}
   {{- end }}
+  rawConfig:
+    {{- if .Values.frontendPolicies }}
+    frontendPolicies:
+      {{- with .Values.frontendPolicies.accessLog }}
+      accessLog:
+        add:
+          {{- range $k, $v := . }}
+          {{ $k }}: {{ $v | quote }}
+          {{- end }}
+      {{- end }}
+    {{- end }}
+    binds:
+      {{- range $listener := .Values.listeners }}
+      {{- $listenerCors := $listener.cors | default $.Values.cors }}
+      {{- $catchAll := and (eq (len $listener.backends) 1) (not (index $listener.backends 0).routePath) }}
+      - port: {{ $listener.port }}
+        listeners:
+          - name: {{ $listener.name | quote }}
+            protocol: {{ $listener.protocol | default "HTTP" }}
+            routes:
+              {{- range $backend := $listener.backends }}
+              {{- $cors := $backend.cors | default $listenerCors }}
+              {{- $allowHeaders := ($backend.cors).allowHeaders | default $listenerCors.allowHeaders }}
+              {{- $exposeHeaders := ($backend.cors).exposeHeaders | default $listenerCors.exposeHeaders }}
+              - name: {{ printf "%s-route" $backend.name | quote }}
+                policies:
+                  {{- if $cors.allowOrigins }}
+                  cors:
+                    allowOrigins:
+                      {{- range $cors.allowOrigins }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- with $allowHeaders }}
+                    allowHeaders:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                    {{- with $exposeHeaders }}
+                    exposeHeaders:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+                  {{- with $backend.authorization }}
+                  mcpAuthorization:
+                    rules:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                  {{- end }}
+                  {{- with $backend.confirmation }}
+                  mcpConfirmation:
+                    {{- with .ttlSeconds }}
+                    ttlSeconds: {{ . }}
+                    {{- end }}
+                    rules:
+                      {{- range .rules }}
+                      - {{ . | quote }}
+                      {{- end }}
+                  {{- end }}
+                  {{- with $backend.rateLimit }}
+                  mcpRateLimit:
+                    {{- with .maxCalls }}
+                    maxCalls: {{ . }}
+                    {{- end }}
+                    {{- with .windowSeconds }}
+                    windowSeconds: {{ . }}
+                    {{- end }}
+                    {{- with .rules }}
+                    rules:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+                  {{- with $backend.argRewrite }}
+                  mcpArgRewrite:
+                    rules:
+                      {{- range . }}
+                      - tools:
+                          {{- range .tools }}
+                          - {{ . | quote }}
+                          {{- end }}
+                        path: {{ .path | quote }}
+                        {{- with .op }}
+                        op: {{ . | quote }}
+                        {{- end }}
+                        value: {{ .value | quote }}
+                      {{- end }}
+                  {{- end }}
+                {{- if not $catchAll }}
+                matches:
+                  - path:
+                      pathPrefix: {{ $backend.routePath | quote }}
+                  {{- range $backend.extraMatches }}
+                  - path:
+                      {{- if .exact }}
+                      exact: {{ .exact | quote }}
+                      {{- else if .pathPrefix }}
+                      pathPrefix: {{ .pathPrefix | quote }}
+                      {{- end }}
+                  {{- end }}
+                {{- end }}
+                backends:
+                  - mcp:
+                      targets:
+                        - name: {{ $backend.name }}
+                          mcp:
+                            host: {{ $backend.mcp.host | quote }}
+                          {{- if $backend.mcp.insecureTLS }}
+                          policies:
+                            backendTLS:
+                              insecure: true
+                          {{- end }}
+              {{- end }}
+      {{- end }}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -32,6 +151,5 @@ spec:
   parametersRef:
     group: agentgateway.dev
     kind: AgentgatewayParameters
-    name: custom-proxy-image
+    name: {{ .Values.gateway.gatewayClassName }}-params
     namespace: {{ .Release.Namespace }}
-{{- end }}
