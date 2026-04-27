@@ -6,9 +6,11 @@ metadata:
 spec:
   gatewayClassName: {{ .Values.gateway.gatewayClassName }}
   listeners:
-    - protocol: {{ .Values.gateway.listener.protocol }}
-      port: {{ .Values.gateway.listener.port }}
-      name: {{ .Values.gateway.listener.name }}
+    {{- range .Values.listeners }}
+    - name: {{ .name }}
+      port: {{ .port }}
+      protocol: {{ .protocol | default "HTTP" }}
       allowedRoutes:
         namespaces:
           from: All
+    {{- end }}
