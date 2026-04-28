@@ -19,7 +19,7 @@ deployment:
   securityContext:
     runAsNonRoot: true
     seccompProfile:
-      type: RuntimeDefault.
+      type: RuntimeDefault
   containerSecurityContext:
     allowPrivilegeEscalation: false
     runAsNonRoot: true
