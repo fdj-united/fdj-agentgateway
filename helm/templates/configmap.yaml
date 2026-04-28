@@ -1,8 +1,3 @@
-{{- /*
-  Render the standalone agentgateway config.yaml. Same listener/backend shape
-  as the k8s chart's rawConfig — produced verbatim here as the file the proxy
-  reads with `agentgateway -f /etc/agentgateway/config.yaml`.
-*/ -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
