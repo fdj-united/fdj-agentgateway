@@ -16,8 +16,18 @@ deployment:
   nodeSelector: {}
   tolerations: []
   affinity: {}
-  securityContext: {}
-  containerSecurityContext: {}
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
 
 service:
   name: kindred-mcp-gateway
