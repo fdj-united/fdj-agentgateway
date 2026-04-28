@@ -1,29 +1,10 @@
-apiVersion: agentgateway.dev/v1alpha1
-kind: AgentgatewayParameters
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: {{ .Values.gateway.gatewayClassName }}-params
+  name: {{ .Values.deployment.name }}-config
   namespace: {{ .Release.Namespace }}
-spec:
-  {{- if and .Values.image.registry .Values.image.repository }}
-  image:
-    registry: {{ .Values.image.registry }}
-    repository: {{ .Values.image.repository }}
-    {{- if .Values.image.tag }}
-    tag: {{ .Values.image.tag }}
-    {{- end }}
-    pullPolicy: {{ .Values.image.pullPolicy }}
-  {{- end }}
-  {{- if .Values.image.pullSecrets }}
-  deployment:
-    spec:
-      template:
-        spec:
-          imagePullSecrets:
-            {{- range .Values.image.pullSecrets }}
-            - name: {{ . }}
-            {{- end }}
-  {{- end }}
-  rawConfig:
+data:
+  config.yaml: |
     {{- if .Values.frontendPolicies }}
     frontendPolicies:
       {{- with .Values.frontendPolicies.accessLog }}
@@ -141,15 +122,3 @@ spec:
                           {{- end }}
               {{- end }}
       {{- end }}
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: GatewayClass
-metadata:
-  name: {{ .Values.gateway.gatewayClassName }}
-spec:
-  controllerName: agentgateway.dev/agentgateway
-  parametersRef:
-    group: agentgateway.dev
-    kind: AgentgatewayParameters
-    name: {{ .Values.gateway.gatewayClassName }}-params
-    namespace: {{ .Release.Namespace }}

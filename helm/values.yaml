@@ -1,5 +1,4 @@
-# Custom proxy image (Kindred fork). Jenkins bakes these values in at
-# package time via `sed`. They're read by templates/parameters.yaml.
+# Proxy image — Jenkins bakes the JFrog reference in at package time.
 image:
   registry: ""
   repository: ""
@@ -7,20 +6,42 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
+# Deployment-level knobs.
+deployment:
+  name: kindred-mcp-gateway
+  replicas: 1
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  securityContext: {}
+  containerSecurityContext: {}
 
-gateway:
-  name: agentgateway-proxy
-  gatewayClassName: agentgateway
+service:
+  name: kindred-mcp-gateway
+  type: ClusterIP
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""          
+  annotations: {}         
+  tls:
+    enabled: false
+    secretName: ""        
 
 # Frontend policies applied to all requests through the proxy.
 frontendPolicies:
   accessLog:
     mcp.tool: 'mcp.tool.name'
     mcp.target: 'mcp.tool.target'
-    mcp.method: 'mcp.methodName'
     mcp.session: 'mcp.sessionId'
+    mcp.method: 'mcp.methodName'
     user: 'request.headers["X-User-Email"]'
     status: 'response.status_code'
+
 
 cors:
   allowOrigins: []
@@ -29,9 +50,3 @@ cors:
   exposeHeaders: []
 
 listeners: []
-
-
-agentgateway:
-  discoveryNamespaceSelectors:
-    - matchLabels:
-        kubernetes.io/metadata.name: kindred-mcp-gateway
