@@ -1,23 +1,27 @@
-{{- if .Values.ingress.enabled }}
-{{- $svcName := printf "%s-agentgateway-proxy" .Release.Name | trunc 63 }}
+{{- if and .Values.ingress .Values.ingress.enabled }}
 {{- $hosts := list }}
 {{- range .Values.listeners }}
-  {{- if .ingress }}{{- if .ingress.host }}
+  {{- if and .ingress .ingress.host }}
     {{- $hosts = append $hosts .ingress.host }}
-  {{- end }}{{- end }}
+  {{- end }}
 {{- end }}
+{{- if $hosts }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ .Release.Name }}-public
+  name: {{ .Values.deployment.name }}-public
   namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}
   {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  ingressClassName: {{ .Values.ingress.className }}
-  {{- if and .Values.ingress.tls.enabled $hosts }}
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.secretName }}
   tls:
     - hosts:
         {{- range $hosts }}
@@ -27,7 +31,7 @@ spec:
   {{- end }}
   rules:
     {{- range .Values.listeners }}
-    {{- if .ingress }}{{- if .ingress.host }}
+    {{- if and .ingress .ingress.host }}
     - host: {{ .ingress.host | quote }}
       http:
         paths:
@@ -35,9 +39,10 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: agentgateway-proxy        # the controller-spawned proxy Service
+                name: {{ $.Values.service.name }}
                 port:
                   number: {{ .port }}
-    {{- end }}{{- end }}
     {{- end }}
+    {{- end }}
+{{- end }}
 {{- end }}
