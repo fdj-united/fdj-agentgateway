@@ -56,6 +56,32 @@ spec:
               mountPath: /etc/agentgateway/config.yaml
               subPath: config.yaml
               readOnly: true
+        {{- if and .Values.admin .Values.admin.enabled }}
+        - name: admin-proxy
+          image: {{ .Values.admin.sidecar.image | quote }}
+          args:
+            - "-d"
+            - "TCP-LISTEN:{{ .Values.admin.sidecar.port }},fork,reuseaddr"
+            - "TCP:127.0.0.1:15000"
+          ports:
+            - name: admin
+              containerPort: {{ .Values.admin.sidecar.port }}
+              protocol: TCP
+          {{- with .Values.admin.sidecar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # Same restricted security context — alpine/socat runs fine as nonroot
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+        {{- end }}
       volumes:
         - name: config
           configMap:

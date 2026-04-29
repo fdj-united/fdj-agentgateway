@@ -20,3 +20,9 @@ spec:
       targetPort: {{ .port }}
       protocol: TCP
     {{- end }}
+    {{- if and .Values.admin .Values.admin.enabled }}
+    - name: admin
+      port: 15000
+      targetPort: {{ .Values.admin.sidecar.port }}
+      protocol: TCP
+    {{- end }}
