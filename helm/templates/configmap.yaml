@@ -23,6 +23,9 @@ data:
         listeners:
           - name: {{ $listener.name | quote }}
             protocol: {{ $listener.protocol | default "HTTP" }}
+            {{- with $listener.hostname }}
+            hostname: {{ . | quote }}
+            {{- end }}
             routes:
               {{- range $backend := $listener.backends }}
               {{- $cors := $backend.cors | default $listenerCors }}
