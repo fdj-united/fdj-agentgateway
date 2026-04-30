@@ -33,7 +33,12 @@ service:
   type: ClusterIP
   annotations: {}
 
-ingress: {}
+ingress:
+  enabled: false  # Enable and configure per environment
+  className: nginx-internal
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-connections: "5"
 
 admin:
   enabled: false
