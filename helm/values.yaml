@@ -5,7 +5,7 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
-# Deployment-level knobs.
+# Deployment-level knobs
 deployment:
   name: kindred-mcp-gateway
   replicas: 1
