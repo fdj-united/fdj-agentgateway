@@ -37,9 +37,7 @@ ingress:
   enabled: false
   className: ""          
   annotations: {}         
-  tls:
-    enabled: false
-    secretName: ""        
+  tls: []        
 
 admin:
   enabled: false
