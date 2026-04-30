@@ -21,7 +21,7 @@ spec:
   {{- with .Values.ingress.className }}
   ingressClassName: {{ . | quote }}
   {{- end }}
-  {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.secretName }}
+  {{- if and .Values.ingress.tls .Values.ingress.tls.enabled .Values.ingress.tls.secretName }}
   tls:
     - hosts:
         {{- range $hosts }}
