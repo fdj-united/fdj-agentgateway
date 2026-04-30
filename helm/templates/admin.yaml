@@ -1,7 +1,5 @@
 {{- if and .Values.admin .Values.admin.enabled .Values.admin.host }}
 {{- $className := .Values.admin.ingress.className | default .Values.ingress.className }}
-{{- $tlsEnabled := or .Values.admin.ingress.tls.enabled (and .Values.ingress .Values.ingress.tls.enabled) }}
-{{- $tlsSecret := .Values.admin.ingress.tls.secretName | default (and .Values.ingress .Values.ingress.tls.secretName) }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -16,12 +14,6 @@ metadata:
 spec:
   {{- with $className }}
   ingressClassName: {{ . | quote }}
-  {{- end }}
-  {{- if and $tlsEnabled $tlsSecret }}
-  tls:
-    - hosts:
-        - {{ .Values.admin.host | quote }}
-      secretName: {{ $tlsSecret | quote }}
   {{- end }}
   rules:
     - host: {{ .Values.admin.host | quote }}
