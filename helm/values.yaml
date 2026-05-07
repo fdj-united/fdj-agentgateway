@@ -47,14 +47,17 @@ admin:
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
     port: 4180
     # Required values when admin.enabled is true:
-    issuerUrl: ""       
-    clientId: "" 
-    existingSecretName: ""     
-    emailDomain: "*"           
-    cookieSecure: true         
-    cookieDomain: ""           
+    issuerUrl: ""
+    clientId: ""
+    existingSecretName: ""
+    secretKeys:
+      clientSecret: ""    
+      cookieSecret: ""    
+    emailDomain: "*"
+    cookieSecure: true
+    cookieDomain: ""
     scope: "openid profile email"
-    extraArgs: []              
+    extraArgs: []
     resources: {}
   ingress:
     className: ""
