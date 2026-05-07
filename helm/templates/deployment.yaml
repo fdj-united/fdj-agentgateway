@@ -77,8 +77,6 @@ spec:
             - --whitelist-domain={{ . }}
             {{- end }}
             - --scope={{ .Values.admin.oauth2Proxy.scope }}
-            - --pass-access-token=true
-            - --set-xauthrequest=true
             {{- range .Values.admin.oauth2Proxy.extraArgs }}
             - {{ . | quote }}
             {{- end }}
