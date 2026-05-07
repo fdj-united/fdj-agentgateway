@@ -25,5 +25,5 @@ spec:
               service:
                 name: {{ .Values.service.name }}
                 port:
-                  number: 15000
+                  number: {{ .Values.admin.oauth2Proxy.port }}
 {{- end }}

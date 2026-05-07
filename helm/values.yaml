@@ -42,17 +42,26 @@ ingress:
 
 admin:
   enabled: false
-  host: ""                
-  sidecar:
-    image: alpine/socat:1.7.4.4
-    port: 15001
+  host: ""
+  oauth2Proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+    port: 4180
+    # Required values when admin.enabled is true:
+    issuerUrl: ""       
+    clientId: "" 
+    existingSecretName: ""     
+    emailDomain: "*"           
+    cookieSecure: true         
+    cookieDomain: ""           
+    scope: "openid profile email"
+    extraArgs: []              
     resources: {}
   ingress:
-    className: ""         
-    annotations: {}       
+    className: ""
+    annotations: {}
     tls:
       enabled: false
-      secretName: ""      
+      secretName: ""
 
 # Frontend policies applied to all requests through the proxy.
 frontendPolicies:
