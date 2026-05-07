@@ -22,7 +22,7 @@ spec:
     {{- end }}
     {{- if and .Values.admin .Values.admin.enabled }}
     - name: admin
-      port: 15000
-      targetPort: {{ .Values.admin.sidecar.port }}
+      port: {{ .Values.admin.oauth2Proxy.port }}
+      targetPort: {{ .Values.admin.oauth2Proxy.port }}
       protocol: TCP
     {{- end }}

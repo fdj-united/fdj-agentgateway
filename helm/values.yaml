@@ -42,17 +42,30 @@ ingress:
 
 admin:
   enabled: false
-  host: ""                
-  sidecar:
-    image: alpine/socat:1.7.4.4
-    port: 15001
+  host: ""
+  # OIDC-protected admin UI via an oauth2-proxy sidecar.
+  # The sidecar terminates the browser request, runs the OIDC dance against the
+  # configured IdP (e.g. Microsoft Entra), then reverse-proxies the authenticated
+  # request to the agentgateway admin port on loopback (127.0.0.1:15000).
+  oauth2Proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+    port: 4180
+    # Required values when admin.enabled is true:
+    issuerUrl: ""              # e.g. https://login.microsoftonline.com/<tenant-id>/v2.0
+    clientId: ""               # Application (client) ID from the IdP
+    existingSecretName: ""     # K8s Secret with keys: client-secret, cookie-secret
+    emailDomain: "*"           # Restrict to a specific email domain in prod (e.g. kindredgroup.com)
+    cookieSecure: true         # Set false only for local HTTP testing
+    cookieDomain: ""           # Optional; defaults to the admin.host
+    scope: "openid profile email"
+    extraArgs: []              # Pass-through additional oauth2-proxy CLI flags
     resources: {}
   ingress:
-    className: ""         
-    annotations: {}       
+    className: ""
+    annotations: {}
     tls:
       enabled: false
-      secretName: ""      
+      secretName: ""
 
 # Frontend policies applied to all requests through the proxy.
 frontendPolicies:

@@ -59,6 +59,53 @@ data:
                       - {{ . | quote }}
                       {{- end }}
                   {{- end }}
+                  {{- with $backend.mcpAuthentication }}
+                  mcpAuthentication:
+                    {{- with .mode }}
+                    mode: {{ . | quote }}
+                    {{- end }}
+                    issuer: {{ .issuer | quote }}
+                    {{- with .audiences }}
+                    audiences:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                    {{- with .jwks }}
+                    jwks:
+                      {{- with .url }}
+                      url: {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                    {{- with .provider }}
+                    provider:
+                      {{- toYaml . | nindent 22 }}
+                    {{- end }}
+                    {{- with .resourceMetadata }}
+                    resourceMetadata:
+                      {{- with .resource }}
+                      resource: {{ . | quote }}
+                      {{- end }}
+                      {{- with .scopesSupported }}
+                      scopesSupported:
+                        {{- range . }}
+                        - {{ . | quote }}
+                        {{- end }}
+                      {{- end }}
+                      {{- with .bearerMethodsSupported }}
+                      bearerMethodsSupported:
+                        {{- range . }}
+                        - {{ . | quote }}
+                        {{- end }}
+                      {{- end }}
+                      {{- with .resourceDocumentation }}
+                      resourceDocumentation: {{ . | quote }}
+                      {{- end }}
+                      {{- with .resourcePolicyUri }}
+                      resourcePolicyUri: {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
                   {{- with $backend.confirmation }}
                   mcpConfirmation:
                     {{- with .ttlSeconds }}
