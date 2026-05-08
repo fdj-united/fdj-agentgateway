@@ -741,7 +741,11 @@ impl Store {
 
 		let mut mcp_authz = Vec::new();
 		// (rule_set, ttl_seconds) pairs collected before building McpConfirmationSet
-		let mut mcp_confirm: Vec<(crate::http::authorization::RuleSet, Option<u64>)> = Vec::new();
+		let mut mcp_confirm: Vec<(
+			crate::http::authorization::RuleSet,
+			Option<u64>,
+			Vec<crate::mcp::PresentationRule>,
+		)> = Vec::new();
 		// (rule_set, max_calls, window_seconds) triples for McpRateLimitSet
 		let mut mcp_rate: Vec<(crate::http::authorization::RuleSet, u32, u64)> = Vec::new();
 		// All ArgRewriteRule entries collected from one or more McpArgRewrite policies
@@ -806,8 +810,8 @@ impl Store {
 				},
 				BackendPolicy::McpConfirmation(p) => {
 					// Confirmation policies merge, like authorization
-					let (rs, ttl) = p.clone().into_parts();
-					mcp_confirm.push((rs, ttl));
+					let (rs, ttl, pres) = p.clone().into_parts();
+					mcp_confirm.push((rs, ttl, pres));
 				},
 				BackendPolicy::McpRateLimit(p) => {
 					let (rs, max_calls, window_seconds) = p.clone().into_parts();
@@ -840,12 +844,19 @@ impl Store {
 			// Use the first explicitly set TTL; fall back to the default (120s).
 			let ttl_secs = mcp_confirm
 				.iter()
-				.find_map(|(_, t)| *t)
+				.find_map(|(_, t, _)| *t)
 				.unwrap_or(120);
-			let rule_sets: Vec<_> = mcp_confirm.into_iter().map(|(rs, _)| rs).collect();
+			// Concat presentation rules across all confirmation policies; the
+			// first rule whose `tools` list matches a tool wins at envelope time.
+			let presentations: Vec<_> = mcp_confirm
+				.iter()
+				.flat_map(|(_, _, p)| p.clone())
+				.collect();
+			let rule_sets: Vec<_> = mcp_confirm.into_iter().map(|(rs, _, _)| rs).collect();
 			pol.mcp_confirmation = Some(McpConfirmationSet::new(
 				rule_sets.into(),
 				std::time::Duration::from_secs(ttl_secs),
+				presentations,
 			));
 		}
 		if !mcp_arg_rewrite.is_empty() {

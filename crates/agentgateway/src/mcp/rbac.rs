@@ -42,12 +42,92 @@ pub struct McpConfirmation {
 	/// Seconds the pending approval stays valid. Defaults to 120.
 	#[serde(rename = "ttlSeconds", default)]
 	pub ttl_seconds: Option<u64>,
+	/// Optional structured presentation rules — one per matching tool. When a
+	/// tool call triggers confirmation, the gateway attaches a `presentation`
+	/// block to the envelope using the first rule whose `tools` list matches.
+	/// The client uses this to render a friendly modal instead of the raw
+	/// `preview` text.
+	#[serde(default)]
+	pub presentations: Vec<PresentationRule>,
 }
 
 impl McpConfirmation {
-	pub fn into_parts(self) -> (RuleSet, Option<u64>) {
-		(self.rules, self.ttl_seconds)
+	pub fn into_parts(self) -> (RuleSet, Option<u64>, Vec<PresentationRule>) {
+		(self.rules, self.ttl_seconds, self.presentations)
 	}
+}
+
+/// Suggested format for a single presentation field. Used as a hint by the
+/// client renderer; unrecognized values fall back to `text`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum PresentationFormat {
+	/// Free-text — the dominant user-facing string (e.g. message body).
+	Text,
+	/// Inline code / identifier (chat IDs, URLs, hashes).
+	Code,
+	/// Pretty-printed JSON (objects, arrays).
+	Json,
+	/// Markdown content (will be rendered as such if the client supports it).
+	Markdown,
+}
+
+impl Default for PresentationFormat {
+	fn default() -> Self {
+		Self::Text
+	}
+}
+
+/// Whether a field is part of the at-a-glance summary or hidden behind a
+/// "show details" affordance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum PresentationImportance {
+	/// Always visible.
+	Primary,
+	/// Hidden under a "show details" toggle by default.
+	Detail,
+}
+
+impl Default for PresentationImportance {
+	fn default() -> Self {
+		Self::Primary
+	}
+}
+
+/// A single labeled field projected out of the tool's call arguments. The
+/// client will render `label` and the resolved value at `path`.
+#[apply(schema!)]
+pub struct PresentationFieldSpec {
+	/// Human-readable label shown to the user (e.g. "Message", "To").
+	pub label: String,
+	/// Dot-separated path inside the call's `arguments` map. Same syntax as
+	/// `McpArgRewrite.path`. If the path resolves to a missing or null value
+	/// the field is silently dropped from the rendered presentation.
+	pub path: String,
+	#[serde(default)]
+	pub format: PresentationFormat,
+	#[serde(default)]
+	pub importance: PresentationImportance,
+}
+
+/// One presentation rule, applied when an incoming tool call's short name
+/// matches `tools`. The first matching rule wins (no merging across rules).
+#[apply(schema!)]
+pub struct PresentationRule {
+	/// Tool short names this rule applies to (post-multiplexing).
+	pub tools: Vec<String>,
+	/// One-line title shown in the modal header. Optional — falls back to the
+	/// raw tool name on the client side.
+	#[serde(default)]
+	pub title: Option<String>,
+	/// Optional one-sentence summary placed under the title.
+	#[serde(default)]
+	pub summary: Option<String>,
+	/// Ordered list of fields to render.
+	pub fields: Vec<PresentationFieldSpec>,
 }
 
 /// Runtime collection of confirmation rules, built from one or more
@@ -57,11 +137,18 @@ pub struct McpConfirmationSet {
 	rules: RuleSets,
 	/// How long a pending approval remains valid before expiring.
 	pub ttl: Duration,
+	/// Per-tool presentation rules merged across config entries; first match
+	/// wins when building the envelope.
+	presentations: Vec<PresentationRule>,
 }
 
 impl McpConfirmationSet {
-	pub fn new(rules: RuleSets, ttl: Duration) -> Self {
-		Self { rules, ttl }
+	pub fn new(rules: RuleSets, ttl: Duration, presentations: Vec<PresentationRule>) -> Self {
+		Self {
+			rules,
+			ttl,
+			presentations,
+		}
 	}
 
 	/// Returns `true` when this tool call should go through two-phase confirmation.
@@ -78,6 +165,80 @@ impl McpConfirmationSet {
 	pub fn register(&self, cel: &mut ContextBuilder) {
 		self.rules.register(cel);
 	}
+
+	/// Build a structured presentation block for this tool call, suitable for
+	/// JSON-serialising into the confirmation envelope. Returns `None` when
+	/// no rule matches `tool_name` — callers should fall back to the raw
+	/// `preview` string in that case.
+	pub fn build_presentation(
+		&self,
+		tool_name: &str,
+		args: Option<&serde_json::Map<String, serde_json::Value>>,
+	) -> Option<serde_json::Value> {
+		let rule = self
+			.presentations
+			.iter()
+			.find(|r| r.tools.iter().any(|t| t == tool_name))?;
+
+		let mut fields_out: Vec<serde_json::Value> = Vec::new();
+		if let Some(map) = args {
+			for spec in &rule.fields {
+				let Some(value) = walk_to_value(map, &spec.path) else {
+					continue;
+				};
+				fields_out.push(serde_json::json!({
+					"label": spec.label,
+					"value": value,
+					"format": match spec.format {
+						PresentationFormat::Text => "text",
+						PresentationFormat::Code => "code",
+						PresentationFormat::Json => "json",
+						PresentationFormat::Markdown => "markdown",
+					},
+					"importance": match spec.importance {
+						PresentationImportance::Primary => "primary",
+						PresentationImportance::Detail => "detail",
+					},
+				}));
+			}
+		}
+
+		// Drop the presentation entirely if every field path missed — the raw
+		// preview is a strictly better fallback than an empty card.
+		if fields_out.is_empty() {
+			return None;
+		}
+
+		let mut obj = serde_json::Map::new();
+		if let Some(t) = &rule.title {
+			obj.insert("title".to_string(), serde_json::Value::String(t.clone()));
+		}
+		if let Some(s) = &rule.summary {
+			obj.insert("summary".to_string(), serde_json::Value::String(s.clone()));
+		}
+		obj.insert("fields".to_string(), serde_json::Value::Array(fields_out));
+		Some(serde_json::Value::Object(obj))
+	}
+}
+
+/// Resolve a dot-separated path to a borrowed `serde_json::Value` for read-only
+/// inspection. Mirrors `walk_to_string_mut` but returns the raw value (string
+/// or otherwise) so the presenter can preserve type information.
+fn walk_to_value<'a>(
+	args: &'a serde_json::Map<String, serde_json::Value>,
+	path: &str,
+) -> Option<&'a serde_json::Value> {
+	let mut parts = path.split('.');
+	let first = parts.next()?;
+	let mut current: &serde_json::Value = args.get(first)?;
+	for part in parts {
+		let map = match current {
+			serde_json::Value::Object(m) => m,
+			_ => return None,
+		};
+		current = map.get(part)?;
+	}
+	Some(current)
 }
 
 /// Configuration for per-session tool-call rate limiting.
@@ -270,6 +431,7 @@ impl Default for McpConfirmationSet {
 		Self {
 			rules: RuleSets::from(Vec::new()),
 			ttl: Duration::from_secs(120),
+			presentations: Vec::new(),
 		}
 	}
 }
@@ -348,5 +510,117 @@ impl ResourceId {
 
 	pub fn name(&self) -> &str {
 		&self.id
+	}
+}
+
+#[cfg(test)]
+mod presentation_tests {
+	use super::*;
+
+	fn args(map: serde_json::Value) -> Option<serde_json::Map<String, serde_json::Value>> {
+		match map {
+			serde_json::Value::Object(m) => Some(m),
+			_ => None,
+		}
+	}
+
+	fn rule_set() -> McpConfirmationSet {
+		McpConfirmationSet::new(
+			RuleSets::from(Vec::new()),
+			Duration::from_secs(120),
+			vec![PresentationRule {
+				tools: vec!["send-chat-message".to_string()],
+				title: Some("Send Teams message".to_string()),
+				summary: Some("Send a chat message to a Teams conversation".to_string()),
+				fields: vec![
+					PresentationFieldSpec {
+						label: "To".to_string(),
+						path: "chatId".to_string(),
+						format: PresentationFormat::Code,
+						importance: PresentationImportance::Primary,
+					},
+					PresentationFieldSpec {
+						label: "Message".to_string(),
+						path: "body.content".to_string(),
+						format: PresentationFormat::Text,
+						importance: PresentationImportance::Primary,
+					},
+					PresentationFieldSpec {
+						label: "Format".to_string(),
+						path: "body.contentType".to_string(),
+						format: PresentationFormat::Code,
+						importance: PresentationImportance::Detail,
+					},
+				],
+			}],
+		)
+	}
+
+	#[test]
+	fn returns_none_when_no_rule_matches_tool_name() {
+		let set = rule_set();
+		let a = args(serde_json::json!({"chatId": "19:abc"}));
+		let result = set.build_presentation("not-a-known-tool", a.as_ref());
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn projects_dot_paths_into_field_values() {
+		let set = rule_set();
+		let a = args(serde_json::json!({
+			"chatId": "19:abc",
+			"body": { "content": "hi", "contentType": "text" },
+		}));
+		let result = set
+			.build_presentation("send-chat-message", a.as_ref())
+			.expect("expected presentation");
+		let fields = result.get("fields").and_then(|v| v.as_array()).unwrap();
+		assert_eq!(fields.len(), 3);
+		assert_eq!(fields[0].get("label").unwrap(), "To");
+		assert_eq!(fields[0].get("value").unwrap(), "19:abc");
+		assert_eq!(fields[0].get("format").unwrap(), "code");
+		assert_eq!(fields[0].get("importance").unwrap(), "primary");
+		assert_eq!(fields[1].get("label").unwrap(), "Message");
+		assert_eq!(fields[1].get("value").unwrap(), "hi");
+		assert_eq!(fields[2].get("importance").unwrap(), "detail");
+		assert_eq!(result.get("title").unwrap(), "Send Teams message");
+	}
+
+	#[test]
+	fn drops_missing_paths_silently() {
+		let set = rule_set();
+		// No `body` map at all → only chatId resolves; the two body.* fields drop.
+		let a = args(serde_json::json!({"chatId": "19:abc"}));
+		let result = set
+			.build_presentation("send-chat-message", a.as_ref())
+			.expect("expected presentation");
+		let fields = result.get("fields").and_then(|v| v.as_array()).unwrap();
+		assert_eq!(fields.len(), 1);
+		assert_eq!(fields[0].get("label").unwrap(), "To");
+	}
+
+	#[test]
+	fn returns_none_when_every_path_misses() {
+		let set = rule_set();
+		let a = args(serde_json::json!({"unrelated": "value"}));
+		let result = set.build_presentation("send-chat-message", a.as_ref());
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn preserves_non_string_value_types() {
+		let mut set = rule_set();
+		set.presentations[0].fields = vec![PresentationFieldSpec {
+			label: "Payload".to_string(),
+			path: "body".to_string(),
+			format: PresentationFormat::Json,
+			importance: PresentationImportance::Primary,
+		}];
+		let a = args(serde_json::json!({"body": {"content": "hi"}}));
+		let result = set
+			.build_presentation("send-chat-message", a.as_ref())
+			.expect("expected presentation");
+		let fields = result.get("fields").and_then(|v| v.as_array()).unwrap();
+		assert!(fields[0].get("value").unwrap().is_object());
 	}
 }

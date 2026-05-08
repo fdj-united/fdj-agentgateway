@@ -485,8 +485,12 @@ impl Session {
 							drop(approvals);
 
 							let preview = build_preview(tool, call_arguments.as_ref());
+							let presentation = self
+								.relay
+								.confirmation
+								.build_presentation(tool, call_arguments.as_ref());
 
-							let payload = serde_json::json!({
+							let mut payload = serde_json::json!({
 								"confirmationRequired": true,
 								"preview": preview,
 								"expiresInSeconds": ttl.as_secs(),
@@ -499,6 +503,11 @@ impl Session {
 									"Do NOT modify the arguments in any way."
 								)
 							});
+							if let Some(pres) = presentation {
+								if let serde_json::Value::Object(map) = &mut payload {
+									map.insert("presentation".to_string(), pres);
+								}
+							}
 							let text = serde_json::to_string_pretty(&payload)
 								.unwrap_or_default();
 							let msg = ServerJsonRpcMessage::response(
