@@ -480,7 +480,7 @@ impl McpToolEnrichmentSet {
 		&self,
 		tool_name: &str,
 		schema: &mut serde_json::Map<String, serde_json::Value>,
-	) -> Result<(), anyhow::Error> {
+	) -> anyhow::Result<()> {
 		if self.rules.is_empty() {
 			return Ok(());
 		}
@@ -680,6 +680,7 @@ impl ResourceId {
 #[cfg(test)]
 mod enrichment_tests {
 	use super::*;
+	use serde_json::{json, Map, Value};
 
 	#[test]
 	fn enrichment_serde_roundtrip() {
@@ -721,8 +722,6 @@ rules:
 		let set = McpToolEnrichmentSet::default();
 		assert!(set.is_empty());
 	}
-
-	use serde_json::{json, Map, Value};
 
 	fn schema_with(properties: Vec<(&str, Value)>) -> Map<String, Value> {
 		let mut props = Map::new();
