@@ -603,6 +603,7 @@ rules:
 		assert_eq!(parsed.rules[0].inject[0].name, "recipientDisplayName");
 		// Default: required is true.
 		assert!(parsed.rules[0].inject[0].required);
+		assert_eq!(parsed.into_inner().len(), 1);
 	}
 
 	#[test]
