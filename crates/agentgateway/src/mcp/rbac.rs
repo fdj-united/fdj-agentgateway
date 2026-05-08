@@ -470,6 +470,101 @@ impl McpToolEnrichmentSet {
 	pub fn is_empty(&self) -> bool {
 		self.rules.is_empty()
 	}
+
+	/// Inject every matching rule's fields into `schema` (a JSON-schema object,
+	/// the body of `Tool.input_schema`). `tool_name` is the SHORT tool name
+	/// (post-multiplexing). On conflict — between an injected field and an
+	/// existing schema property, or between two rules' injected fields on the
+	/// same tool — returns Err describing the conflict.
+	pub fn apply_to_schema(
+		&self,
+		tool_name: &str,
+		schema: &mut serde_json::Map<String, serde_json::Value>,
+	) -> Result<(), anyhow::Error> {
+		if self.rules.is_empty() {
+			return Ok(());
+		}
+		// Collect every field that matches this tool, across all rules.
+		let mut to_inject: Vec<&EnrichmentField> = Vec::new();
+		for rule in &self.rules {
+			if rule.tools.iter().any(|t| t == tool_name) {
+				to_inject.extend(rule.inject.iter());
+			}
+		}
+		if to_inject.is_empty() {
+			return Ok(());
+		}
+
+		// Detect cross-rule conflicts on field name.
+		let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+		for f in &to_inject {
+			if !seen_names.insert(f.name.as_str()) {
+				return Err(anyhow::anyhow!(
+					"mcpToolEnrichment: tool '{}' has multiple rules injecting field '{}'; rename or merge the rules",
+					tool_name,
+					f.name
+				));
+			}
+		}
+
+		// Ensure `properties` exists; for an upstream that returned no
+		// properties at all we still want to add ours. We DO NOT create
+		// `required` unless we actually need it.
+		let properties = schema
+			.entry("properties".to_string())
+			.or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+		let serde_json::Value::Object(props_map) = properties else {
+			return Err(anyhow::anyhow!(
+				"mcpToolEnrichment: tool '{}' has non-object `properties` in its schema",
+				tool_name
+			));
+		};
+
+		// Detect conflicts with existing properties.
+		for f in &to_inject {
+			if props_map.contains_key(&f.name) {
+				return Err(anyhow::anyhow!(
+					"mcpToolEnrichment: tool '{}' already has a property named '{}' — refusing to inject",
+					tool_name,
+					f.name
+				));
+			}
+		}
+
+		// Inject.
+		for f in &to_inject {
+			let mut field_schema = serde_json::Map::new();
+			field_schema.insert("type".to_string(), serde_json::Value::String(f.field_type.clone()));
+			field_schema.insert(
+				"description".to_string(),
+				serde_json::Value::String(f.description.clone()),
+			);
+			props_map.insert(f.name.clone(), serde_json::Value::Object(field_schema));
+		}
+
+		// Add to `required` for those marked required.
+		let required_to_add: Vec<String> = to_inject
+			.iter()
+			.filter(|f| f.required)
+			.map(|f| f.name.clone())
+			.collect();
+		if !required_to_add.is_empty() {
+			let required = schema
+				.entry("required".to_string())
+				.or_insert_with(|| serde_json::Value::Array(Vec::new()));
+			let serde_json::Value::Array(req_arr) = required else {
+				return Err(anyhow::anyhow!(
+					"mcpToolEnrichment: tool '{}' has non-array `required` in its schema",
+					tool_name
+				));
+			};
+			for name in required_to_add {
+				req_arr.push(serde_json::Value::String(name));
+			}
+		}
+
+		Ok(())
+	}
 }
 
 /// Resolve a dot-separated path to a mutable `&mut String` inside a JSON map.
@@ -625,6 +720,112 @@ rules:
 	fn enrichment_set_default_is_empty() {
 		let set = McpToolEnrichmentSet::default();
 		assert!(set.is_empty());
+	}
+
+	use serde_json::{json, Map, Value};
+
+	fn schema_with(properties: Vec<(&str, Value)>) -> Map<String, Value> {
+		let mut props = Map::new();
+		for (k, v) in properties {
+			props.insert(k.to_string(), v);
+		}
+		let mut schema = Map::new();
+		schema.insert("type".to_string(), json!("object"));
+		schema.insert("properties".to_string(), Value::Object(props));
+		schema
+	}
+
+	fn one_rule(tool: &str, fields: Vec<(&str, bool, &str)>) -> McpToolEnrichmentSet {
+		McpToolEnrichmentSet::new(vec![EnrichmentRule {
+			tools: vec![tool.to_string()],
+			inject: fields
+				.into_iter()
+				.map(|(name, required, desc)| EnrichmentField {
+					name: name.to_string(),
+					field_type: "string".to_string(),
+					required,
+					description: desc.to_string(),
+				})
+				.collect(),
+		}])
+	}
+
+	#[test]
+	fn apply_injects_property_for_matching_tool() {
+		let set = one_rule("send-chat-message", vec![("recipientDisplayName", true, "name")]);
+		let mut schema = schema_with(vec![("chatId", json!({"type": "string"}))]);
+		set.apply_to_schema("send-chat-message", &mut schema).unwrap();
+
+		let props = schema["properties"].as_object().unwrap();
+		assert!(props.contains_key("recipientDisplayName"));
+		let injected = &props["recipientDisplayName"];
+		assert_eq!(injected["type"], json!("string"));
+		assert_eq!(injected["description"], json!("name"));
+
+		let required = schema["required"].as_array().unwrap();
+		assert!(required.contains(&json!("recipientDisplayName")));
+	}
+
+	#[test]
+	fn apply_skips_non_matching_tool() {
+		let set = one_rule("send-chat-message", vec![("x", true, "x")]);
+		let mut schema = schema_with(vec![("a", json!({"type": "string"}))]);
+		set.apply_to_schema("some-other-tool", &mut schema).unwrap();
+
+		let props = schema["properties"].as_object().unwrap();
+		assert!(!props.contains_key("x"));
+		assert!(schema.get("required").is_none());
+	}
+
+	#[test]
+	fn apply_required_false_does_not_add_to_required() {
+		let set = one_rule("t", vec![("f", false, "x")]);
+		let mut schema = schema_with(vec![]);
+		set.apply_to_schema("t", &mut schema).unwrap();
+
+		let props = schema["properties"].as_object().unwrap();
+		assert!(props.contains_key("f"));
+		// `required` array either absent or does not contain "f".
+		match schema.get("required") {
+			None => {}
+			Some(Value::Array(a)) => assert!(!a.contains(&json!("f"))),
+			other => panic!("unexpected `required`: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn apply_rejects_conflict_with_existing_property() {
+		let set = one_rule("t", vec![("chatId", true, "x")]);
+		let mut schema = schema_with(vec![("chatId", json!({"type": "string"}))]);
+		let err = set.apply_to_schema("t", &mut schema).unwrap_err();
+		assert!(err.to_string().contains("chatId"));
+	}
+
+	#[test]
+	fn apply_rejects_conflict_across_rules() {
+		let set = McpToolEnrichmentSet::new(vec![
+			EnrichmentRule {
+				tools: vec!["t".to_string()],
+				inject: vec![EnrichmentField {
+					name: "f".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "first".to_string(),
+				}],
+			},
+			EnrichmentRule {
+				tools: vec!["t".to_string()],
+				inject: vec![EnrichmentField {
+					name: "f".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "second".to_string(),
+				}],
+			},
+		]);
+		let mut schema = schema_with(vec![]);
+		let err = set.apply_to_schema("t", &mut schema).unwrap_err();
+		assert!(err.to_string().contains('f'));
 	}
 }
 
