@@ -403,6 +403,75 @@ impl McpArgRewriteSet {
 	}
 }
 
+/// One field to inject into a tool's input schema. The LLM populates this
+/// from conversation context; the gateway shows the value in the confirmation
+/// modal and strips it before forwarding the call upstream.
+///
+/// v1: only `string`-typed fields are supported.
+#[apply(schema!)]
+pub struct EnrichmentField {
+	/// Property name added to `Tool.input_schema.properties`.
+	pub name: String,
+	/// JSON-schema type. v1 only supports "string".
+	#[serde(rename = "type", default = "default_enrichment_type")]
+	pub field_type: String,
+	/// If true, name is added to `input_schema.required`. Defaults to `true`.
+	#[serde(default = "default_true")]
+	pub required: bool,
+	/// Description text written verbatim into the JSON schema. This is the
+	/// only signal the LLM gets about what to populate.
+	pub description: String,
+}
+
+fn default_enrichment_type() -> String {
+	"string".to_string()
+}
+
+fn default_true() -> bool {
+	true
+}
+
+/// One enrichment rule, applied to every tool whose short name appears in
+/// `tools`. Multiple rules whose `tools` lists overlap on the same tool all
+/// apply (their `inject` lists are unioned). Field-name conflicts across
+/// rules — or against an existing schema property — are caught at start time.
+#[apply(schema!)]
+pub struct EnrichmentRule {
+	/// Tool short names this rule applies to (post-multiplexing).
+	pub tools: Vec<String>,
+	/// Synthetic fields injected into matching tools' input schemas.
+	pub inject: Vec<EnrichmentField>,
+}
+
+/// Configuration for tool-schema enrichment, attached to a backend.
+#[apply(schema!)]
+pub struct McpToolEnrichment {
+	pub rules: Vec<EnrichmentRule>,
+}
+
+impl McpToolEnrichment {
+	pub fn into_inner(self) -> Vec<EnrichmentRule> {
+		self.rules
+	}
+}
+
+/// Runtime view of merged enrichment rules from one or more
+/// [`McpToolEnrichment`] entries attached to a backend.
+#[derive(Clone, Debug, Default)]
+pub struct McpToolEnrichmentSet {
+	rules: Vec<EnrichmentRule>,
+}
+
+impl McpToolEnrichmentSet {
+	pub fn new(rules: Vec<EnrichmentRule>) -> Self {
+		Self { rules }
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.rules.is_empty()
+	}
+}
+
 /// Resolve a dot-separated path to a mutable `&mut String` inside a JSON map.
 /// Returns `None` if any segment doesn't exist, an intermediate value isn't
 /// an object, or the leaf isn't a string.
@@ -510,6 +579,51 @@ impl ResourceId {
 
 	pub fn name(&self) -> &str {
 		&self.id
+	}
+}
+
+#[cfg(test)]
+mod enrichment_tests {
+	use super::*;
+
+	#[test]
+	fn enrichment_serde_roundtrip() {
+		let yaml = r#"
+rules:
+  - tools: [send-chat-message]
+    inject:
+      - name: recipientDisplayName
+        type: string
+        description: "Human-readable recipient name."
+"#;
+		let parsed: McpToolEnrichment = serde_yaml::from_str(yaml).unwrap();
+		assert_eq!(parsed.rules.len(), 1);
+		assert_eq!(parsed.rules[0].tools, vec!["send-chat-message".to_string()]);
+		assert_eq!(parsed.rules[0].inject.len(), 1);
+		assert_eq!(parsed.rules[0].inject[0].name, "recipientDisplayName");
+		// Default: required is true.
+		assert!(parsed.rules[0].inject[0].required);
+	}
+
+	#[test]
+	fn enrichment_required_explicit_false() {
+		let yaml = r#"
+rules:
+  - tools: [t]
+    inject:
+      - name: f
+        type: string
+        required: false
+        description: "x"
+"#;
+		let parsed: McpToolEnrichment = serde_yaml::from_str(yaml).unwrap();
+		assert!(!parsed.rules[0].inject[0].required);
+	}
+
+	#[test]
+	fn enrichment_set_default_is_empty() {
+		let set = McpToolEnrichmentSet::default();
+		assert!(set.is_empty());
 	}
 }
 
