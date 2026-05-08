@@ -565,6 +565,30 @@ impl McpToolEnrichmentSet {
 
 		Ok(())
 	}
+
+	/// Remove every synthetic field declared in matching rules from `args`.
+	/// `tool_name` is the SHORT tool name. Missing fields are no-ops; calling
+	/// twice is identical to calling once.
+	pub fn strip(
+		&self,
+		tool_name: &str,
+		args: &mut Option<serde_json::Map<String, serde_json::Value>>,
+	) {
+		if self.rules.is_empty() {
+			return;
+		}
+		let Some(map) = args.as_mut() else {
+			return;
+		};
+		for rule in &self.rules {
+			if !rule.tools.iter().any(|t| t == tool_name) {
+				continue;
+			}
+			for field in &rule.inject {
+				map.remove(&field.name);
+			}
+		}
+	}
 }
 
 /// Resolve a dot-separated path to a mutable `&mut String` inside a JSON map.
@@ -681,6 +705,7 @@ impl ResourceId {
 mod enrichment_tests {
 	use super::*;
 	use serde_json::{json, Map, Value};
+	use serde_json::Map as JsonMap;
 
 	#[test]
 	fn enrichment_serde_roundtrip() {
@@ -825,6 +850,80 @@ rules:
 		let mut schema = schema_with(vec![]);
 		let err = set.apply_to_schema("t", &mut schema).unwrap_err();
 		assert!(err.to_string().contains('f'));
+	}
+
+	fn args_with(pairs: Vec<(&str, Value)>) -> Option<JsonMap<String, Value>> {
+		let mut m = JsonMap::new();
+		for (k, v) in pairs {
+			m.insert(k.to_string(), v);
+		}
+		Some(m)
+	}
+
+	#[test]
+	fn strip_removes_matching_synthetic_field() {
+		let set = one_rule("t", vec![("display", true, "x")]);
+		let mut args = args_with(vec![
+			("chatId", json!("19:abc")),
+			("display", json!("Alice")),
+		]);
+		set.strip("t", &mut args);
+
+		let m = args.unwrap();
+		assert!(!m.contains_key("display"));
+		assert!(m.contains_key("chatId"));
+	}
+
+	#[test]
+	fn strip_is_noop_for_non_matching_tool() {
+		let set = one_rule("t", vec![("display", true, "x")]);
+		let mut args = args_with(vec![("display", json!("Alice"))]);
+		set.strip("other", &mut args);
+		assert!(args.unwrap().contains_key("display"));
+	}
+
+	#[test]
+	fn strip_is_noop_when_field_absent() {
+		let set = one_rule("t", vec![("display", true, "x")]);
+		let mut args = args_with(vec![("chatId", json!("19:abc"))]);
+		set.strip("t", &mut args);
+		let m = args.unwrap();
+		assert_eq!(m.len(), 1);
+		assert!(m.contains_key("chatId"));
+	}
+
+	#[test]
+	fn strip_is_idempotent() {
+		let set = one_rule("t", vec![("display", true, "x")]);
+		let mut args = args_with(vec![("display", json!("Alice"))]);
+		set.strip("t", &mut args);
+		set.strip("t", &mut args);
+		assert!(args.unwrap().is_empty());
+	}
+
+	#[test]
+	fn strip_then_hash_is_stable_across_synthetic_value_changes() {
+		// This is the load-bearing invariant: Phase-2 confirmation match
+		// must survive the LLM producing a different synthetic value than
+		// it did in Phase 1. (See spec §6.)
+		use crate::mcp::session::hash_args;
+		let set = one_rule("t", vec![("display", true, "x")]);
+
+		let mut a1 = args_with(vec![
+			("chatId", json!("19:abc")),
+			("display", json!("Alice")),
+		]);
+		set.strip("t", &mut a1);
+		let h1 = hash_args(a1.as_ref());
+
+		let mut a2 = args_with(vec![
+			("chatId", json!("19:abc")),
+			("display", json!("Alice S.")),
+		]);
+		set.strip("t", &mut a2);
+		let h2 = hash_args(a2.as_ref());
+
+		assert_eq!(h1, h2);
 	}
 }
 

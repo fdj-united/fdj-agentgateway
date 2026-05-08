@@ -118,7 +118,7 @@ fn hash_value(v: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
 	}
 }
 
-fn hash_args(args: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
+pub(crate) fn hash_args(args: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
 	match args {
