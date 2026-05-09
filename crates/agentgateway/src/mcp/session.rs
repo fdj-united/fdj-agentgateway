@@ -411,16 +411,11 @@ impl Session {
 							) {
 							// Compute the same lookup key Phase 1 uses.
 							let cleared = if self.is_stateful {
-								let mut for_hash = call_arguments.clone();
-								if let Some(map) = for_hash.as_mut() {
+								let mut stripped = call_arguments.clone();
+								if let Some(map) = stripped.as_mut() {
 									map.remove(crate::mcp::MCP_CLEAR_PENDING_SENTINEL);
 								}
-								self.relay.enrichment.strip(tool, &mut for_hash);
-								let key = format!(
-									"{}|{:016x}",
-									name,
-									hash_args(for_hash.as_ref())
-								);
+								let key = self.pending_approval_key(&name, tool, &stripped);
 								let mut approvals = self.pending_approvals.lock().await;
 								approvals.remove(&key).is_some()
 							} else {
@@ -516,11 +511,7 @@ impl Session {
 							// doesn't break the pending-approval match (spec §6).
 							// build_presentation below still uses the ORIGINAL args (with
 							// the synthetic field present) to populate the modal.
-							let key = {
-								let mut for_hash = call_arguments.clone();
-								self.relay.enrichment.strip(tool, &mut for_hash);
-								format!("{}|{:016x}", name, hash_args(for_hash.as_ref()))
-							};
+							let key = self.pending_approval_key(&name, tool, &call_arguments);
 
 							let mut approvals = self.pending_approvals.lock().await;
 
@@ -701,6 +692,26 @@ impl Session {
 				"unsupported message type".to_string(),
 			)),
 		}
+	}
+
+	/// Compute the `(tool, args-hash)` key used to track a pending approval.
+	/// Both the Phase-1 store path AND the clear-sentinel evict path MUST go
+	/// through this helper so the two stay in lock-step. If a future change
+	/// adds a normalization step (e.g. dropping nulls, sorting keys), it lands
+	/// here once and both call sites pick it up automatically.
+	///
+	/// The caller is responsible for removing any non-payload sentinel args
+	/// (e.g. `MCP_CLEAR_PENDING_SENTINEL`) from `args` before calling this —
+	/// the helper just runs the standard strip + hash sequence.
+	fn pending_approval_key(
+		&self,
+		name: &str,
+		tool: &str,
+		args: &Option<serde_json::Map<String, serde_json::Value>>,
+	) -> String {
+		let mut for_hash = args.clone();
+		self.relay.enrichment.strip(tool, &mut for_hash);
+		format!("{}|{:016x}", name, hash_args(for_hash.as_ref()))
 	}
 }
 
