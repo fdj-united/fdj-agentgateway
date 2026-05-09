@@ -28,6 +28,11 @@ use rmcp::model::RequestId;
 /// a subsequent identical call within the gateway-side TTL doesn't bypass
 /// confirmation.
 ///
+/// **Cross-repo invariant:** the matching constant in the LibreChat backend
+/// (currently a literal in `Fdj-LibreChat/api/server/services/MCP.js`) MUST
+/// be kept in lockstep — if you change this value, update both repos in the
+/// same release.
+///
 /// See [docs/superpowers/specs/2026-05-09-mcp-confirmation-clear-design.md](../../../docs/superpowers/specs/2026-05-09-mcp-confirmation-clear-design.md).
 pub const MCP_CLEAR_PENDING_SENTINEL: &str = "__mcp_clear_pending__";
 pub use router::App;

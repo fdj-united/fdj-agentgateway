@@ -207,17 +207,16 @@ impl Relay {
 					// (See spec §6.1.)
 					if let Some(serde_json::Value::Object(props)) =
 						t.input_schema.get("properties")
+						&& props.contains_key(MCP_CLEAR_PENDING_SENTINEL)
 					{
-						if props.contains_key(MCP_CLEAR_PENDING_SENTINEL) {
-							return Err(ClientError::new(anyhow::anyhow!(
-								"tool '{}' declares the reserved property '{}' — \
-								 this name is reserved by the gateway for the \
-								 pending-approval clear sentinel; rename the property \
-								 to avoid the collision",
-								t.name,
-								MCP_CLEAR_PENDING_SENTINEL
-							)));
-						}
+						return Err(ClientError::new(anyhow::anyhow!(
+							"tool '{}' declares the reserved property '{}' — \
+							 this name is reserved by the gateway for the \
+							 pending-approval clear sentinel; rename the property \
+							 to avoid the collision",
+							t.name,
+							MCP_CLEAR_PENDING_SENTINEL
+						)));
 					}
 
 					// Inject enrichment fields into the tool's input schema. The
