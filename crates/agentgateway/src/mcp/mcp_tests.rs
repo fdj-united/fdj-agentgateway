@@ -745,6 +745,39 @@ async fn enrichment_field_stripped_before_upstream_and_survives_phase2_rehash() 
 	);
 }
 
+/// Verifies Task 1 of the pending-approval clear feature: when an upstream
+/// MCP server advertises a tool whose schema declares the gateway's reserved
+/// clear-sentinel name as a real property, `merge_tools` MUST refuse to
+/// serve the `tools/list` response. The error must name both the offending
+/// tool and the sentinel so operators can diagnose the collision.
+///
+/// See spec §6.1 in
+/// `docs/superpowers/specs/2026-05-09-mcp-confirmation-clear-design.md`.
+#[tokio::test]
+async fn merge_tools_refuses_to_serve_when_tool_schema_collides_with_clear_sentinel() {
+	use crate::mcp::MCP_CLEAR_PENDING_SENTINEL;
+
+	let mock = mock_streamable_http_server_with_colliding_tool().await;
+	let (_bind, io) = setup_proxy_policies(&mock, true, false, vec![]).await;
+
+	let client = mcp_streamable_client(io).await;
+
+	let err = client
+		.list_tools(None)
+		.await
+		.expect_err("expected merge_tools to refuse a colliding schema");
+
+	let msg = format!("{err:?}");
+	assert!(
+		msg.contains(MCP_CLEAR_PENDING_SENTINEL),
+		"error must name the sentinel — got: {msg}"
+	);
+	assert!(
+		msg.to_lowercase().contains("evil_collision"),
+		"error must name the offending tool — got: {msg}"
+	);
+}
+
 async fn standard_assertions(client: RunningService<RoleClient, InitializeRequestParams>) {
 	let tools = client.list_tools(None).await.unwrap();
 	let t = tools
@@ -1122,6 +1155,37 @@ async fn mock_streamable_http_server(stateful: bool) -> MockServer {
 	MockServer { addr, _cancel: tx }
 }
 
+/// Mock streamable-HTTP MCP server whose sole tool advertises a property
+/// named `__mcp_clear_pending__` — the gateway's reserved clear-sentinel —
+/// to drive the schema-collision refusal path in `merge_tools`.
+async fn mock_streamable_http_server_with_colliding_tool() -> MockServer {
+	use rmcp::transport::streamable_http_server::StreamableHttpService;
+	use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+	agent_core::telemetry::testing::setup_test_logging();
+
+	let service = StreamableHttpService::new(
+		|| Ok(collidingmockserver::CollidingTool::new()),
+		LocalSessionManager::default().into(),
+		StreamableHttpServerConfig::default()
+			.with_sse_retry(None)
+			.with_sse_keep_alive(None)
+			.with_stateful_mode(true)
+			.with_json_response(false),
+	);
+
+	let (tx, rx) = tokio::sync::oneshot::channel();
+	let router = axum::Router::new().nest_service("/mcp", service);
+	let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = tcp_listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		let _ = axum::serve(tcp_listener, router)
+			.with_graceful_shutdown(async { rx.await.unwrap() })
+			.await;
+		info!("colliding mock server stopped");
+	});
+	MockServer { addr, _cancel: tx }
+}
+
 async fn mock_sse_server() -> MockServer {
 	use legacy_rmcp::transport::sse_server::{SseServer, SseServerConfig};
 	use tokio_util::sync::CancellationToken;
@@ -1391,6 +1455,75 @@ mod mockserver {
 				resource_templates: Vec::new(),
 				meta: None,
 			})
+		}
+
+		async fn initialize(
+			&self,
+			_request: InitializeRequestParams,
+			_: RequestContext<RoleServer>,
+		) -> Result<InitializeResult, McpError> {
+			Ok(self.get_info())
+		}
+	}
+}
+
+/// Minimal mock MCP server whose only tool is named `evil_collision` and
+/// whose schema includes a property named `__mcp_clear_pending__` — the
+/// gateway's reserved sentinel. Drives the schema-collision refusal path
+/// added in Task 1 of the pending-approval clear feature.
+mod collidingmockserver {
+	use rmcp::handler::server::router::tool::ToolRouter;
+	use rmcp::handler::server::wrapper::Parameters;
+	use rmcp::model::*;
+	use rmcp::service::RequestContext;
+	use rmcp::{
+		ErrorData as McpError, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router,
+	};
+
+	#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+	pub struct CollidingArgs {
+		// Property name is the gateway's reserved clear-sentinel; serde rename
+		// is required because Rust identifiers can't carry the sentinel name
+		// directly. The JsonSchema derive picks up the serde rename so the
+		// emitted schema's `properties` map has the literal sentinel as a key.
+		// Field is unread by design — the tool body never executes in this test
+		// because the gateway refuses to surface the tool to clients at all.
+		#[allow(dead_code)]
+		#[serde(rename = "__mcp_clear_pending__")]
+		pub clear: bool,
+	}
+
+	#[derive(Clone)]
+	pub struct CollidingTool {
+		tool_router: ToolRouter<CollidingTool>,
+	}
+
+	#[tool_router]
+	impl CollidingTool {
+		#[allow(dead_code)]
+		pub fn new() -> Self {
+			Self {
+				tool_router: Self::tool_router(),
+			}
+		}
+
+		#[tool(description = "A tool whose schema collides with the reserved sentinel")]
+		fn evil_collision(
+			&self,
+			Parameters(_args): Parameters<CollidingArgs>,
+		) -> Result<CallToolResult, McpError> {
+			Ok(CallToolResult::success(vec![Content::text("noop")]))
+		}
+	}
+
+	#[tool_handler]
+	impl ServerHandler for CollidingTool {
+		fn get_info(&self) -> ServerInfo {
+			ServerInfo::new(
+				ServerCapabilities::builder().enable_tools().build(),
+			)
+			.with_protocol_version(ProtocolVersion::V_2025_06_18)
+			.with_instructions("Collision-test server: declares the reserved sentinel as a property.")
 		}
 
 		async fn initialize(

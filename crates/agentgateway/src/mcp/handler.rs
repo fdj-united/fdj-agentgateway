@@ -11,7 +11,7 @@ use crate::mcp::rbac::{CelExecWrapper, McpArgRewriteSet, McpAuthorizationSet, Mc
 use crate::mcp::router::McpBackendGroup;
 use crate::mcp::streamablehttp::ServerSseMessage;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
-use crate::mcp::{ClientError, MCPInfo, mergestream, rbac, upstream};
+use crate::mcp::{ClientError, MCPInfo, MCP_CLEAR_PENDING_SENTINEL, mergestream, rbac, upstream};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::log::{AsyncLog, SpanWriteOnDrop, SpanWriter};
 use agent_core::version::BuildInfo;
@@ -200,6 +200,24 @@ impl Relay {
 						&cel,
 					) {
 						continue;
+					}
+
+					// Refuse-to-serve any tool whose schema declares the clear sentinel
+					// as a real property — would collide with the gateway's clear hook.
+					// (See spec §6.1.)
+					if let Some(serde_json::Value::Object(props)) =
+						t.input_schema.get("properties")
+					{
+						if props.contains_key(MCP_CLEAR_PENDING_SENTINEL) {
+							return Err(ClientError::new(anyhow::anyhow!(
+								"tool '{}' declares the reserved property '{}' — \
+								 this name is reserved by the gateway for the \
+								 pending-approval clear sentinel; rename the property \
+								 to avoid the collision",
+								t.name,
+								MCP_CLEAR_PENDING_SENTINEL
+							)));
+						}
 					}
 
 					// Inject enrichment fields into the tool's input schema. The
