@@ -28,7 +28,7 @@ use crate::http::{
 	timeout,
 };
 use crate::mcp::FailureMode;
-use crate::mcp::{McpArgRewrite, McpAuthorization, McpConfirmation, McpRateLimit};
+use crate::mcp::{McpArgRewrite, McpAuthorization, McpConfirmation, McpRateLimit, McpToolEnrichment};
 use crate::telemetry::log::OrderedStringMap;
 use crate::transport::tls;
 use crate::types::discovery::{NamespacedHostname, Service};
@@ -2062,6 +2062,7 @@ pub enum BackendPolicy {
 	McpConfirmation(McpConfirmation),
 	McpRateLimit(McpRateLimit),
 	McpArgRewrite(McpArgRewrite),
+	McpToolEnrichment(McpToolEnrichment),
 	McpAuthentication(McpAuthentication),
 	A2a(A2aPolicy),
 	#[serde(rename = "http")]

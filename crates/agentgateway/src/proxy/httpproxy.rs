@@ -202,6 +202,8 @@ async fn apply_backend_policies(
 		// Applied elsewhere
 		mcp_arg_rewrite: _,
 		// Applied elsewhere
+		mcp_tool_enrichment: _,
+		// Applied elsewhere
 		mcp_authentication: _,
 		// Applied elsewhere
 		inference_routing: _,

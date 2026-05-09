@@ -17,7 +17,7 @@ use crate::llm::policy::PromptGuard;
 use crate::llm::{AIBackend, AIProvider, LocalModelAIProvider, NamedAIProvider};
 use crate::llm::{anthropic, openai};
 use crate::mcp::FailureMode;
-use crate::mcp::{McpArgRewrite, McpAuthorization, McpConfirmation, McpRateLimit};
+use crate::mcp::{McpArgRewrite, McpAuthorization, McpConfirmation, McpRateLimit, McpToolEnrichment};
 use crate::store::LocalWorkload;
 use crate::types::agent::{
 	A2aPolicy, Authorization, Backend, BackendKey, BackendPolicy, BackendReference,
@@ -667,6 +667,7 @@ impl LocalBackend {
 				mcp_confirmation: p.mcp_confirmation,
 				mcp_rate_limit: p.mcp_rate_limit,
 				mcp_arg_rewrite: p.mcp_arg_rewrite,
+				mcp_tool_enrichment: p.mcp_tool_enrichment,
 				a2a: None,
 				ai: None,
 			})
@@ -1127,6 +1128,9 @@ pub struct MCPLocalBackendPolicies {
 	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
 	#[serde(default)]
 	pub mcp_arg_rewrite: Option<McpArgRewrite>,
+	/// Inject extra parameters into selected tool schemas; the values are stripped before forwarding upstream.
+	#[serde(default)]
+	pub mcp_tool_enrichment: Option<McpToolEnrichment>,
 }
 
 #[apply(schema_de!)]
@@ -1148,6 +1152,9 @@ pub struct LocalBackendPolicies {
 	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
 	#[serde(default)]
 	pub mcp_arg_rewrite: Option<McpArgRewrite>,
+	/// Inject extra parameters into selected tool schemas; the values are stripped before forwarding upstream.
+	#[serde(default)]
+	pub mcp_tool_enrichment: Option<McpToolEnrichment>,
 	/// Mark this traffic as A2A to enable A2A processing and telemetry.
 	#[serde(default)]
 	pub a2a: Option<A2aPolicy>,
@@ -1176,6 +1183,7 @@ impl LocalBackendPolicies {
 			mcp_confirmation,
 			mcp_rate_limit,
 			mcp_arg_rewrite,
+			mcp_tool_enrichment,
 			a2a,
 			ai,
 		} = self;
@@ -1212,6 +1220,9 @@ impl LocalBackendPolicies {
 		}
 		if let Some(p) = mcp_arg_rewrite {
 			pols.push(BackendPolicy::McpArgRewrite(p))
+		}
+		if let Some(p) = mcp_tool_enrichment {
+			pols.push(BackendPolicy::McpToolEnrichment(p))
 		}
 		if let Some(p) = a2a {
 			pols.push(BackendPolicy::A2a(p))
@@ -1330,6 +1341,9 @@ pub struct FilterOrPolicy {
 	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
 	#[serde(default)]
 	mcp_arg_rewrite: Option<McpArgRewrite>,
+	/// Inject extra parameters into selected tool schemas; the values are stripped before forwarding upstream.
+	#[serde(default)]
+	mcp_tool_enrichment: Option<McpToolEnrichment>,
 	/// Authorization policies for HTTP access.
 	#[serde(default)]
 	authorization: Option<Authorization>,
@@ -2467,6 +2481,7 @@ pub(crate) async fn split_policies(
 		mcp_confirmation,
 		mcp_rate_limit,
 		mcp_arg_rewrite,
+		mcp_tool_enrichment,
 		mcp_authentication,
 		a2a,
 		ai,
@@ -2523,6 +2538,9 @@ pub(crate) async fn split_policies(
 	}
 	if let Some(p) = mcp_arg_rewrite {
 		backend_policies.push(BackendPolicy::McpArgRewrite(p))
+	}
+	if let Some(p) = mcp_tool_enrichment {
+		backend_policies.push(BackendPolicy::McpToolEnrichment(p))
 	}
 	if let Some(p) = mcp_authentication {
 		let authn: McpAuthentication = p.translate(client.clone()).await?;

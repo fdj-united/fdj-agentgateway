@@ -117,6 +117,9 @@ impl App {
 		let arg_rewrite_policies = backend_policies
 			.mcp_arg_rewrite
 			.unwrap_or_default();
+		let enrichment_policies = backend_policies
+			.mcp_tool_enrichment
+			.unwrap_or_default();
 		let authn = backend_policies.mcp_authentication;
 
 		// Store an empty value, we will populate each field async
@@ -155,7 +158,7 @@ impl App {
 					confirmation: confirmation_policies.clone(),
 					rate_limit: rate_limit_policies.clone(),
 					arg_rewrite: arg_rewrite_policies.clone(),
-					enrichment: crate::mcp::McpToolEnrichmentSet::default(),
+					enrichment: enrichment_policies.clone(),
 					client: client.clone(),
 				},
 			))
@@ -175,7 +178,7 @@ impl App {
 					confirmation: confirmation_policies.clone(),
 					rate_limit: rate_limit_policies.clone(),
 					arg_rewrite: arg_rewrite_policies.clone(),
-					enrichment: crate::mcp::McpToolEnrichmentSet::default(),
+					enrichment: enrichment_policies.clone(),
 					client: client.clone(),
 				},
 			))

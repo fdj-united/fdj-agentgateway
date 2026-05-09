@@ -10,7 +10,7 @@ use crate::http::ext_proc::InferenceRouting;
 use crate::http::oidc;
 use crate::http::{ext_authz, ext_proc, filters, health, remoteratelimit, retry, timeout};
 use crate::llm::policy::ResponseGuard;
-use crate::mcp::{McpArgRewriteSet, McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet};
+use crate::mcp::{McpArgRewriteSet, McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet, McpToolEnrichmentSet};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{
 	A2aPolicy, Backend, BackendKey, BackendPolicy, BackendTargetRef, BackendWithPolicies, Bind,
@@ -153,6 +153,7 @@ pub struct BackendPolicies {
 	pub mcp_confirmation: Option<McpConfirmationSet>,
 	pub mcp_rate_limit: Option<McpRateLimitSet>,
 	pub mcp_arg_rewrite: Option<McpArgRewriteSet>,
+	pub mcp_tool_enrichment: Option<McpToolEnrichmentSet>,
 	pub mcp_authentication: Option<McpAuthentication>,
 
 	pub http: Option<types::backend::HTTP>,
@@ -189,6 +190,7 @@ impl BackendPolicies {
 			mcp_confirmation: other.mcp_confirmation.or(self.mcp_confirmation),
 			mcp_rate_limit: other.mcp_rate_limit.or(self.mcp_rate_limit),
 			mcp_arg_rewrite: other.mcp_arg_rewrite.or(self.mcp_arg_rewrite),
+			mcp_tool_enrichment: other.mcp_tool_enrichment.or(self.mcp_tool_enrichment),
 			mcp_authentication: other.mcp_authentication.or(self.mcp_authentication),
 			inference_routing: other.inference_routing.or(self.inference_routing),
 			http: other.http.or(self.http),
@@ -750,6 +752,8 @@ impl Store {
 		let mut mcp_rate: Vec<(crate::http::authorization::RuleSet, u32, u64)> = Vec::new();
 		// All ArgRewriteRule entries collected from one or more McpArgRewrite policies
 		let mut mcp_arg_rewrite: Vec<crate::mcp::ArgRewriteRule> = Vec::new();
+		// All EnrichmentRule entries collected from one or more McpToolEnrichment policies
+		let mut mcp_tool_enrichment: Vec<crate::mcp::EnrichmentRule> = Vec::new();
 		let mut pol = BackendPolicies::default();
 		for rule in rules {
 			match &rule {
@@ -821,6 +825,10 @@ impl Store {
 					// Rules from multiple policies concatenate, applied in order.
 					mcp_arg_rewrite.extend(p.clone().into_inner());
 				},
+				BackendPolicy::McpToolEnrichment(p) => {
+					// Rules from multiple policies concatenate.
+					mcp_tool_enrichment.extend(p.clone().into_inner());
+				},
 				BackendPolicy::McpAuthentication(p) => {
 					pol.mcp_authentication.get_or_insert_with(|| p.clone());
 				},
@@ -861,6 +869,9 @@ impl Store {
 		}
 		if !mcp_arg_rewrite.is_empty() {
 			pol.mcp_arg_rewrite = Some(McpArgRewriteSet::new(mcp_arg_rewrite));
+		}
+		if !mcp_tool_enrichment.is_empty() {
+			pol.mcp_tool_enrichment = Some(McpToolEnrichmentSet::new(mcp_tool_enrichment));
 		}
 		pol
 	}
