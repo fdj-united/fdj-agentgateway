@@ -457,7 +457,17 @@ impl Session {
 							// Build the call key from (tool name, args hash). Different parallel
 							// calls with different args get separate pending entries; a confirmation
 							// re-call only matches when the LLM re-issues IDENTICAL args.
-							let key = format!("{}|{:016x}", name, hash_args(call_arguments.as_ref()));
+							//
+							// Hash a STRIPPED clone of the args so an enrichment-injected
+							// synthetic display field varying between Phase 1 and Phase 2
+							// doesn't break the pending-approval match (spec §6).
+							// build_presentation below still uses the ORIGINAL args (with
+							// the synthetic field present) to populate the modal.
+							let key = {
+								let mut for_hash = call_arguments.clone();
+								self.relay.enrichment.strip(tool, &mut for_hash);
+								format!("{}|{:016x}", name, hash_args(for_hash.as_ref()))
+							};
 
 							let mut approvals = self.pending_approvals.lock().await;
 
@@ -471,6 +481,9 @@ impl Session {
 									drop(approvals);
 									let tn = tool.to_string();
 									ctr.params.name = tn.into();
+									// Strip BEFORE arg_rewrite + upstream forward, so the
+									// upstream MCP server never sees fields it didn't define.
+									self.relay.enrichment.strip(tool, &mut ctr.params.arguments);
 									self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
 									return self
 										.relay
@@ -527,6 +540,10 @@ impl Session {
 
 						let tn = tool.to_string();
 						ctr.params.name = tn.into();
+						// Strip BEFORE arg_rewrite + upstream forward — handles the case
+						// where a tool has enrichment configured but no mcpConfirmation;
+						// the upstream still must not see the synthetic field.
+						self.relay.enrichment.strip(tool, &mut ctr.params.arguments);
 						self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
 						self
 							.relay

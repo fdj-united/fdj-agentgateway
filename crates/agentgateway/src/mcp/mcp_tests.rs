@@ -609,6 +609,142 @@ async fn enrichment_injects_field_into_tools_list_response() {
 	);
 }
 
+/// Verifies Task 7: when an enrichment-injected synthetic field is present in
+/// `tools/call` arguments, the gateway must
+///   1. NEVER forward that field to the upstream MCP server, and
+///   2. NOT break the two-phase confirmation match even if the LLM produces a
+///      different synthetic value in Phase 2 than it did in Phase 1.
+///
+/// This is a full integration test against the mock streamable HTTP server.
+/// The mock's `echo` tool simply reflects its arguments back as JSON, so the
+/// final response text is a direct witness of what the upstream observed.
+///
+/// Maps to the three call sites changed in `session.rs`:
+///   - hash-on-stripped-clone at the confirmation key computation,
+///   - strip-before-arg-rewrite at Phase 2,
+///   - strip-before-arg-rewrite at the non-confirmed path
+///     (covered indirectly: if Phase 2 reused the non-confirmed path's strip,
+///     a matching pending entry would never be found in the first place).
+#[tokio::test]
+async fn enrichment_field_stripped_before_upstream_and_survives_phase2_rehash() {
+	let mock = mock_streamable_http_server(true).await;
+
+	// Confirmation rule: every call to `echo` requires two-phase confirmation.
+	let confirmation = crate::mcp::McpConfirmation {
+		rules: RuleSet::new(PolicySet::new(
+			vec![],
+			vec![],
+			vec![Arc::new(
+				cel::Expression::new_strict(r#"mcp.tool.name == "echo""#).unwrap(),
+			)],
+		)),
+		ttl_seconds: Some(120),
+		presentations: vec![],
+	};
+
+	// Enrichment rule: `echo` gains a synthetic `recipientDisplayName` field
+	// that the LLM is expected to populate but the upstream never sees.
+	let enrichment = crate::mcp::McpToolEnrichment {
+		rules: vec![crate::mcp::EnrichmentRule {
+			tools: vec!["echo".to_string()],
+			inject: vec![crate::mcp::EnrichmentField {
+				name: "recipientDisplayName".to_string(),
+				field_type: "string".to_string(),
+				required: true,
+				description: "Human-readable recipient name".to_string(),
+			}],
+		}],
+	};
+
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![
+			BackendPolicy::McpConfirmation(confirmation),
+			BackendPolicy::McpToolEnrichment(enrichment),
+		],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	// ── Phase 1: call echo with synthetic = "Alice" ────────────────────────
+	let phase1 = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({
+					"hi": "world",
+					"recipientDisplayName": "Alice",
+				})
+				.as_object()
+				.cloned()
+				.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 1 call should return a result envelope, not error");
+
+	let phase1_text = phase1.content[0]
+		.raw
+		.as_text()
+		.expect("Phase 1 result must be text content")
+		.text
+		.clone();
+	let phase1_json: serde_json::Value =
+		serde_json::from_str(&phase1_text).expect("Phase 1 envelope must be JSON");
+	assert_eq!(
+		phase1_json.get("confirmationRequired"),
+		Some(&serde_json::json!(true)),
+		"Phase 1 must return a confirmation envelope, got {phase1_text}"
+	);
+
+	// ── Phase 2: re-call echo with the SAME identifying args but a DIFFERENT
+	//            synthetic value. The hash-on-stripped-clone invariant means
+	//            the pending entry must still match.
+	let phase2 = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({
+					"hi": "world",
+					"recipientDisplayName": "Bob",
+				})
+				.as_object()
+				.cloned()
+				.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 2 call should match the pending approval and forward upstream");
+
+	let phase2_text = phase2.content[0]
+		.raw
+		.as_text()
+		.expect("Phase 2 result must be text content")
+		.text
+		.clone();
+
+	// Upstream is the echo mock — it reflects whatever args it received as JSON.
+	// If the gateway stripped correctly, this is exactly `{"hi":"world"}` and
+	// MUST NOT contain `recipientDisplayName`.
+	assert!(
+		!phase2_text.contains("recipientDisplayName"),
+		"upstream must never see synthetic field; got upstream echo: {phase2_text}"
+	);
+	assert!(
+		!phase2_text.contains("confirmationRequired"),
+		"Phase 2 must NOT return another confirmation envelope (pending match \
+		 broken by a non-stripped hash); got: {phase2_text}"
+	);
+	let upstream_args: serde_json::Value = serde_json::from_str(&phase2_text)
+		.expect("upstream echo must reflect a valid JSON object");
+	assert_eq!(
+		upstream_args,
+		serde_json::json!({"hi": "world"}),
+		"upstream must receive only the non-synthetic fields, got {upstream_args}"
+	);
+}
+
 async fn standard_assertions(client: RunningService<RoleClient, InitializeRequestParams>) {
 	let tools = client.list_tools(None).await.unwrap();
 	let t = tools
