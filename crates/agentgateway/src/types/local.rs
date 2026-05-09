@@ -1128,7 +1128,7 @@ pub struct MCPLocalBackendPolicies {
 	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
 	#[serde(default)]
 	pub mcp_arg_rewrite: Option<McpArgRewrite>,
-	/// Inject extra parameters into selected tool schemas; the values are stripped before forwarding upstream.
+	/// Inject synthetic display-only fields into selected tool schemas; their values are stripped before forwarding upstream.
 	#[serde(default)]
 	pub mcp_tool_enrichment: Option<McpToolEnrichment>,
 }
@@ -1152,7 +1152,7 @@ pub struct LocalBackendPolicies {
 	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
 	#[serde(default)]
 	pub mcp_arg_rewrite: Option<McpArgRewrite>,
-	/// Inject extra parameters into selected tool schemas; the values are stripped before forwarding upstream.
+	/// Inject synthetic display-only fields into selected tool schemas; their values are stripped before forwarding upstream.
 	#[serde(default)]
 	pub mcp_tool_enrichment: Option<McpToolEnrichment>,
 	/// Mark this traffic as A2A to enable A2A processing and telemetry.
@@ -1341,7 +1341,7 @@ pub struct FilterOrPolicy {
 	/// Mutate string fields in selected tool calls' arguments before forwarding upstream.
 	#[serde(default)]
 	mcp_arg_rewrite: Option<McpArgRewrite>,
-	/// Inject extra parameters into selected tool schemas; the values are stripped before forwarding upstream.
+	/// Inject synthetic display-only fields into selected tool schemas; their values are stripped before forwarding upstream.
 	#[serde(default)]
 	mcp_tool_enrichment: Option<McpToolEnrichment>,
 	/// Authorization policies for HTTP access.
