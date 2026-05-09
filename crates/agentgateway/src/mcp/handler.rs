@@ -7,7 +7,7 @@ use crate::http::sessionpersistence::MCPSession;
 use crate::mcp;
 use crate::mcp::FailureMode;
 use crate::mcp::mergestream::{MergeFn, Messages};
-use crate::mcp::rbac::{CelExecWrapper, McpArgRewriteSet, McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet};
+use crate::mcp::rbac::{CelExecWrapper, McpArgRewriteSet, McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet, McpToolEnrichmentSet};
 use crate::mcp::router::McpBackendGroup;
 use crate::mcp::streamablehttp::ServerSseMessage;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
@@ -44,6 +44,7 @@ pub struct Relay {
 	pub confirmation: McpConfirmationSet,
 	pub rate_limit: McpRateLimitSet,
 	pub arg_rewrite: McpArgRewriteSet,
+	pub enrichment: McpToolEnrichmentSet,
 }
 
 pub struct RelayInputs {
@@ -52,6 +53,7 @@ pub struct RelayInputs {
 	pub confirmation: McpConfirmationSet,
 	pub rate_limit: McpRateLimitSet,
 	pub arg_rewrite: McpArgRewriteSet,
+	pub enrichment: McpToolEnrichmentSet,
 	pub client: PolicyClient,
 }
 
@@ -63,6 +65,7 @@ impl RelayInputs {
 			self.confirmation,
 			self.rate_limit,
 			self.arg_rewrite,
+			self.enrichment,
 			self.client,
 		)
 	}
@@ -75,6 +78,7 @@ impl Relay {
 		confirmation: McpConfirmationSet,
 		rate_limit: McpRateLimitSet,
 		arg_rewrite: McpArgRewriteSet,
+		enrichment: McpToolEnrichmentSet,
 		client: PolicyClient,
 	) -> Result<Self, mcp::Error> {
 		Ok(Self {
@@ -83,6 +87,7 @@ impl Relay {
 			confirmation,
 			rate_limit,
 			arg_rewrite,
+			enrichment,
 		})
 	}
 	pub fn with_policies(&self, policies: McpAuthorizationSet) -> Self {
@@ -92,6 +97,7 @@ impl Relay {
 			confirmation: self.confirmation.clone(),
 			rate_limit: self.rate_limit.clone(),
 			arg_rewrite: self.arg_rewrite.clone(),
+			enrichment: self.enrichment.clone(),
 		}
 	}
 

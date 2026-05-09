@@ -18,7 +18,7 @@ use crate::http::SendDirectResponse;
 use crate::proxy::ProxyError;
 use axum_core::BoxError;
 use prometheus_client::encoding::{EncodeLabelValue, LabelValueEncoder};
-pub use rbac::{ArgRewriteRule, McpArgRewrite, McpArgRewriteSet, McpAuthorization, McpAuthorizationSet, McpConfirmation, McpConfirmationSet, McpRateLimit, McpRateLimitSet, PresentationFieldSpec, PresentationFormat, PresentationImportance, PresentationRule, RewriteOp, ResourceId, ResourceType};
+pub use rbac::{ArgRewriteRule, EnrichmentField, EnrichmentRule, McpArgRewrite, McpArgRewriteSet, McpAuthorization, McpAuthorizationSet, McpConfirmation, McpConfirmationSet, McpRateLimit, McpRateLimitSet, McpToolEnrichment, McpToolEnrichmentSet, PresentationFieldSpec, PresentationFormat, PresentationImportance, PresentationRule, RewriteOp, ResourceId, ResourceType};
 use rmcp::model::RequestId;
 pub use router::App;
 use serde::{Deserialize, Serialize};

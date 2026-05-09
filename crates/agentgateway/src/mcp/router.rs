@@ -155,6 +155,7 @@ impl App {
 					confirmation: confirmation_policies.clone(),
 					rate_limit: rate_limit_policies.clone(),
 					arg_rewrite: arg_rewrite_policies.clone(),
+					enrichment: crate::mcp::McpToolEnrichmentSet::default(),
 					client: client.clone(),
 				},
 			))
@@ -174,6 +175,7 @@ impl App {
 					confirmation: confirmation_policies.clone(),
 					rate_limit: rate_limit_policies.clone(),
 					arg_rewrite: arg_rewrite_policies.clone(),
+					enrichment: crate::mcp::McpToolEnrichmentSet::default(),
 					client: client.clone(),
 				},
 			))

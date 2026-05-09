@@ -1659,6 +1659,7 @@ fn test_openapi_targets_emit_stateless_session_state() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1710,6 +1711,7 @@ fn test_sse_targets_emit_stateless_session_state() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1758,6 +1760,7 @@ async fn test_stdio_targets_remain_non_stateless() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1784,6 +1787,7 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1820,6 +1824,7 @@ fn test_set_sessions_matches_by_target_name() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1872,6 +1877,7 @@ fn test_set_sessions_rejects_mismatched_target_set() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1919,6 +1925,7 @@ fn test_merge_initialize_merges_upstream_instructions_when_multiplexing() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1996,6 +2003,7 @@ fn test_merge_initialize_no_instructions_when_multiplexing() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -2050,6 +2058,7 @@ fn test_merge_initialize_forwards_single_backend_without_multiplexing() {
 		crate::mcp::McpConfirmationSet::default(),
 		crate::mcp::McpRateLimitSet::default(),
 		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
