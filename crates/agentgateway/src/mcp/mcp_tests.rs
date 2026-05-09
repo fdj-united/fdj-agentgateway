@@ -570,10 +570,17 @@ async fn enrichment_injects_field_into_tools_list_response() {
 	let injected = props
 		.get("recipientDisplayName")
 		.expect("injected field must appear in properties");
-	assert_eq!(injected["type"], serde_json::json!("string"));
 	assert_eq!(
-		injected["description"],
-		serde_json::json!("Human-readable recipient name")
+		injected
+			.get("type")
+			.expect("injected field must declare a type"),
+		&serde_json::json!("string")
+	);
+	assert_eq!(
+		injected
+			.get("description")
+			.expect("injected field must declare a description"),
+		&serde_json::json!("Human-readable recipient name")
 	);
 
 	let required = schema
@@ -592,13 +599,12 @@ async fn enrichment_injects_field_into_tools_list_response() {
 		.find(|t| t.name == "increment")
 		.expect("mock should expose 'increment' tool");
 	let inc_schema: &serde_json::Map<String, serde_json::Value> = increment.input_schema.as_ref();
-	let inc_has_field = inc_schema
+	let inc_props = inc_schema
 		.get("properties")
 		.and_then(|v| v.as_object())
-		.map(|p| p.contains_key("recipientDisplayName"))
-		.unwrap_or(false);
+		.expect("increment tool must expose `properties` in its input_schema");
 	assert!(
-		!inc_has_field,
+		!inc_props.contains_key("recipientDisplayName"),
 		"non-matching tool 'increment' must not receive injected field"
 	);
 }

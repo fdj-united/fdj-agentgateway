@@ -210,13 +210,7 @@ impl Relay {
 						let schema = Arc::make_mut(&mut t.input_schema);
 						enrichment
 							.apply_to_schema(t.name.as_ref(), schema)
-							.map_err(|e| {
-								ClientError::new(anyhow::anyhow!(
-									"mcpToolEnrichment failed for tool '{}': {}",
-									t.name,
-									e
-								))
-							})?;
+							.map_err(|e| ClientError::new(e.context("mcpToolEnrichment")))?;
 					}
 
 					// Rename to handle multiplexing.
