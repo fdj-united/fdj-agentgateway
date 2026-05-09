@@ -778,6 +778,279 @@ async fn merge_tools_refuses_to_serve_when_tool_schema_collides_with_clear_senti
 	);
 }
 
+/// Build a `McpConfirmation` policy that requires confirmation for the named
+/// tool, matching the shape used by `enrichment_field_stripped_…`.
+fn confirmation_policy_for_tool(tool: &str) -> crate::mcp::McpConfirmation {
+	let expr = format!(r#"mcp.tool.name == "{tool}""#);
+	crate::mcp::McpConfirmation {
+		rules: RuleSet::new(PolicySet::new(
+			vec![],
+			vec![],
+			vec![Arc::new(cel::Expression::new_strict(&expr).unwrap())],
+		)),
+		ttl_seconds: Some(120),
+		presentations: vec![],
+	}
+}
+
+/// Extract the textual content from a Phase-1 / clear / Phase-2 response.
+fn extract_text(result: &rmcp::model::CallToolResult) -> String {
+	result.content[0]
+		.raw
+		.as_text()
+		.expect("expected a text content frame")
+		.text
+		.clone()
+}
+
+/// Verifies the load-bearing property of the clear sentinel: after a Phase 1
+/// stores a pending entry, the LLM (i.e. LibreChat) can issue a `tools/call`
+/// with `__mcp_clear_pending__: true` to evict that entry. A subsequent
+/// identical call MUST then re-trigger Phase 1 (a fresh confirmation envelope)
+/// rather than be matched to a stale Phase-2 forward.
+#[tokio::test]
+async fn clear_removes_pending_approval_so_subsequent_call_re_triggers_phase_1() {
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![BackendPolicy::McpConfirmation(confirmation_policy_for_tool(
+			"echo",
+		))],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	// Phase 1: original call returns a confirmation envelope.
+	let phase1 = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "x123" })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 1 call should return a result envelope");
+	let phase1_text = extract_text(&phase1);
+	assert!(
+		phase1_text.contains("confirmationRequired"),
+		"Phase 1 must return a confirmation envelope, got {phase1_text}"
+	);
+
+	// Clear: send a tools/call with the sentinel.
+	let cleared = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "x123", "__mcp_clear_pending__": true })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Clear call should return a result envelope");
+	let cleared_text = extract_text(&cleared);
+	assert!(
+		cleared_text.contains("\"cleared\":true") || cleared_text.contains("\"cleared\": true"),
+		"expected cleared:true got {cleared_text}"
+	);
+
+	// Subsequent identical call: pending entry was cleared, so Phase 1 fires
+	// again with a fresh envelope (NOT a Phase-2 upstream forward).
+	let phase1_again = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "x123" })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Subsequent identical call should return a result envelope");
+	let phase1_again_text = extract_text(&phase1_again);
+	assert!(
+		phase1_again_text.contains("confirmationRequired"),
+		"after clear, an identical call should re-trigger Phase 1, not bypass; got {phase1_again_text}"
+	);
+}
+
+/// When no Phase 1 has happened (so there's no pending entry to evict), a
+/// clear must still short-circuit and return `{"cleared": false}` — never
+/// reach the upstream and never invoke Phase 1 itself.
+#[tokio::test]
+async fn clear_with_no_matching_entry_returns_cleared_false() {
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![BackendPolicy::McpConfirmation(confirmation_policy_for_tool(
+			"echo",
+		))],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	// No prior Phase 1; clear has nothing to remove.
+	let cleared = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "x123", "__mcp_clear_pending__": true })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Clear call should return a result envelope");
+	let cleared_text = extract_text(&cleared);
+	assert!(
+		cleared_text.contains("\"cleared\":false") || cleared_text.contains("\"cleared\": false"),
+		"expected cleared:false got {cleared_text}"
+	);
+}
+
+/// A clear must NEVER be forwarded upstream. Our mock `echo` reflects its
+/// received args back as JSON; the test asserts the response body is a
+/// `{"cleared": …}` envelope rather than an `echo`-style mirror containing
+/// the sentinel. We use the absence of the sentinel-key in the response as
+/// proof that the upstream did not see it.
+#[tokio::test]
+async fn clear_is_never_forwarded_upstream() {
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![BackendPolicy::McpConfirmation(confirmation_policy_for_tool(
+			"echo",
+		))],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	let resp = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "x": "y", "__mcp_clear_pending__": true })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Clear call should return a result envelope");
+
+	let body = extract_text(&resp);
+
+	// If the gateway forwarded upstream, the `echo` mock would reflect the
+	// args verbatim, so the body would contain `__mcp_clear_pending__` (and
+	// `"x":"y"`). The short-circuit replaces the body with a `{cleared: …}`
+	// envelope instead.
+	assert!(
+		!body.contains("__mcp_clear_pending__"),
+		"clear must not reach the upstream MCP server; got echo-like body: {body}"
+	);
+	assert!(
+		body.contains("\"cleared\""),
+		"clear must return a {{cleared: …}} envelope; got {body}"
+	);
+}
+
+/// The clear sentinel must bypass ALL other policies — including the
+/// per-tool MCP rate limit. Otherwise a user who repeatedly declines a
+/// confirmation modal would burn through the rate-limit quota on declines
+/// alone, locking them out of the tool entirely.
+#[tokio::test]
+async fn clear_bypasses_rate_limit_so_user_can_decline_freely() {
+	let mock = mock_streamable_http_server(true).await;
+
+	// 2 calls per minute, scoped to `echo`.
+	let confirmation = confirmation_policy_for_tool("echo");
+	let rate_limit = crate::mcp::McpRateLimit {
+		rules: RuleSet::new(PolicySet::new(
+			vec![],
+			vec![],
+			vec![Arc::new(
+				cel::Expression::new_strict(r#"mcp.tool.name == "echo""#).unwrap(),
+			)],
+		)),
+		max_calls: 2,
+		window_seconds: 60,
+	};
+
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![
+			BackendPolicy::McpConfirmation(confirmation),
+			BackendPolicy::McpRateLimit(rate_limit),
+		],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	// Burn the rate-limit quota with 2 Phase-1 calls.
+	let _ = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "1" })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 1 call #1 should succeed");
+	let _ = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "2" })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 1 call #2 should succeed");
+
+	// 5 clears in a row must all return success without rate-limit rejection.
+	for i in 0..5u32 {
+		let cleared = client
+			.call_tool(
+				rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+					serde_json::json!({
+						"id": format!("{i}"),
+						"__mcp_clear_pending__": true,
+					})
+					.as_object()
+					.cloned()
+					.unwrap(),
+				),
+			)
+			.await
+			.unwrap_or_else(|e| panic!("clear {i} was rejected: {e:?}"));
+		let cleared_text = extract_text(&cleared);
+		assert!(
+			cleared_text.contains("\"cleared\""),
+			"clear {i} did not return a cleared response: {cleared_text}"
+		);
+		assert!(
+			!cleared_text.contains("rate_limit_exceeded"),
+			"clear {i} hit the rate limit: {cleared_text}"
+		);
+	}
+}
+
 async fn standard_assertions(client: RunningService<RoleClient, InitializeRequestParams>) {
 	let tools = client.list_tools(None).await.unwrap();
 	let t = tools

@@ -395,6 +395,59 @@ impl Session {
 						let (service_name, tool) = self.relay.parse_resource_name(&name)?;
 						span.rename_span(format!("{method} {service_name}"));
 						let call_arguments = ctr.params.arguments.clone();
+
+						// ── Pending-approval clear (sentinel short-circuit) ──
+						// If the LLM (i.e. LibreChat) sent the clear sentinel,
+						// strip the sentinel from a clone of the args, re-derive
+						// the same (tool, hash(stripped_args)) key Phase 1 used,
+						// remove the matching pending entry if present, and return
+						// a {cleared: ...} result. NEVER forwards upstream and
+						// bypasses ALL other policy checks (auth, rate-limit,
+						// arg-rewrite, confirmation). See spec §3 + §6.
+						if let Some(args) = call_arguments.as_ref()
+							&& matches!(
+								args.get(crate::mcp::MCP_CLEAR_PENDING_SENTINEL),
+								Some(serde_json::Value::Bool(true))
+							) {
+							// Compute the same lookup key Phase 1 uses.
+							let cleared = if self.is_stateful {
+								let mut for_hash = call_arguments.clone();
+								if let Some(map) = for_hash.as_mut() {
+									map.remove(crate::mcp::MCP_CLEAR_PENDING_SENTINEL);
+								}
+								self.relay.enrichment.strip(tool, &mut for_hash);
+								let key = format!(
+									"{}|{:016x}",
+									name,
+									hash_args(for_hash.as_ref())
+								);
+								let mut approvals = self.pending_approvals.lock().await;
+								approvals.remove(&key).is_some()
+							} else {
+								// Stateless session has no pending_approvals at
+								// all — clear is trivially a no-op.
+								false
+							};
+							let body = if cleared {
+								"{\"cleared\":true}"
+							} else {
+								"{\"cleared\":false}"
+							};
+							let msg = ServerJsonRpcMessage::response(
+								ServerResult::CallToolResult(
+									CallToolResult::success(vec![Content::text(body)]),
+								),
+								r.id.clone(),
+							);
+							use futures_util::stream;
+							return crate::mcp::handler::messages_to_response(
+								r.id,
+								stream::once(async move { Ok(msg) }),
+								None,
+							);
+						}
+						// ── End pending-approval clear ──
+
 						log.non_atomic_mutate(|l| {
 							l.set_tool(service_name.to_string(), tool.to_string());
 							l.capture_call_arguments(call_arguments.clone());
