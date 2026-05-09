@@ -525,6 +525,84 @@ async fn authorization_deny_with_request_header_filters_per_agent() {
 	);
 }
 
+/// Verifies Task 6: a configured `mcpToolEnrichment` rule causes the matching
+/// tool's `input_schema` in the `tools/list` response to include the synthetic
+/// field (in `properties` and `required`). Tools not named in the rule are
+/// untouched.
+#[tokio::test]
+async fn enrichment_injects_field_into_tools_list_response() {
+	let mock = mock_streamable_http_server(true).await;
+
+	let enrichment = crate::mcp::McpToolEnrichment {
+		rules: vec![crate::mcp::EnrichmentRule {
+			tools: vec!["echo".to_string()],
+			inject: vec![crate::mcp::EnrichmentField {
+				name: "recipientDisplayName".to_string(),
+				field_type: "string".to_string(),
+				required: true,
+				description: "Human-readable recipient name".to_string(),
+			}],
+		}],
+	};
+
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![BackendPolicy::McpToolEnrichment(enrichment)],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+	let tools = client.list_tools(None).await.unwrap();
+
+	let echo = tools
+		.tools
+		.iter()
+		.find(|t| t.name == "echo")
+		.expect("mock should expose 'echo' tool");
+
+	let schema: &serde_json::Map<String, serde_json::Value> = echo.input_schema.as_ref();
+	let props = schema
+		.get("properties")
+		.and_then(|v| v.as_object())
+		.expect("input_schema must have a `properties` object");
+	let injected = props
+		.get("recipientDisplayName")
+		.expect("injected field must appear in properties");
+	assert_eq!(injected["type"], serde_json::json!("string"));
+	assert_eq!(
+		injected["description"],
+		serde_json::json!("Human-readable recipient name")
+	);
+
+	let required = schema
+		.get("required")
+		.and_then(|v| v.as_array())
+		.expect("input_schema must have `required` after injecting a required field");
+	assert!(
+		required.contains(&serde_json::json!("recipientDisplayName")),
+		"required must include the injected field, got {required:?}"
+	);
+
+	// A non-matching tool must NOT have the injected field in its schema.
+	let increment = tools
+		.tools
+		.iter()
+		.find(|t| t.name == "increment")
+		.expect("mock should expose 'increment' tool");
+	let inc_schema: &serde_json::Map<String, serde_json::Value> = increment.input_schema.as_ref();
+	let inc_has_field = inc_schema
+		.get("properties")
+		.and_then(|v| v.as_object())
+		.map(|p| p.contains_key("recipientDisplayName"))
+		.unwrap_or(false);
+	assert!(
+		!inc_has_field,
+		"non-matching tool 'increment' must not receive injected field"
+	);
+}
+
 async fn standard_assertions(client: RunningService<RoleClient, InitializeRequestParams>) {
 	let tools = client.list_tools(None).await.unwrap();
 	let t = tools

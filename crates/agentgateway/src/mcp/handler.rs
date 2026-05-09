@@ -181,42 +181,56 @@ impl Relay {
 
 	pub fn merge_tools(&self, cel: CelExecWrapper) -> Box<MergeFn> {
 		let policies = self.policies.clone();
+		let enrichment = self.enrichment.clone();
 		let default_target_name = self.upstreams.default_target_name.clone();
 		Box::new(move |streams| {
-			let tools = streams
-				.into_iter()
-				.flat_map(|(server_name, s)| {
-					let tools = match s {
-						ServerResult::ListToolsResult(ltr) => ltr.tools,
-						_ => vec![],
-					};
-					tools
-						.into_iter()
-						// Apply authorization policies, filtering tools that are not allowed.
-						.filter(|t| {
-							policies.validate(
-								&rbac::ResourceType::Tool(rbac::ResourceId::new(
-									server_name.to_string(),
-									t.name.to_string(),
-								)),
-								&cel,
-							)
-						})
-						// Rename to handle multiplexing
-						.map(|mut t| {
-							t.name = Cow::Owned(resource_name(
-								default_target_name.as_ref(),
-								server_name.as_str(),
-								&t.name,
-							));
-							t
-						})
-						.collect_vec()
-				})
-				.collect_vec();
+			let mut tools_out: Vec<rmcp::model::Tool> = Vec::new();
+			for (server_name, s) in streams {
+				let tools = match s {
+					ServerResult::ListToolsResult(ltr) => ltr.tools,
+					_ => vec![],
+				};
+				for mut t in tools {
+					// Apply authorization policies, filtering tools that are not allowed.
+					if !policies.validate(
+						&rbac::ResourceType::Tool(rbac::ResourceId::new(
+							server_name.to_string(),
+							t.name.to_string(),
+						)),
+						&cel,
+					) {
+						continue;
+					}
+
+					// Inject enrichment fields into the tool's input schema. The
+					// short (pre-rename) tool name is what enrichment rules match
+					// on. `Arc::make_mut` is copy-on-write — cheap because
+					// `merge_tools` runs per-request.
+					if !enrichment.is_empty() {
+						let schema = Arc::make_mut(&mut t.input_schema);
+						enrichment
+							.apply_to_schema(t.name.as_ref(), schema)
+							.map_err(|e| {
+								ClientError::new(anyhow::anyhow!(
+									"mcpToolEnrichment failed for tool '{}': {}",
+									t.name,
+									e
+								))
+							})?;
+					}
+
+					// Rename to handle multiplexing.
+					t.name = Cow::Owned(resource_name(
+						default_target_name.as_ref(),
+						server_name.as_str(),
+						&t.name,
+					));
+					tools_out.push(t);
+				}
+			}
 			Ok(
 				ListToolsResult {
-					tools,
+					tools: tools_out,
 					next_cursor: None,
 					meta: None,
 				}
