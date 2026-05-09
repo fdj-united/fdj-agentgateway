@@ -871,7 +871,18 @@ impl Store {
 			pol.mcp_arg_rewrite = Some(McpArgRewriteSet::new(mcp_arg_rewrite));
 		}
 		if !mcp_tool_enrichment.is_empty() {
-			pol.mcp_tool_enrichment = Some(McpToolEnrichmentSet::new(mcp_tool_enrichment));
+			let set = McpToolEnrichmentSet::new(mcp_tool_enrichment);
+			// Defense-in-depth: per-policy collisions are caught earlier in
+			// `local.rs::split_policies`, but multiple McpToolEnrichment
+			// policies (e.g. one at gateway scope, one at backend scope)
+			// have their rules concatenated here, so a same-tool/same-field
+			// collision can still arise at merge time. Panic loudly rather
+			// than silently letting the dynamic check at first `tools/list`
+			// surface as an opaque LLM error.
+			if let Err(e) = set.validate() {
+				panic!("{}", e);
+			}
+			pol.mcp_tool_enrichment = Some(set);
 		}
 		pol
 	}

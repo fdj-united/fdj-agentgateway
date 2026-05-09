@@ -566,6 +566,32 @@ impl McpToolEnrichmentSet {
 		Ok(())
 	}
 
+	/// Detect cross-rule field-name collisions per tool, statically. This
+	/// catches the most common operator misconfig (two rules injecting the
+	/// same field name on the same tool) at config-construction time —
+	/// before the gateway accepts traffic. The complementary dynamic case
+	/// (a synthetic field colliding with an upstream tool's existing
+	/// property) is detected at runtime by `apply_to_schema`.
+	pub fn validate(&self) -> anyhow::Result<()> {
+		use std::collections::{HashMap, HashSet};
+		let mut by_tool: HashMap<&str, HashSet<&str>> = HashMap::new();
+		for rule in &self.rules {
+			for tool in &rule.tools {
+				let seen = by_tool.entry(tool.as_str()).or_default();
+				for field in &rule.inject {
+					if !seen.insert(field.name.as_str()) {
+						return Err(anyhow::anyhow!(
+							"mcpToolEnrichment: tool '{}' has multiple rules injecting field '{}'; rename or merge the rules",
+							tool,
+							field.name
+						));
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
 	/// Remove every synthetic field declared in matching rules from `args`.
 	/// `tool_name` is the SHORT tool name. Missing fields are no-ops; calling
 	/// twice is identical to calling once.
@@ -850,6 +876,109 @@ rules:
 		let mut schema = schema_with(vec![]);
 		let err = set.apply_to_schema("t", &mut schema).unwrap_err();
 		assert!(err.to_string().contains('f'));
+	}
+
+	#[test]
+	fn validate_accepts_clean_config() {
+		let set = McpToolEnrichmentSet::new(vec![
+			EnrichmentRule {
+				tools: vec!["a".to_string(), "b".to_string()],
+				inject: vec![EnrichmentField {
+					name: "f1".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "x".to_string(),
+				}],
+			},
+			EnrichmentRule {
+				tools: vec!["a".to_string()],
+				inject: vec![EnrichmentField {
+					name: "f2".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "y".to_string(),
+				}],
+			},
+		]);
+		set.validate().unwrap();
+	}
+
+	#[test]
+	fn validate_rejects_cross_rule_duplicate_field_per_tool() {
+		let set = McpToolEnrichmentSet::new(vec![
+			EnrichmentRule {
+				tools: vec!["a".to_string()],
+				inject: vec![EnrichmentField {
+					name: "dup".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "first".to_string(),
+				}],
+			},
+			EnrichmentRule {
+				tools: vec!["a".to_string(), "b".to_string()],
+				inject: vec![EnrichmentField {
+					name: "dup".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "second".to_string(),
+				}],
+			},
+		]);
+		let err = set.validate().unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("'a'"), "expected tool name 'a' in: {msg}");
+		assert!(msg.contains("'dup'"), "expected field name 'dup' in: {msg}");
+	}
+
+	#[test]
+	fn validate_rejects_same_rule_duplicate_field() {
+		let set = McpToolEnrichmentSet::new(vec![EnrichmentRule {
+			tools: vec!["a".to_string()],
+			inject: vec![
+				EnrichmentField {
+					name: "dup".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "first".to_string(),
+				},
+				EnrichmentField {
+					name: "dup".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "second".to_string(),
+				},
+			],
+		}]);
+		let err = set.validate().unwrap_err();
+		assert!(err.to_string().contains("'dup'"));
+	}
+
+	#[test]
+	fn validate_allows_same_field_name_on_different_tools() {
+		// Two rules each declaring the same field name, but for DIFFERENT
+		// tools — that's fine, no conflict per tool.
+		let set = McpToolEnrichmentSet::new(vec![
+			EnrichmentRule {
+				tools: vec!["a".to_string()],
+				inject: vec![EnrichmentField {
+					name: "f".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "x".to_string(),
+				}],
+			},
+			EnrichmentRule {
+				tools: vec!["b".to_string()],
+				inject: vec![EnrichmentField {
+					name: "f".to_string(),
+					field_type: "string".to_string(),
+					required: true,
+					description: "y".to_string(),
+				}],
+			},
+		]);
+		set.validate().unwrap();
 	}
 
 	fn args_with(pairs: Vec<(&str, Value)>) -> Option<JsonMap<String, Value>> {

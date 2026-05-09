@@ -2540,6 +2540,13 @@ pub(crate) async fn split_policies(
 		backend_policies.push(BackendPolicy::McpArgRewrite(p))
 	}
 	if let Some(p) = mcp_tool_enrichment {
+		// Static cross-rule conflict check at config-construction time so
+		// `--validate-only` and gateway startup fail loudly on duplicate
+		// field-name injections per tool — see spec §10.2. The complementary
+		// dynamic check (synthetic field colliding with an upstream tool's
+		// existing property) still runs at request time in
+		// `McpToolEnrichmentSet::apply_to_schema`.
+		crate::mcp::McpToolEnrichmentSet::new(p.rules.clone()).validate()?;
 		backend_policies.push(BackendPolicy::McpToolEnrichment(p))
 	}
 	if let Some(p) = mcp_authentication {
