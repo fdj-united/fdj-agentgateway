@@ -209,19 +209,31 @@ export default function PoliciesPage() {
               {appliedPolicies.map((p: AppliedPolicy) => {
                 const isService = !!p.target?.backend?.service;
                 const isBackend = !!p.target?.backend?.backend;
+                const isGateway = !!(p.target as any)?.gateway;
+                const gw: any = (p.target as any)?.gateway;
                 const targetLabel = isService
                   ? `${p.target!.backend!.service!.namespace}/${p.target!.backend!.service!.hostname}`
                   : isBackend
                     ? `${p.target!.backend!.backend!.namespace}/${p.target!.backend!.backend!.name}`
-                    : "Unknown target";
+                    : isGateway
+                      ? `${gw.gatewayNamespace ?? ""}/${gw.gatewayName ?? ""}${gw.listenerName ? `:${gw.listenerName}` : ""}`
+                      : "Unknown target";
+                const headerLabel = p.name
+                  ? `${p.name.kind ?? ""} ${p.name.namespace ?? ""}/${p.name.name ?? ""}`.trim()
+                  : p.key;
+                const badge = isService
+                  ? "Service"
+                  : isBackend
+                    ? "Backend"
+                    : isGateway
+                      ? "Gateway"
+                      : "Other";
                 return (
                   <Card key={p.key}>
                     <CardHeader className="pb-2">
                       <div className="flex items-center justify-between">
-                        <div className="font-medium">
-                          {p.name.kind} {p.name.namespace}/{p.name.name}
-                        </div>
-                        <Badge variant="outline">{isService ? "Service" : "Backend"}</Badge>
+                        <div className="font-medium">{headerLabel}</div>
+                        <Badge variant="outline">{badge}</Badge>
                       </div>
                       <div className="text-xs text-muted-foreground mt-1">
                         Target: {targetLabel}

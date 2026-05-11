@@ -18,8 +18,23 @@ use crate::http::SendDirectResponse;
 use crate::proxy::ProxyError;
 use axum_core::BoxError;
 use prometheus_client::encoding::{EncodeLabelValue, LabelValueEncoder};
-pub use rbac::{McpAuthorization, McpAuthorizationSet, ResourceId, ResourceType};
+pub use rbac::{ArgRewriteRule, EnrichmentField, EnrichmentRule, McpArgRewrite, McpArgRewriteSet, McpAuthorization, McpAuthorizationSet, McpConfirmation, McpConfirmationSet, McpRateLimit, McpRateLimitSet, McpToolEnrichment, McpToolEnrichmentSet, PresentationFieldSpec, PresentationFormat, PresentationImportance, PresentationRule, RewriteOp, ResourceId, ResourceType};
 use rmcp::model::RequestId;
+
+/// Sentinel argument that, when present and `true` on a `tools/call` request,
+/// signals to the gateway "clear the pending-approval entry for this
+/// (tool, args) — do NOT actually call upstream." Used by LibreChat to evict
+/// stale pending entries when the user declines a confirmation modal so that
+/// a subsequent identical call within the gateway-side TTL doesn't bypass
+/// confirmation.
+///
+/// **Cross-repo invariant:** the matching constant in the LibreChat backend
+/// (currently a literal in `Fdj-LibreChat/api/server/services/MCP.js`) MUST
+/// be kept in lockstep — if you change this value, update both repos in the
+/// same release.
+///
+/// See [docs/superpowers/specs/2026-05-09-mcp-confirmation-clear-design.md](../../../docs/superpowers/specs/2026-05-09-mcp-confirmation-clear-design.md).
+pub const MCP_CLEAR_PENDING_SENTINEL: &str = "__mcp_clear_pending__";
 pub use router::App;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

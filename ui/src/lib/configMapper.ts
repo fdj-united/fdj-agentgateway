@@ -39,11 +39,44 @@ export function configDumpToLocalConfig(configDump: any): LocalConfig {
   // routes during mapping.
   const a2aPolicyTargets = buildA2aPolicyTargets(configDump.policies || []);
 
-  localConfig.binds = (configDump.binds || []).map((bind: any) =>
-    mapToBind(bind, backends as Backend[], a2aPolicyTargets)
+  // The proxy may report multiple bind entries that share the same OS-level
+  // address (e.g. one synthesized from the Gateway resource with no routes,
+  // and one from rawConfig.binds carrying the actual routes). Only one socket
+  // can listen per port, so collapse them into a single Bind keyed by port,
+  // merging listeners by name and preferring entries that have routes.
+  localConfig.binds = mergeBindsByPort(
+    (configDump.binds || []).map((bind: any) =>
+      mapToBind(bind, backends as Backend[], a2aPolicyTargets)
+    )
   );
 
   return localConfig;
+}
+
+function mergeBindsByPort(binds: Bind[]): Bind[] {
+  const byPort = new Map<number, Bind>();
+  for (const bind of binds) {
+    const existing = byPort.get(bind.port);
+    if (!existing) {
+      byPort.set(bind.port, { ...bind, listeners: [...bind.listeners] });
+      continue;
+    }
+    for (const incoming of bind.listeners) {
+      const idx = existing.listeners.findIndex((l) => l.name === incoming.name);
+      if (idx === -1) {
+        existing.listeners.push(incoming);
+        continue;
+      }
+      // Prefer the listener with routes; if both have routes, keep the
+      // existing one (already-merged result wins to remain stable).
+      const existingHasRoutes = (existing.listeners[idx].routes?.length ?? 0) > 0;
+      const incomingHasRoutes = (incoming.routes?.length ?? 0) > 0;
+      if (incomingHasRoutes && !existingHasRoutes) {
+        existing.listeners[idx] = incoming;
+      }
+    }
+  }
+  return Array.from(byPort.values());
 }
 
 // Structured representation of an A2A policy target, mirroring the Rust
@@ -120,7 +153,9 @@ function mapToListener(
   a2aPolicyTargets: A2aPolicyTarget[]
 ): Listener {
   return {
-    name: listenerData.name,
+    // xDS/config_dump emits the listener name under `listenerName`; local
+    // configs flatten it into `name`. Prefer `listenerName`, fall back to `name`.
+    name: listenerData.listenerName || listenerData.name,
     hostname: listenerData.hostname,
     protocol: listenerData.protocol as ListenerProtocol,
     tls: mapToTlsConfig(listenerData.tls),
@@ -154,6 +189,21 @@ function mapToRoute(
     routeBackendMatchesA2aPolicy(rb, a2aPolicyTargets)
   );
 
+  // Flatten inlinePolicies array [{cors:...}, {mcpAuthorization:...}] into
+  // a single Policies object {cors:..., mcpAuthorization:...}. This covers
+  // route-level traffic policies (CORS, redirects, auth) and route-backend-
+  // level backend policies (mcpAuthorization, mcpConfirmation, backendTLS,
+  // etc.) that live inline in rawConfig-derived dumps.
+  const mergedPolicies: Record<string, any> = {};
+  const mergeInto = (policies: any[] | undefined) => {
+    if (!Array.isArray(policies)) return;
+    for (const p of policies) {
+      if (p && typeof p === "object") Object.assign(mergedPolicies, p);
+    }
+  };
+  mergeInto(routeData.inlinePolicies);
+  for (const rb of rawBackends) mergeInto(rb.inlinePolicies);
+
   const route: Route = {
     name: routeData.name,
     ruleName: routeData.ruleName || "",
@@ -163,7 +213,11 @@ function mapToRoute(
   };
 
   if (hasInlineA2a || hasMatchingA2aPolicy) {
-    route.policies = { a2a: {} };
+    mergedPolicies.a2a = mergedPolicies.a2a ?? {};
+  }
+
+  if (Object.keys(mergedPolicies).length > 0) {
+    route.policies = mergedPolicies as any;
   }
 
   return route;
@@ -221,8 +275,10 @@ function mapToMatches(matchesData: any): Match[] {
     if (matchData.path) {
       if (matchData.path.exact) {
         match.path.exact = matchData.path.exact;
-      } else if (matchData.path.prefix) {
-        match.path.pathPrefix = matchData.path.prefix;
+      } else if (matchData.path.pathPrefix || matchData.path.prefix) {
+        // config_dump serializes prefix as `pathPrefix`; local configs use
+        // either form depending on version. Accept both.
+        match.path.pathPrefix = matchData.path.pathPrefix || matchData.path.prefix;
       } else if (matchData.path.regex) {
         match.path.regex = matchData.path.regex;
       }
@@ -253,9 +309,18 @@ function mapToBackend(backendData: any): Backend | undefined {
 }
 
 function mapToRouteBackend(rb: any, backends: Backend[]): Backend | undefined {
-  // Route backend reference is a string in "namespace/name" format
+  // Route backend reference is a string. Typed CRs produce "namespace/name";
+  // rawConfig-defined backends produce hierarchical paths like
+  // "/agentgateway/.../route/backend0" (with a leading slash) while the
+  // matching top-level backend entry stores the same path WITHOUT the
+  // leading slash. Match on both forms.
   if (typeof rb.backend === "string") {
-    const found = backends.find((b) => getBackendName(b) === rb.backend);
+    const key = rb.backend;
+    const stripped = key.startsWith("/") ? key.slice(1) : key;
+    const found = backends.find((b) => {
+      const name = getBackendName(b);
+      return name === key || name === stripped;
+    });
     if (found) return found;
   }
 

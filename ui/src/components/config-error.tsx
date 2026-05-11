@@ -30,7 +30,7 @@ export function ConfigError({ error }: ConfigErrorProps) {
             <CardTitle className="text-destructive">Configuration Error</CardTitle>
           </div>
           <CardDescription>
-            The agentgateway server is running but has a configuration issue.
+            The MCP-Gateway server is running but has a configuration issue.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -45,7 +45,7 @@ export function ConfigError({ error }: ConfigErrorProps) {
             <h3 className="font-semibold">To resolve this issue:</h3>
             <ol className="list-decimal list-inside space-y-2 text-sm">
               <li>
-                <strong>Check the agentgateway server logs</strong> for detailed error information
+                <strong>Check the MCP-Gateway server logs</strong> for detailed error information
               </li>
               <li>
                 <strong>Verify the configuration file</strong> exists and is properly formatted:
@@ -56,7 +56,7 @@ export function ConfigError({ error }: ConfigErrorProps) {
                 </ul>
               </li>
               <li>
-                <strong>Restart the agentgateway server</strong> after fixing the configuration
+                <strong>Restart the MCP-Gateway server</strong> after fixing the configuration
               </li>
               <li>
                 <strong>Check the server status</strong> to ensure it&apos;s running on{" "}

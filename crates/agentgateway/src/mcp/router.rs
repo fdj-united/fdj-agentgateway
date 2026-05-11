@@ -108,6 +108,18 @@ impl App {
 		let authorization_policies = backend_policies
 			.mcp_authorization
 			.unwrap_or_else(|| McpAuthorizationSet::new(RuleSets::from(Vec::new())));
+		let confirmation_policies = backend_policies
+			.mcp_confirmation
+			.unwrap_or_default();
+		let rate_limit_policies = backend_policies
+			.mcp_rate_limit
+			.unwrap_or_default();
+		let arg_rewrite_policies = backend_policies
+			.mcp_arg_rewrite
+			.unwrap_or_default();
+		let enrichment_policies = backend_policies
+			.mcp_tool_enrichment
+			.unwrap_or_default();
 		let authn = backend_policies.mcp_authentication;
 
 		// Store an empty value, we will populate each field async
@@ -118,6 +130,8 @@ impl App {
 		req.extensions_mut().insert(tracer);
 
 		authorization_policies.register(log.cel.ctx());
+		confirmation_policies.register(log.cel.ctx());
+		rate_limit_policies.register(log.cel.ctx());
 		log.cel.ctx().maybe_buffer_request_body(&mut req).await;
 
 		// `response` is not valid here, since we run authz first
@@ -141,6 +155,10 @@ impl App {
 				RelayInputs {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
+					confirmation: confirmation_policies.clone(),
+					rate_limit: rate_limit_policies.clone(),
+					arg_rewrite: arg_rewrite_policies.clone(),
+					enrichment: enrichment_policies.clone(),
 					client: client.clone(),
 				},
 			))
@@ -157,6 +175,10 @@ impl App {
 				RelayInputs {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
+					confirmation: confirmation_policies.clone(),
+					rate_limit: rate_limit_policies.clone(),
+					arg_rewrite: arg_rewrite_policies.clone(),
+					enrichment: enrichment_policies.clone(),
 					client: client.clone(),
 				},
 			))

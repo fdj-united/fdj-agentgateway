@@ -36,6 +36,7 @@ EOF
 FROM docker.io/library/rust:1.93.0-trixie AS base-builder
 
 ARG TARGETARCH
+ARG CORPORATE_CA_CERT=""
 
 RUN <<EOF
 mkdir /build
@@ -46,6 +47,13 @@ else
 fi
 echo "Building $(cat /build/target)"
 EOF
+
+# Inject corporate CA certificate if provided (needed behind TLS-intercepting proxies)
+RUN --mount=type=secret,id=corporate_ca,target=/tmp/corporate-ca.pem,required=false \
+    if [ -f /tmp/corporate-ca.pem ]; then \
+      cp /tmp/corporate-ca.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
+      update-ca-certificates; \
+    fi
 
 FROM ${BUILDER}-builder AS builder
 ARG TARGETARCH

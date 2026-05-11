@@ -664,6 +664,532 @@ async fn authorization_deny_with_request_header_filters_per_agent() {
 	);
 }
 
+/// Verifies Task 6: a configured `mcpToolEnrichment` rule causes the matching
+/// tool's `input_schema` in the `tools/list` response to include the synthetic
+/// field (in `properties` and `required`). Tools not named in the rule are
+/// untouched.
+#[tokio::test]
+async fn enrichment_injects_field_into_tools_list_response() {
+	let mock = mock_streamable_http_server(true).await;
+
+	let enrichment = crate::mcp::McpToolEnrichment {
+		rules: vec![crate::mcp::EnrichmentRule {
+			tools: vec!["echo".to_string()],
+			inject: vec![crate::mcp::EnrichmentField {
+				name: "recipientDisplayName".to_string(),
+				field_type: "string".to_string(),
+				required: true,
+				description: "Human-readable recipient name".to_string(),
+			}],
+		}],
+	};
+
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![BackendPolicy::McpToolEnrichment(enrichment)],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+	let tools = client.list_tools(None).await.unwrap();
+
+	let echo = tools
+		.tools
+		.iter()
+		.find(|t| t.name == "echo")
+		.expect("mock should expose 'echo' tool");
+
+	let schema: &serde_json::Map<String, serde_json::Value> = echo.input_schema.as_ref();
+	let props = schema
+		.get("properties")
+		.and_then(|v| v.as_object())
+		.expect("input_schema must have a `properties` object");
+	let injected = props
+		.get("recipientDisplayName")
+		.expect("injected field must appear in properties");
+	assert_eq!(
+		injected
+			.get("type")
+			.expect("injected field must declare a type"),
+		&serde_json::json!("string")
+	);
+	assert_eq!(
+		injected
+			.get("description")
+			.expect("injected field must declare a description"),
+		&serde_json::json!("Human-readable recipient name")
+	);
+
+	let required = schema
+		.get("required")
+		.and_then(|v| v.as_array())
+		.expect("input_schema must have `required` after injecting a required field");
+	assert!(
+		required.contains(&serde_json::json!("recipientDisplayName")),
+		"required must include the injected field, got {required:?}"
+	);
+
+	// A non-matching tool must NOT have the injected field in its schema.
+	let increment = tools
+		.tools
+		.iter()
+		.find(|t| t.name == "increment")
+		.expect("mock should expose 'increment' tool");
+	let inc_schema: &serde_json::Map<String, serde_json::Value> = increment.input_schema.as_ref();
+	let inc_props = inc_schema
+		.get("properties")
+		.and_then(|v| v.as_object())
+		.expect("increment tool must expose `properties` in its input_schema");
+	assert!(
+		!inc_props.contains_key("recipientDisplayName"),
+		"non-matching tool 'increment' must not receive injected field"
+	);
+}
+
+/// Verifies Task 7: when an enrichment-injected synthetic field is present in
+/// `tools/call` arguments, the gateway must
+///   1. NEVER forward that field to the upstream MCP server, and
+///   2. NOT break the two-phase confirmation match even if the LLM produces a
+///      different synthetic value in Phase 2 than it did in Phase 1.
+///
+/// This is a full integration test against the mock streamable HTTP server.
+/// The mock's `echo` tool simply reflects its arguments back as JSON, so the
+/// final response text is a direct witness of what the upstream observed.
+///
+/// Maps to the three call sites changed in `session.rs`:
+///   - hash-on-stripped-clone at the confirmation key computation,
+///   - strip-before-arg-rewrite at Phase 2,
+///   - strip-before-arg-rewrite at the non-confirmed path
+///     (covered indirectly: if Phase 2 reused the non-confirmed path's strip,
+///     a matching pending entry would never be found in the first place).
+#[tokio::test]
+async fn enrichment_field_stripped_before_upstream_and_survives_phase2_rehash() {
+	let mock = mock_streamable_http_server(true).await;
+
+	// Confirmation rule: every call to `echo` requires two-phase confirmation.
+	let confirmation = crate::mcp::McpConfirmation {
+		rules: RuleSet::new(PolicySet::new(
+			vec![],
+			vec![],
+			vec![Arc::new(
+				cel::Expression::new_strict(r#"mcp.tool.name == "echo""#).unwrap(),
+			)],
+		)),
+		ttl_seconds: Some(120),
+		presentations: vec![],
+	};
+
+	// Enrichment rule: `echo` gains a synthetic `recipientDisplayName` field
+	// that the LLM is expected to populate but the upstream never sees.
+	let enrichment = crate::mcp::McpToolEnrichment {
+		rules: vec![crate::mcp::EnrichmentRule {
+			tools: vec!["echo".to_string()],
+			inject: vec![crate::mcp::EnrichmentField {
+				name: "recipientDisplayName".to_string(),
+				field_type: "string".to_string(),
+				required: true,
+				description: "Human-readable recipient name".to_string(),
+			}],
+		}],
+	};
+
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![
+			BackendPolicy::McpConfirmation(confirmation),
+			BackendPolicy::McpToolEnrichment(enrichment),
+		],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	// ── Phase 1: call echo with synthetic = "Alice" ────────────────────────
+	let phase1 = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({
+					"hi": "world",
+					"recipientDisplayName": "Alice",
+				})
+				.as_object()
+				.cloned()
+				.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 1 call should return a result envelope, not error");
+
+	let phase1_text = phase1.content[0]
+		.raw
+		.as_text()
+		.expect("Phase 1 result must be text content")
+		.text
+		.clone();
+	let phase1_json: serde_json::Value =
+		serde_json::from_str(&phase1_text).expect("Phase 1 envelope must be JSON");
+	assert_eq!(
+		phase1_json.get("confirmationRequired"),
+		Some(&serde_json::json!(true)),
+		"Phase 1 must return a confirmation envelope, got {phase1_text}"
+	);
+
+	// ── Phase 2: re-call echo with the SAME identifying args but a DIFFERENT
+	//            synthetic value. The hash-on-stripped-clone invariant means
+	//            the pending entry must still match.
+	let phase2 = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({
+					"hi": "world",
+					"recipientDisplayName": "Bob",
+				})
+				.as_object()
+				.cloned()
+				.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 2 call should match the pending approval and forward upstream");
+
+	let phase2_text = phase2.content[0]
+		.raw
+		.as_text()
+		.expect("Phase 2 result must be text content")
+		.text
+		.clone();
+
+	// Upstream is the echo mock — it reflects whatever args it received as JSON.
+	// If the gateway stripped correctly, this is exactly `{"hi":"world"}` and
+	// MUST NOT contain `recipientDisplayName`.
+	assert!(
+		!phase2_text.contains("recipientDisplayName"),
+		"upstream must never see synthetic field; got upstream echo: {phase2_text}"
+	);
+	assert!(
+		!phase2_text.contains("confirmationRequired"),
+		"Phase 2 must NOT return another confirmation envelope (pending match \
+		 broken by a non-stripped hash); got: {phase2_text}"
+	);
+	let upstream_args: serde_json::Value = serde_json::from_str(&phase2_text)
+		.expect("upstream echo must reflect a valid JSON object");
+	assert_eq!(
+		upstream_args,
+		serde_json::json!({"hi": "world"}),
+		"upstream must receive only the non-synthetic fields, got {upstream_args}"
+	);
+}
+
+/// Verifies Task 1 of the pending-approval clear feature: when an upstream
+/// MCP server advertises a tool whose schema declares the gateway's reserved
+/// clear-sentinel name as a real property, `merge_tools` MUST refuse to
+/// serve the `tools/list` response. The error must name both the offending
+/// tool and the sentinel so operators can diagnose the collision.
+///
+/// See spec §6.1 in
+/// `docs/superpowers/specs/2026-05-09-mcp-confirmation-clear-design.md`.
+#[tokio::test]
+async fn merge_tools_refuses_to_serve_when_tool_schema_collides_with_clear_sentinel() {
+	use crate::mcp::MCP_CLEAR_PENDING_SENTINEL;
+
+	let mock = mock_streamable_http_server_with_colliding_tool().await;
+	let (_bind, io) = setup_proxy_policies(&mock, true, false, vec![]).await;
+
+	let client = mcp_streamable_client(io).await;
+
+	let err = client
+		.list_tools(None)
+		.await
+		.expect_err("expected merge_tools to refuse a colliding schema");
+
+	let msg = format!("{err:?}");
+	assert!(
+		msg.contains(MCP_CLEAR_PENDING_SENTINEL),
+		"error must name the sentinel — got: {msg}"
+	);
+	assert!(
+		msg.to_lowercase().contains("evil_collision"),
+		"error must name the offending tool — got: {msg}"
+	);
+}
+
+/// Build a `McpConfirmation` policy that requires confirmation for the named
+/// tool, matching the shape used by `enrichment_field_stripped_…`.
+fn confirmation_policy_for_tool(tool: &str) -> crate::mcp::McpConfirmation {
+	let expr = format!(r#"mcp.tool.name == "{tool}""#);
+	crate::mcp::McpConfirmation {
+		rules: RuleSet::new(PolicySet::new(
+			vec![],
+			vec![],
+			vec![Arc::new(cel::Expression::new_strict(&expr).unwrap())],
+		)),
+		ttl_seconds: Some(120),
+		presentations: vec![],
+	}
+}
+
+/// Extract the textual content from a Phase-1 / clear / Phase-2 response.
+fn extract_text(result: &rmcp::model::CallToolResult) -> String {
+	result.content[0]
+		.raw
+		.as_text()
+		.expect("expected a text content frame")
+		.text
+		.clone()
+}
+
+/// Verifies the load-bearing property of the clear sentinel: after a Phase 1
+/// stores a pending entry, the LLM (i.e. LibreChat) can issue a `tools/call`
+/// with `__mcp_clear_pending__: true` to evict that entry. A subsequent
+/// identical call MUST then re-trigger Phase 1 (a fresh confirmation envelope)
+/// rather than be matched to a stale Phase-2 forward.
+#[tokio::test]
+async fn clear_removes_pending_approval_so_subsequent_call_re_triggers_phase_1() {
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![BackendPolicy::McpConfirmation(confirmation_policy_for_tool(
+			"echo",
+		))],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	// Phase 1: original call returns a confirmation envelope.
+	let phase1 = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "x123" })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 1 call should return a result envelope");
+	let phase1_text = extract_text(&phase1);
+	assert!(
+		phase1_text.contains("confirmationRequired"),
+		"Phase 1 must return a confirmation envelope, got {phase1_text}"
+	);
+
+	// Clear: send a tools/call with the sentinel.
+	let cleared = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "x123", "__mcp_clear_pending__": true })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Clear call should return a result envelope");
+	let cleared_text = extract_text(&cleared);
+	assert!(
+		cleared_text.contains("\"cleared\":true") || cleared_text.contains("\"cleared\": true"),
+		"expected cleared:true got {cleared_text}"
+	);
+
+	// Subsequent identical call: pending entry was cleared, so Phase 1 fires
+	// again with a fresh envelope (NOT a Phase-2 upstream forward).
+	let phase1_again = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "x123" })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Subsequent identical call should return a result envelope");
+	let phase1_again_text = extract_text(&phase1_again);
+	assert!(
+		phase1_again_text.contains("confirmationRequired"),
+		"after clear, an identical call should re-trigger Phase 1, not bypass; got {phase1_again_text}"
+	);
+}
+
+/// When no Phase 1 has happened (so there's no pending entry to evict), a
+/// clear must still short-circuit and return `{"cleared": false}` — never
+/// reach the upstream and never invoke Phase 1 itself.
+#[tokio::test]
+async fn clear_with_no_matching_entry_returns_cleared_false() {
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![BackendPolicy::McpConfirmation(confirmation_policy_for_tool(
+			"echo",
+		))],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	// No prior Phase 1; clear has nothing to remove.
+	let cleared = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "x123", "__mcp_clear_pending__": true })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Clear call should return a result envelope");
+	let cleared_text = extract_text(&cleared);
+	assert!(
+		cleared_text.contains("\"cleared\":false") || cleared_text.contains("\"cleared\": false"),
+		"expected cleared:false got {cleared_text}"
+	);
+}
+
+/// A clear must NEVER be forwarded upstream. Our mock `echo` reflects its
+/// received args back as JSON; the test asserts the response body is a
+/// `{"cleared": …}` envelope rather than an `echo`-style mirror containing
+/// the sentinel. We use the absence of the sentinel-key in the response as
+/// proof that the upstream did not see it.
+#[tokio::test]
+async fn clear_is_never_forwarded_upstream() {
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![BackendPolicy::McpConfirmation(confirmation_policy_for_tool(
+			"echo",
+		))],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	let resp = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "x": "y", "__mcp_clear_pending__": true })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Clear call should return a result envelope");
+
+	let body = extract_text(&resp);
+
+	// If the gateway forwarded upstream, the `echo` mock would reflect the
+	// args verbatim, so the body would contain `__mcp_clear_pending__` (and
+	// `"x":"y"`). The short-circuit replaces the body with a `{cleared: …}`
+	// envelope instead.
+	assert!(
+		!body.contains("__mcp_clear_pending__"),
+		"clear must not reach the upstream MCP server; got echo-like body: {body}"
+	);
+	assert!(
+		body.contains("\"cleared\""),
+		"clear must return a {{cleared: …}} envelope; got {body}"
+	);
+}
+
+/// The clear sentinel must bypass ALL other policies — including the
+/// per-tool MCP rate limit. Otherwise a user who repeatedly declines a
+/// confirmation modal would burn through the rate-limit quota on declines
+/// alone, locking them out of the tool entirely.
+#[tokio::test]
+async fn clear_bypasses_rate_limit_so_user_can_decline_freely() {
+	let mock = mock_streamable_http_server(true).await;
+
+	// 2 calls per minute, scoped to `echo`.
+	let confirmation = confirmation_policy_for_tool("echo");
+	let rate_limit = crate::mcp::McpRateLimit {
+		rules: RuleSet::new(PolicySet::new(
+			vec![],
+			vec![],
+			vec![Arc::new(
+				cel::Expression::new_strict(r#"mcp.tool.name == "echo""#).unwrap(),
+			)],
+		)),
+		max_calls: 2,
+		window_seconds: 60,
+	};
+
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![
+			BackendPolicy::McpConfirmation(confirmation),
+			BackendPolicy::McpRateLimit(rate_limit),
+		],
+	)
+	.await;
+
+	let client = mcp_streamable_client(io).await;
+
+	// Burn the rate-limit quota with 2 Phase-1 calls.
+	let _ = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "1" })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 1 call #1 should succeed");
+	let _ = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({ "id": "2" })
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect("Phase 1 call #2 should succeed");
+
+	// 5 clears in a row must all return success without rate-limit rejection.
+	for i in 0..5u32 {
+		let cleared = client
+			.call_tool(
+				rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+					serde_json::json!({
+						"id": format!("{i}"),
+						"__mcp_clear_pending__": true,
+					})
+					.as_object()
+					.cloned()
+					.unwrap(),
+				),
+			)
+			.await
+			.unwrap_or_else(|e| panic!("clear {i} was rejected: {e:?}"));
+		let cleared_text = extract_text(&cleared);
+		assert!(
+			cleared_text.contains("\"cleared\""),
+			"clear {i} did not return a cleared response: {cleared_text}"
+		);
+		assert!(
+			!cleared_text.contains("rate_limit_exceeded"),
+			"clear {i} hit the rate limit: {cleared_text}"
+		);
+	}
+}
+
 async fn standard_assertions(client: RunningService<RoleClient, InitializeRequestParams>) {
 	let tools = client.list_tools(None).await.unwrap();
 	let t = tools
@@ -1056,6 +1582,37 @@ async fn mock_streamable_http_server(stateful: bool) -> MockServer {
 	}
 }
 
+/// Mock streamable-HTTP MCP server whose sole tool advertises a property
+/// named `__mcp_clear_pending__` — the gateway's reserved clear-sentinel —
+/// to drive the schema-collision refusal path in `merge_tools`.
+async fn mock_streamable_http_server_with_colliding_tool() -> MockServer {
+	use rmcp::transport::streamable_http_server::StreamableHttpService;
+	use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+	agent_core::telemetry::testing::setup_test_logging();
+
+	let service = StreamableHttpService::new(
+		|| Ok(collidingmockserver::CollidingTool::new()),
+		LocalSessionManager::default().into(),
+		StreamableHttpServerConfig::default()
+			.with_sse_retry(None)
+			.with_sse_keep_alive(None)
+			.with_stateful_mode(true)
+			.with_json_response(false),
+	);
+
+	let (tx, rx) = tokio::sync::oneshot::channel();
+	let router = axum::Router::new().nest_service("/mcp", service);
+	let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = tcp_listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		let _ = axum::serve(tcp_listener, router)
+			.with_graceful_shutdown(async { rx.await.unwrap() })
+			.await;
+		info!("colliding mock server stopped");
+	});
+	MockServer { addr, _cancel: tx }
+}
+
 async fn mock_sse_server() -> MockServer {
 	use legacy_rmcp::transport::sse_server::{SseServer, SseServerConfig};
 	use tokio_util::sync::CancellationToken;
@@ -1348,6 +1905,75 @@ mod mockserver {
 		) -> Result<InitializeResult, McpError> {
 			let mut init_counter = self.init_counter.lock().await;
 			*init_counter += 1;
+			Ok(self.get_info())
+		}
+	}
+}
+
+/// Minimal mock MCP server whose only tool is named `evil_collision` and
+/// whose schema includes a property named `__mcp_clear_pending__` — the
+/// gateway's reserved sentinel. Drives the schema-collision refusal path
+/// added in Task 1 of the pending-approval clear feature.
+mod collidingmockserver {
+	use rmcp::handler::server::router::tool::ToolRouter;
+	use rmcp::handler::server::wrapper::Parameters;
+	use rmcp::model::*;
+	use rmcp::service::RequestContext;
+	use rmcp::{
+		ErrorData as McpError, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router,
+	};
+
+	#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+	pub struct CollidingArgs {
+		// Property name is the gateway's reserved clear-sentinel; serde rename
+		// is required because Rust identifiers can't carry the sentinel name
+		// directly. The JsonSchema derive picks up the serde rename so the
+		// emitted schema's `properties` map has the literal sentinel as a key.
+		// Field is unread by design — the tool body never executes in this test
+		// because the gateway refuses to surface the tool to clients at all.
+		#[allow(dead_code)]
+		#[serde(rename = "__mcp_clear_pending__")]
+		pub clear: bool,
+	}
+
+	#[derive(Clone)]
+	pub struct CollidingTool {
+		tool_router: ToolRouter<CollidingTool>,
+	}
+
+	#[tool_router]
+	impl CollidingTool {
+		#[allow(dead_code)]
+		pub fn new() -> Self {
+			Self {
+				tool_router: Self::tool_router(),
+			}
+		}
+
+		#[tool(description = "A tool whose schema collides with the reserved sentinel")]
+		fn evil_collision(
+			&self,
+			Parameters(_args): Parameters<CollidingArgs>,
+		) -> Result<CallToolResult, McpError> {
+			Ok(CallToolResult::success(vec![Content::text("noop")]))
+		}
+	}
+
+	#[tool_handler]
+	impl ServerHandler for CollidingTool {
+		fn get_info(&self) -> ServerInfo {
+			ServerInfo::new(
+				ServerCapabilities::builder().enable_tools().build(),
+			)
+			.with_protocol_version(ProtocolVersion::V_2025_06_18)
+			.with_instructions("Collision-test server: declares the reserved sentinel as a property.")
+		}
+
+		async fn initialize(
+			&self,
+			_request: InitializeRequestParams,
+			_: RequestContext<RoleServer>,
+		) -> Result<InitializeResult, McpError> {
 			Ok(self.get_info())
 		}
 	}
@@ -1826,6 +2452,10 @@ fn test_openapi_targets_emit_stateless_session_state() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1874,6 +2504,10 @@ fn test_sse_targets_emit_stateless_session_state() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1919,6 +2553,10 @@ async fn test_stdio_targets_remain_non_stateless() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1942,6 +2580,10 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 			failure_mode: FailureMode::FailOpen,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -1975,6 +2617,10 @@ fn test_set_sessions_matches_by_target_name() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -2024,6 +2670,10 @@ fn test_set_sessions_rejects_mismatched_target_set() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -2068,6 +2718,10 @@ fn test_merge_initialize_merges_upstream_instructions_when_multiplexing() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -2142,6 +2796,10 @@ fn test_merge_initialize_no_instructions_when_multiplexing() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
@@ -2193,6 +2851,10 @@ fn test_merge_initialize_forwards_single_backend_without_multiplexing() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ::http::StatusCode;
 use ::http::header::CONTENT_TYPE;
@@ -10,13 +11,14 @@ use anyhow::anyhow;
 use futures_util::StreamExt;
 use headers::HeaderMapExt;
 use rmcp::model::{
-	ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, Implementation,
-	InitializeRequest, JsonRpcRequest, ProtocolVersion, RequestId, RootsCapabilities,
-	ServerJsonRpcMessage,
+	CallToolResult, ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest,
+	ConstString, Content, Implementation, InitializeRequest, JsonRpcRequest, ProtocolVersion,
+	RequestId, RootsCapabilities, ServerJsonRpcMessage, ServerResult,
 };
 use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
 use sse_stream::{KeepAlive, Sse, SseBody, SseStream};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Mutex;
 
 use crate::http::Response;
 use crate::mcp::handler::{Relay, RelayInputs};
@@ -27,12 +29,121 @@ use crate::mcp::{ClientError, rbac};
 use crate::proxy::ProxyError;
 use crate::{mcp, *};
 
+/// Per-tool call counter for the rate limit window.
+#[derive(Debug, Clone)]
+struct RateLimitEntry {
+	count: u32,
+	window_started_at: Instant,
+}
+
+impl RateLimitEntry {
+	fn new() -> Self {
+		Self { count: 1, window_started_at: Instant::now() }
+	}
+
+	/// Returns whether the window has expired and resets it if so.
+	/// Returns the current count (after incrementing if still in window).
+	fn increment_or_reset(&mut self, window: std::time::Duration) -> u32 {
+		if Instant::now().duration_since(self.window_started_at) >= window {
+			self.count = 1;
+			self.window_started_at = Instant::now();
+		} else {
+			self.count += 1;
+		}
+		self.count
+	}
+}
+
+/// A tool call intercepted by the two-phase confirmation flow.
+/// Stored per-session, keyed by `(tool_name, args_hash)` so that:
+///   - parallel calls with different args each get their own pending entry
+///     (they no longer collide on tool-name alone), and
+///   - a confirmation re-call only matches when the LLM re-issues IDENTICAL
+///     args, defeating attempts to swap recipient/payload after approval.
+/// Single-use: consumed on Phase 2.
+#[derive(Debug, Clone)]
+struct PendingApproval {
+	expires_at: Instant,
+}
+
+impl PendingApproval {
+	fn new(ttl: std::time::Duration) -> Self {
+		Self {
+			expires_at: Instant::now() + ttl,
+		}
+	}
+
+	fn is_expired(&self) -> bool {
+		Instant::now() > self.expires_at
+	}
+}
+
+/// Order-independent hash of a JSON value: object keys are sorted before hashing
+/// so two semantically-equal arg maps produce the same hash regardless of how
+/// the LLM serialized them.
+fn hash_value(v: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
+	use serde_json::Value;
+	use std::hash::Hash;
+	match v {
+		Value::Null => 0u8.hash(hasher),
+		Value::Bool(b) => {
+			1u8.hash(hasher);
+			b.hash(hasher);
+		},
+		Value::Number(n) => {
+			2u8.hash(hasher);
+			n.to_string().hash(hasher);
+		},
+		Value::String(s) => {
+			3u8.hash(hasher);
+			s.hash(hasher);
+		},
+		Value::Array(arr) => {
+			4u8.hash(hasher);
+			arr.len().hash(hasher);
+			for item in arr {
+				hash_value(item, hasher);
+			}
+		},
+		Value::Object(map) => {
+			5u8.hash(hasher);
+			let mut keys: Vec<&String> = map.keys().collect();
+			keys.sort();
+			keys.len().hash(hasher);
+			for k in keys {
+				k.hash(hasher);
+				hash_value(map.get(k).unwrap(), hasher);
+			}
+		},
+	}
+}
+
+pub(crate) fn hash_args(args: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	match args {
+		Some(map) => {
+			let v = serde_json::Value::Object(map.clone());
+			hash_value(&v, &mut hasher);
+		},
+		None => 0u8.hash(&mut hasher),
+	}
+	hasher.finish()
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
 	encoder: http::sessionpersistence::Encoder,
 	relay: Arc<Relay>,
 	pub id: Arc<str>,
 	tx: Option<Sender<ServerJsonRpcMessage>>,
+	/// Pending two-phase confirmations, keyed by `<tool-name>|<args-hash>`.
+	/// Arc allows the HashMap to be shared across Session clones (same session, multiple requests).
+	pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+	/// Per-tool call counters for rate limiting, keyed by fully-qualified tool name.
+	tool_call_counts: Arc<Mutex<HashMap<String, RateLimitEntry>>>,
+	/// Whether this session was created in stateful mode (confirmation requires statefulness).
+	is_stateful: bool,
 }
 
 impl Session {
@@ -125,6 +236,7 @@ impl Session {
 
 	pub fn with_inputs(mut self, inputs: RelayInputs) -> Self {
 		self.relay = Arc::new(self.relay.with_policies(inputs.policies));
+		// pending_approvals and is_stateful are intentionally preserved across with_inputs calls
 		self
 	}
 
@@ -377,25 +489,200 @@ impl Session {
 						let (service_name, tool) = self.relay.parse_resource_name(&name)?;
 						span.rename_span(format!("{method} {service_name}"));
 						let call_arguments = ctr.params.arguments.clone();
+
+						// ── Pending-approval clear (sentinel short-circuit) ──
+						// If the LLM (i.e. LibreChat) sent the clear sentinel,
+						// strip the sentinel from a clone of the args, re-derive
+						// the same (tool, hash(stripped_args)) key Phase 1 used,
+						// remove the matching pending entry if present, and return
+						// a {cleared: ...} result. NEVER forwards upstream and
+						// bypasses ALL other policy checks (auth, rate-limit,
+						// arg-rewrite, confirmation). See spec §3 + §6.
+						if let Some(args) = call_arguments.as_ref()
+							&& matches!(
+								args.get(crate::mcp::MCP_CLEAR_PENDING_SENTINEL),
+								Some(serde_json::Value::Bool(true))
+							) {
+							// Compute the same lookup key Phase 1 uses.
+							let cleared = if self.is_stateful {
+								let mut stripped = call_arguments.clone();
+								if let Some(map) = stripped.as_mut() {
+									map.remove(crate::mcp::MCP_CLEAR_PENDING_SENTINEL);
+								}
+								let key = self.pending_approval_key(&name, tool, &stripped);
+								let mut approvals = self.pending_approvals.lock().await;
+								approvals.remove(&key).is_some()
+							} else {
+								// Stateless session has no pending_approvals at
+								// all — clear is trivially a no-op.
+								false
+							};
+							let body = if cleared {
+								"{\"cleared\":true}"
+							} else {
+								"{\"cleared\":false}"
+							};
+							let msg = ServerJsonRpcMessage::response(
+								ServerResult::CallToolResult(
+									CallToolResult::success(vec![Content::text(body)]),
+								),
+								r.id.clone(),
+							);
+							use futures_util::stream;
+							return crate::mcp::handler::messages_to_response(
+								r.id,
+								stream::once(async move { Ok(msg) }),
+								None,
+							);
+						}
+						// ── End pending-approval clear ──
+
 						log.non_atomic_mutate(|l| {
 							l.set_tool(service_name.to_string(), tool.to_string());
-							l.capture_call_arguments(call_arguments);
+							l.capture_call_arguments(call_arguments.clone());
 						});
-						if !self.relay.policies.validate(
-							&rbac::ResourceType::Tool(rbac::ResourceId::new(
-								service_name.to_string(),
-								tool.to_string(),
-							)),
-							&cel,
-						) {
+						let resource = rbac::ResourceType::Tool(rbac::ResourceId::new(
+							service_name.to_string(),
+							tool.to_string(),
+						));
+						if !self.relay.policies.validate(&resource, &cel) {
 							return Err(UpstreamError::Authorization {
 								resource_type: "tool".to_string(),
 								resource_name: name.to_string(),
 							});
 						}
 
+						// ── Per-session rate limit ───────────────────────────────
+						if self.is_stateful
+							&& self.relay.rate_limit.is_limited(&resource, &cel)
+						{
+							let mut counts = self.tool_call_counts.lock().await;
+							let count = counts
+								.entry(name.to_string())
+								.or_insert_with(RateLimitEntry::new)
+								.increment_or_reset(self.relay.rate_limit.window);
+
+							if count > self.relay.rate_limit.max_calls {
+								drop(counts);
+								let payload = serde_json::json!({
+									"error": "rate_limit_exceeded",
+									"message": format!(
+										"Tool '{}' has been called {} times within the {}s window. Maximum allowed: {}.",
+										tool,
+										count,
+										self.relay.rate_limit.window.as_secs(),
+										self.relay.rate_limit.max_calls,
+									)
+								});
+								let text = serde_json::to_string_pretty(&payload)
+									.unwrap_or_default();
+								let msg = ServerJsonRpcMessage::response(
+									ServerResult::CallToolResult(CallToolResult::success(vec![
+										Content::text(text),
+									])),
+									r.id.clone(),
+								);
+								use futures_util::stream;
+								return crate::mcp::handler::messages_to_response(
+									r.id,
+									stream::once(async move { Ok(msg) }),
+									None,
+								);
+							}
+						}
+						// ── End rate limit ───────────────────────────────────────
+
+						// ── Two-phase confirmation ───────────────────────────────
+						if self.is_stateful
+							&& self.relay.confirmation.requires_confirmation(&resource, &cel)
+						{
+							// Build the call key from (tool name, args hash). Different parallel
+							// calls with different args get separate pending entries; a confirmation
+							// re-call only matches when the LLM re-issues IDENTICAL args.
+							//
+							// Hash a STRIPPED clone of the args so an enrichment-injected
+							// synthetic display field varying between Phase 1 and Phase 2
+							// doesn't break the pending-approval match (spec §6).
+							// build_presentation below still uses the ORIGINAL args (with
+							// the synthetic field present) to populate the modal.
+							let key = self.pending_approval_key(&name, tool, &call_arguments);
+
+							let mut approvals = self.pending_approvals.lock().await;
+
+							if let Some(pending) = approvals.get(&key) {
+								if pending.is_expired() {
+									// Expired → drop it and fall through to Phase 1
+									approvals.remove(&key);
+								} else {
+									// Phase 2: matching pending → consume and execute upstream
+									approvals.remove(&key);
+									drop(approvals);
+									let tn = tool.to_string();
+									ctr.params.name = tn.into();
+									// Strip BEFORE arg_rewrite + upstream forward, so the
+									// upstream MCP server never sees fields it didn't define.
+									self.relay.enrichment.strip(tool, &mut ctr.params.arguments);
+									self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
+									return self
+										.relay
+										.send_single(r, ctx, service_name, Some(log.clone()))
+										.await;
+								}
+							}
+
+							// Phase 1: store pending for this exact (tool, args) call signature
+							let ttl = self.relay.confirmation.ttl;
+							approvals.insert(key, PendingApproval::new(ttl));
+							drop(approvals);
+
+							let preview = build_preview(tool, call_arguments.as_ref());
+							let presentation = self
+								.relay
+								.confirmation
+								.build_presentation(tool, call_arguments.as_ref());
+
+							let mut payload = serde_json::json!({
+								"confirmationRequired": true,
+								"preview": preview,
+								"expiresInSeconds": ttl.as_secs(),
+								"instruction": concat!(
+									"STOP. Do NOT re-call this tool automatically. ",
+									"Show the preview above to the user and ask: ",
+									"\"Do you confirm this operation? (yes/no)\". ",
+									"Only re-call this tool with IDENTICAL arguments after the ",
+									"user explicitly replies \"yes\". ",
+									"Do NOT modify the arguments in any way."
+								)
+							});
+							if let Some(pres) = presentation {
+								if let serde_json::Value::Object(map) = &mut payload {
+									map.insert("presentation".to_string(), pres);
+								}
+							}
+							let text = serde_json::to_string_pretty(&payload)
+								.unwrap_or_default();
+							let msg = ServerJsonRpcMessage::response(
+								ServerResult::CallToolResult(CallToolResult::success(vec![
+									Content::text(text),
+								])),
+								r.id.clone(),
+							);
+							use futures_util::stream;
+							return crate::mcp::handler::messages_to_response(
+								r.id,
+								stream::once(async move { Ok(msg) }),
+								None,
+							);
+						}
+						// ── End two-phase confirmation ───────────────────────────
+
 						let tn = tool.to_string();
 						ctr.params.name = tn.into();
+						// Strip BEFORE arg_rewrite + upstream forward — handles the case
+						// where a tool has enrichment configured but no mcpConfirmation;
+						// the upstream still must not see the synthetic field.
+						self.relay.enrichment.strip(tool, &mut ctr.params.arguments);
+						self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
 						self
 							.relay
 							.send_single(r, ctx, service_name, Some(log.clone()))
@@ -504,6 +791,26 @@ impl Session {
 	fn get_roots_capabilities(&self) -> Option<RootsCapabilities> {
 		None
 	}
+
+	/// Compute the `(tool, args-hash)` key used to track a pending approval.
+	/// Both the Phase-1 store path AND the clear-sentinel evict path MUST go
+	/// through this helper so the two stay in lock-step. If a future change
+	/// adds a normalization step (e.g. dropping nulls, sorting keys), it lands
+	/// here once and both call sites pick it up automatically.
+	///
+	/// The caller is responsible for removing any non-payload sentinel args
+	/// (e.g. `MCP_CLEAR_PENDING_SENTINEL`) from `args` before calling this —
+	/// the helper just runs the standard strip + hash sequence.
+	fn pending_approval_key(
+		&self,
+		name: &str,
+		tool: &str,
+		args: &Option<serde_json::Map<String, serde_json::Value>>,
+	) -> String {
+		let mut for_hash = args.clone();
+		self.relay.enrichment.strip(tool, &mut for_hash);
+		format!("{}|{:016x}", name, hash_args(for_hash.as_ref()))
+	}
 }
 
 #[derive(Debug)]
@@ -560,6 +867,9 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
 		};
 		let mut sm = self.sessions.write().expect("write lock");
 		sm.insert(id.to_string(), sess.clone());
@@ -576,6 +886,9 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
 		}
 	}
 
@@ -588,6 +901,8 @@ impl SessionManager {
 	/// Unlike create_session, this does NOT register the session in the session manager.
 	/// The caller is responsible for calling session.delete_session() when done
 	/// to clean up upstream resources (e.g., stdio processes).
+	/// NOTE: two-phase confirmation is disabled for stateless sessions because
+	/// the session state is not preserved between requests.
 	pub fn create_stateless_session(&self, relay: Relay) -> Session {
 		let id = session_id();
 		Session {
@@ -595,6 +910,9 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: false,
 		}
 	}
 
@@ -608,6 +926,9 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: Some(tx),
 			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
 		};
 		let mut sm = self.sessions.write().expect("write lock");
 		sm.insert(id.to_string(), sess.clone());
@@ -703,6 +1024,26 @@ impl sse_stream::Timer for TokioSseTimer {
 		let this = self.project();
 		this.sleep.reset(tokio::time::Instant::from_std(when));
 	}
+}
+
+/// Build a human-readable preview string for the confirmation prompt.
+fn build_preview(
+	tool_name: &str,
+	args: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> String {
+	let mut lines = vec![format!("Tool: {tool_name}")];
+	if let Some(map) = args {
+		for (k, v) in map {
+			let display = match v {
+				serde_json::Value::String(s) if s.len() > 200 => {
+					format!("{}…", &s[..200])
+				},
+				other => other.to_string(),
+			};
+			lines.push(format!("  {k}: {display}"));
+		}
+	}
+	lines.join("\n")
 }
 
 fn get_client_info() -> ClientInfo {

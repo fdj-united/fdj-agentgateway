@@ -9,3 +9,9 @@
 var/
 controller/_output
 controller/_test
+
+# Local-only deployment experiments (not part of the upstream project).
+# The "real" chart lives in the separate kindred-mcp-gateway Bitbucket repo.
+deploy-test/
+deploy/
+deployment/

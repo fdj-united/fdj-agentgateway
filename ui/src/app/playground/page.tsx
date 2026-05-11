@@ -609,7 +609,7 @@ export default function PlaygroundPage() {
         detailedMessage += "• Network: Server may be down or unreachable\n";
         detailedMessage += "• Headers: Missing required headers (Accept, mcp-protocol-version)\n";
         detailedMessage += `• URL: Check if '${selectedRoute?.endpoint || "unknown"}/sse' is correct\n`;
-        detailedMessage += "• Config: Verify agentgateway is running with correct config";
+        detailedMessage += "• Config: Verify MCP-Gateway is running with correct config";
 
         console.error("CORS/Network error details:", {
           url: `${selectedRoute?.endpoint || "unknown"}/sse`,
@@ -621,7 +621,7 @@ export default function PlaygroundPage() {
         toast.error(detailedMessage, { duration: 8000 });
       } else if (errorMessage.includes("CORS") || errorMessage.includes("Access-Control")) {
         toast.error(
-          `❌ CORS Error: ${errorMessage}\n• Add '${window.location.origin}' to CORS allowOrigins\n• Check CORS headers in agentgateway config`,
+          `❌ CORS Error: ${errorMessage}\n• Add '${window.location.origin}' to CORS allowOrigins\n• Check CORS headers in MCP-Gateway config`,
           { duration: 6000 }
         );
       } else {

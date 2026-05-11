@@ -10,7 +10,7 @@ use crate::http::ext_proc::InferenceRouting;
 use crate::http::oidc;
 use crate::http::{ext_authz, ext_proc, filters, health, remoteratelimit, retry, timeout};
 use crate::llm::policy::ResponseGuard;
-use crate::mcp::McpAuthorizationSet;
+use crate::mcp::{McpArgRewriteSet, McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet, McpToolEnrichmentSet};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{
 	A2aPolicy, Backend, BackendKey, BackendPolicy, BackendTargetRef, BackendWithPolicies, Bind,
@@ -150,6 +150,10 @@ pub struct BackendPolicies {
 	pub inference_routing: Option<InferenceRouting>,
 
 	pub mcp_authorization: Option<McpAuthorizationSet>,
+	pub mcp_confirmation: Option<McpConfirmationSet>,
+	pub mcp_rate_limit: Option<McpRateLimitSet>,
+	pub mcp_arg_rewrite: Option<McpArgRewriteSet>,
+	pub mcp_tool_enrichment: Option<McpToolEnrichmentSet>,
 	pub mcp_authentication: Option<McpAuthentication>,
 
 	pub http: Option<types::backend::HTTP>,
@@ -183,6 +187,10 @@ impl BackendPolicies {
 			llm: other.llm.or(self.llm),
 			// TODO: is this right??
 			mcp_authorization: other.mcp_authorization.or(self.mcp_authorization),
+			mcp_confirmation: other.mcp_confirmation.or(self.mcp_confirmation),
+			mcp_rate_limit: other.mcp_rate_limit.or(self.mcp_rate_limit),
+			mcp_arg_rewrite: other.mcp_arg_rewrite.or(self.mcp_arg_rewrite),
+			mcp_tool_enrichment: other.mcp_tool_enrichment.or(self.mcp_tool_enrichment),
 			mcp_authentication: other.mcp_authentication.or(self.mcp_authentication),
 			inference_routing: other.inference_routing.or(self.inference_routing),
 			http: other.http.or(self.http),
@@ -734,6 +742,18 @@ impl Store {
 			.chain(rules);
 
 		let mut mcp_authz = Vec::new();
+		// (rule_set, ttl_seconds) pairs collected before building McpConfirmationSet
+		let mut mcp_confirm: Vec<(
+			crate::http::authorization::RuleSet,
+			Option<u64>,
+			Vec<crate::mcp::PresentationRule>,
+		)> = Vec::new();
+		// (rule_set, max_calls, window_seconds) triples for McpRateLimitSet
+		let mut mcp_rate: Vec<(crate::http::authorization::RuleSet, u32, u64)> = Vec::new();
+		// All ArgRewriteRule entries collected from one or more McpArgRewrite policies
+		let mut mcp_arg_rewrite: Vec<crate::mcp::ArgRewriteRule> = Vec::new();
+		// All EnrichmentRule entries collected from one or more McpToolEnrichment policies
+		let mut mcp_tool_enrichment: Vec<crate::mcp::EnrichmentRule> = Vec::new();
 		let mut pol = BackendPolicies::default();
 		for rule in rules {
 			match &rule {
@@ -792,6 +812,23 @@ impl Store {
 					// Authorization policies merge, unlike others
 					mcp_authz.push(p.clone().into_inner());
 				},
+				BackendPolicy::McpConfirmation(p) => {
+					// Confirmation policies merge, like authorization
+					let (rs, ttl, pres) = p.clone().into_parts();
+					mcp_confirm.push((rs, ttl, pres));
+				},
+				BackendPolicy::McpRateLimit(p) => {
+					let (rs, max_calls, window_seconds) = p.clone().into_parts();
+					mcp_rate.push((rs, max_calls, window_seconds));
+				},
+				BackendPolicy::McpArgRewrite(p) => {
+					// Rules from multiple policies concatenate, applied in order.
+					mcp_arg_rewrite.extend(p.clone().into_inner());
+				},
+				BackendPolicy::McpToolEnrichment(p) => {
+					// Rules from multiple policies concatenate.
+					mcp_tool_enrichment.extend(p.clone().into_inner());
+				},
 				BackendPolicy::McpAuthentication(p) => {
 					pol.mcp_authentication.get_or_insert_with(|| p.clone());
 				},
@@ -799,6 +836,53 @@ impl Store {
 		}
 		if !mcp_authz.is_empty() {
 			pol.mcp_authorization = Some(McpAuthorizationSet::new(mcp_authz.into()));
+		}
+		if !mcp_rate.is_empty() {
+			// Use the first explicitly set values; these don't merge meaningfully.
+			let max_calls = mcp_rate[0].1;
+			let window_secs = mcp_rate[0].2;
+			let rule_sets: Vec<_> = mcp_rate.into_iter().map(|(rs, _, _)| rs).collect();
+			pol.mcp_rate_limit = Some(McpRateLimitSet::new(
+				rule_sets.into(),
+				max_calls,
+				std::time::Duration::from_secs(window_secs),
+			));
+		}
+		if !mcp_confirm.is_empty() {
+			// Use the first explicitly set TTL; fall back to the default (120s).
+			let ttl_secs = mcp_confirm
+				.iter()
+				.find_map(|(_, t, _)| *t)
+				.unwrap_or(120);
+			// Concat presentation rules across all confirmation policies; the
+			// first rule whose `tools` list matches a tool wins at envelope time.
+			let presentations: Vec<_> = mcp_confirm
+				.iter()
+				.flat_map(|(_, _, p)| p.clone())
+				.collect();
+			let rule_sets: Vec<_> = mcp_confirm.into_iter().map(|(rs, _, _)| rs).collect();
+			pol.mcp_confirmation = Some(McpConfirmationSet::new(
+				rule_sets.into(),
+				std::time::Duration::from_secs(ttl_secs),
+				presentations,
+			));
+		}
+		if !mcp_arg_rewrite.is_empty() {
+			pol.mcp_arg_rewrite = Some(McpArgRewriteSet::new(mcp_arg_rewrite));
+		}
+		if !mcp_tool_enrichment.is_empty() {
+			let set = McpToolEnrichmentSet::new(mcp_tool_enrichment);
+			// Defense-in-depth: per-policy collisions are caught earlier in
+			// `local.rs::split_policies`, but multiple McpToolEnrichment
+			// policies (e.g. one at gateway scope, one at backend scope)
+			// have their rules concatenated here, so a same-tool/same-field
+			// collision can still arise at merge time. Panic loudly rather
+			// than silently letting the dynamic check at first `tools/list`
+			// surface as an opaque LLM error.
+			if let Err(e) = set.validate() {
+				panic!("{}", e);
+			}
+			pol.mcp_tool_enrichment = Some(set);
 		}
 		pol
 	}

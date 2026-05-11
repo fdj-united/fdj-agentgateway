@@ -99,7 +99,7 @@ export function AppSidebar({ setActiveView }: AppSidebarProps) {
       <SidebarHeader className="border-b">
         <div className="p-2 flex items-center justify-center mb-2">
           <AgentgatewayLogo className="h-10 w-auto" />
-          <span className="text-2xl ml-2 font-bold">agentgateway</span>
+          <span className="text-2xl ml-2 font-bold">MCP-Gateway</span>
         </div>
       </SidebarHeader>
 

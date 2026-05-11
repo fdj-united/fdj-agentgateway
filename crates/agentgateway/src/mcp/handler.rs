@@ -7,11 +7,11 @@ use crate::http::sessionpersistence::MCPSession;
 use crate::mcp;
 use crate::mcp::FailureMode;
 use crate::mcp::mergestream::{MergeFn, Messages};
-use crate::mcp::rbac::{CelExecWrapper, McpAuthorizationSet};
+use crate::mcp::rbac::{CelExecWrapper, McpArgRewriteSet, McpAuthorizationSet, McpConfirmationSet, McpRateLimitSet, McpToolEnrichmentSet};
 use crate::mcp::router::McpBackendGroup;
 use crate::mcp::streamablehttp::ServerSseMessage;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
-use crate::mcp::{ClientError, MCPInfo, mergestream, rbac, upstream};
+use crate::mcp::{ClientError, MCPInfo, MCP_CLEAR_PENDING_SENTINEL, mergestream, rbac, upstream};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::log::{AsyncLog, SpanWriteOnDrop, SpanWriter};
 use agent_core::version::BuildInfo;
@@ -41,17 +41,33 @@ fn resource_name(default_target_name: Option<&String>, target: &str, name: &str)
 pub struct Relay {
 	upstreams: Arc<upstream::UpstreamGroup>,
 	pub policies: McpAuthorizationSet,
+	pub confirmation: McpConfirmationSet,
+	pub rate_limit: McpRateLimitSet,
+	pub arg_rewrite: McpArgRewriteSet,
+	pub enrichment: McpToolEnrichmentSet,
 }
 
 pub struct RelayInputs {
 	pub backend: McpBackendGroup,
 	pub policies: McpAuthorizationSet,
+	pub confirmation: McpConfirmationSet,
+	pub rate_limit: McpRateLimitSet,
+	pub arg_rewrite: McpArgRewriteSet,
+	pub enrichment: McpToolEnrichmentSet,
 	pub client: PolicyClient,
 }
 
 impl RelayInputs {
 	pub fn build_new_connections(self) -> Result<Relay, mcp::Error> {
-		Relay::new(self.backend, self.policies, self.client)
+		Relay::new(
+			self.backend,
+			self.policies,
+			self.confirmation,
+			self.rate_limit,
+			self.arg_rewrite,
+			self.enrichment,
+			self.client,
+		)
 	}
 }
 
@@ -59,17 +75,29 @@ impl Relay {
 	pub fn new(
 		backend: McpBackendGroup,
 		policies: McpAuthorizationSet,
+		confirmation: McpConfirmationSet,
+		rate_limit: McpRateLimitSet,
+		arg_rewrite: McpArgRewriteSet,
+		enrichment: McpToolEnrichmentSet,
 		client: PolicyClient,
 	) -> Result<Self, mcp::Error> {
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(client, backend)?),
 			policies,
+			confirmation,
+			rate_limit,
+			arg_rewrite,
+			enrichment,
 		})
 	}
 	pub fn with_policies(&self, policies: McpAuthorizationSet) -> Self {
 		Self {
 			upstreams: self.upstreams.clone(),
 			policies,
+			confirmation: self.confirmation.clone(),
+			rate_limit: self.rate_limit.clone(),
+			arg_rewrite: self.arg_rewrite.clone(),
+			enrichment: self.enrichment.clone(),
 		}
 	}
 
@@ -153,42 +181,67 @@ impl Relay {
 
 	pub fn merge_tools(&self, cel: CelExecWrapper) -> Box<MergeFn> {
 		let policies = self.policies.clone();
+		let enrichment = self.enrichment.clone();
 		let default_target_name = self.upstreams.default_target_name.clone();
 		Box::new(move |streams| {
-			let tools = streams
-				.into_iter()
-				.flat_map(|(server_name, s)| {
-					let tools = match s {
-						ServerResult::ListToolsResult(ltr) => ltr.tools,
-						_ => vec![],
-					};
-					tools
-						.into_iter()
-						// Apply authorization policies, filtering tools that are not allowed.
-						.filter(|t| {
-							policies.validate(
-								&rbac::ResourceType::Tool(rbac::ResourceId::new(
-									server_name.to_string(),
-									t.name.to_string(),
-								)),
-								&cel,
-							)
-						})
-						// Rename to handle multiplexing
-						.map(|mut t| {
-							t.name = Cow::Owned(resource_name(
-								default_target_name.as_ref(),
-								server_name.as_str(),
-								&t.name,
-							));
-							t
-						})
-						.collect_vec()
-				})
-				.collect_vec();
+			let mut tools_out: Vec<rmcp::model::Tool> = Vec::new();
+			for (server_name, s) in streams {
+				let tools = match s {
+					ServerResult::ListToolsResult(ltr) => ltr.tools,
+					_ => vec![],
+				};
+				for mut t in tools {
+					// Apply authorization policies, filtering tools that are not allowed.
+					if !policies.validate(
+						&rbac::ResourceType::Tool(rbac::ResourceId::new(
+							server_name.to_string(),
+							t.name.to_string(),
+						)),
+						&cel,
+					) {
+						continue;
+					}
+
+					// Refuse-to-serve any tool whose schema declares the clear sentinel
+					// as a real property — would collide with the gateway's clear hook.
+					// (See spec §6.1.)
+					if let Some(serde_json::Value::Object(props)) =
+						t.input_schema.get("properties")
+						&& props.contains_key(MCP_CLEAR_PENDING_SENTINEL)
+					{
+						return Err(ClientError::new(anyhow::anyhow!(
+							"tool '{}' declares the reserved property '{}' — \
+							 this name is reserved by the gateway for the \
+							 pending-approval clear sentinel; rename the property \
+							 to avoid the collision",
+							t.name,
+							MCP_CLEAR_PENDING_SENTINEL
+						)));
+					}
+
+					// Inject enrichment fields into the tool's input schema. The
+					// short (pre-rename) tool name is what enrichment rules match
+					// on. `Arc::make_mut` is copy-on-write — cheap because
+					// `merge_tools` runs per-request.
+					if !enrichment.is_empty() {
+						let schema = Arc::make_mut(&mut t.input_schema);
+						enrichment
+							.apply_to_schema(t.name.as_ref(), schema)
+							.map_err(|e| ClientError::new(e.context("mcpToolEnrichment")))?;
+					}
+
+					// Rename to handle multiplexing.
+					t.name = Cow::Owned(resource_name(
+						default_target_name.as_ref(),
+						server_name.as_str(),
+						&t.name,
+					));
+					tools_out.push(t);
+				}
+			}
 			Ok(
 				ListToolsResult {
-					tools,
+					tools: tools_out,
 					next_cursor: None,
 					meta: None,
 				}
@@ -569,7 +622,7 @@ pub fn setup_request_log(
 	(_span, log, cel)
 }
 
-fn messages_to_response(
+pub(crate) fn messages_to_response(
 	id: RequestId,
 	stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,
 	mcp_log: Option<AsyncLog<MCPInfo>>,

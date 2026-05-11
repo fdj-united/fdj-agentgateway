@@ -216,7 +216,7 @@ export default function Home() {
         <div className="text-center py-12">
           <div className="mx-auto max-w-2xl">
             <Network className="mx-auto h-12 w-12 text-muted-foreground mb-4" />
-            <h3 className="text-lg font-semibold mb-2">Welcome to agentgateway</h3>
+            <h3 className="text-lg font-semibold mb-2">Welcome to MCP-Gateway</h3>
             <p className="text-muted-foreground mb-6">
               Get started by configuring your first port bind and listener to begin routing traffic.
             </p>
@@ -490,7 +490,7 @@ export default function Home() {
             <CardContent>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div className="text-center">
-                  <div className="text-2xl font-bold">{binds?.length || 0}</div>
+                  <div className="text-2xl font-bold text-primary">{binds?.length || 0}</div>
                   <div className="text-sm text-muted-foreground">Active Port Binds</div>
                 </div>
                 <div className="text-center">
