@@ -1,14 +1,18 @@
 import {
   Shield,
+  ShieldCheck,
   Lock,
   Globe,
   Edit,
   Timer,
+  Gauge,
   RotateCcw,
   Key,
   Zap,
   Network,
   FileText,
+  FilePenLine,
+  Sparkles,
   ArrowRight,
   Users,
 } from "lucide-react";
@@ -17,6 +21,10 @@ export type PolicyType =
   | "jwtAuth"
   | "mcpAuthentication"
   | "mcpAuthorization"
+  | "mcpConfirmation"
+  | "mcpRateLimit"
+  | "mcpArgRewrite"
+  | "mcpToolEnrichment"
   | "cors"
   | "backendTLS"
   | "backendAuth"
@@ -39,6 +47,10 @@ export interface PolicyTypeInfo {
   description: string;
   httpOnly?: boolean;
   tcpOnly?: boolean;
+  // UI-only: hide config form behind a "coming soon" toast. The card still
+  // shows Active/Inactive based on whether the policy is present in the route
+  // config, so YAML-managed policies remain visible in the dashboard.
+  comingSoon?: boolean;
 }
 
 export const POLICY_TYPES: Record<PolicyType, PolicyTypeInfo> = {
@@ -59,6 +71,34 @@ export const POLICY_TYPES: Record<PolicyType, PolicyTypeInfo> = {
     icon: Lock,
     description: "Model Context Protocol authorization rules",
     httpOnly: true,
+  },
+  mcpConfirmation: {
+    name: "MCP Confirmation",
+    icon: ShieldCheck,
+    description: "Require user confirmation before sensitive MCP tool calls",
+    httpOnly: true,
+    comingSoon: true,
+  },
+  mcpRateLimit: {
+    name: "MCP Rate Limit",
+    icon: Gauge,
+    description: "Per-tool rate limiting for MCP calls",
+    httpOnly: true,
+    comingSoon: true,
+  },
+  mcpArgRewrite: {
+    name: "MCP Arg Rewrite",
+    icon: FilePenLine,
+    description: "Rewrite MCP tool-call arguments before forwarding upstream",
+    httpOnly: true,
+    comingSoon: true,
+  },
+  mcpToolEnrichment: {
+    name: "MCP Tool Enrichment",
+    icon: Sparkles,
+    description: "Inject synthetic display fields into MCP tool schemas",
+    httpOnly: true,
+    comingSoon: true,
   },
   cors: {
     name: "CORS",

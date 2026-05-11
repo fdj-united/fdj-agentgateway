@@ -106,6 +106,13 @@ export interface Policies {
   cors?: CorsPolicy | null;
   mcpAuthorization?: McpAuthorization | null;
   mcpAuthentication?: McpAuthentication | null;
+  // YAML-only policies (no UI editor yet — shown as Active/Inactive cards with
+  // a "Coming soon" toast on Add/Edit). Typed as `any` since the UI doesn't
+  // need to inspect their internals.
+  mcpConfirmation?: any | null;
+  mcpRateLimit?: any | null;
+  mcpArgRewrite?: any | null;
+  mcpToolEnrichment?: any | null;
   a2a?: any | null;
   ai?: any;
   backendTLS?: BackendTLS | null;

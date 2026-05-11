@@ -189,6 +189,10 @@ export function PolicyConfig() {
   };
 
   const handleAddPolicy = async (routeContext: RouteWithContext, type: PolicyType) => {
+    if (POLICY_TYPES[type].comingSoon) {
+      toast.info(`${POLICY_TYPES[type].name} editor coming soon — manage via YAML for now.`);
+      return;
+    }
     setPolicyDialog({
       isOpen: true,
       type,
@@ -198,6 +202,10 @@ export function PolicyConfig() {
   };
 
   const handleEditPolicy = async (routeContext: RouteWithContext, type: PolicyType) => {
+    if (POLICY_TYPES[type].comingSoon) {
+      toast.info(`${POLICY_TYPES[type].name} editor coming soon — manage via YAML for now.`);
+      return;
+    }
     const existingData = (routeContext.route.policies as any)?.[type];
     setPolicyDialog({
       isOpen: true,
@@ -460,6 +468,7 @@ export function PolicyConfig() {
               {getAvailablePolicyTypes(selectedRoute.routeType).map(([type, info]) => {
                 const hasPolicy = hasPolicyType(selectedRoute, type as PolicyType);
                 const IconComponent = info.icon;
+                const comingSoon = !!info.comingSoon;
 
                 return (
                   <div
@@ -471,9 +480,16 @@ export function PolicyConfig() {
                         <IconComponent className="h-5 w-5 text-muted-foreground" />
                         <span className="font-medium">{info.name}</span>
                       </div>
-                      <Badge variant={hasPolicy ? "default" : "outline"} className="text-xs">
-                        {hasPolicy ? "Active" : "Inactive"}
-                      </Badge>
+                      <div className="flex items-center space-x-2">
+                        {comingSoon && (
+                          <Badge variant="secondary" className="text-xs">
+                            Coming soon
+                          </Badge>
+                        )}
+                        <Badge variant={hasPolicy ? "default" : "outline"} className="text-xs">
+                          {hasPolicy ? "Active" : "Inactive"}
+                        </Badge>
+                      </div>
                     </div>
                     <p className="text-sm text-muted-foreground mb-3">{info.description}</p>
                     <div className="flex items-center space-x-2">
@@ -502,7 +518,7 @@ export function PolicyConfig() {
                           </>
                         )}
                       </Button>
-                      {hasPolicy && (
+                      {hasPolicy && !comingSoon && (
                         <Button
                           variant="outline"
                           size="sm"
