@@ -115,6 +115,57 @@ data:
                       {{- range .rules }}
                       - {{ . | quote }}
                       {{- end }}
+                    {{- with .presentations }}
+                    presentations:
+                      {{- range . }}
+                      - tools:
+                          {{- range .tools }}
+                          - {{ . | quote }}
+                          {{- end }}
+                        {{- with .title }}
+                        title: {{ . | quote }}
+                        {{- end }}
+                        {{- with .summary }}
+                        summary: {{ . | quote }}
+                        {{- end }}
+                        {{- with .fields }}
+                        fields:
+                          {{- range . }}
+                          - label: {{ .label | quote }}
+                            path: {{ .path | quote }}
+                            {{- with .format }}
+                            format: {{ . }}
+                            {{- end }}
+                            {{- with .importance }}
+                            importance: {{ . }}
+                            {{- end }}
+                          {{- end }}
+                        {{- end }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+                  {{- with $backend.toolEnrichment }}
+                  mcpToolEnrichment:
+                    rules:
+                      {{- range .rules }}
+                      - tools:
+                          {{- range .tools }}
+                          - {{ . | quote }}
+                          {{- end }}
+                        inject:
+                          {{- range .inject }}
+                          - name: {{ .name | quote }}
+                            {{- with .type }}
+                            type: {{ . | quote }}
+                            {{- end }}
+                            {{- if hasKey . "required" }}
+                            required: {{ .required }}
+                            {{- end }}
+                            {{- with .description }}
+                            description: {{ . | quote }}
+                            {{- end }}
+                          {{- end }}
+                      {{- end }}
                   {{- end }}
                   {{- with $backend.rateLimit }}
                   mcpRateLimit:
