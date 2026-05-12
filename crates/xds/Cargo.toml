@@ -1,0 +1,26 @@
+[package]
+name = "agent-xds"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+axum-core.workspace = true
+agent-core.workspace = true
+anyhow.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+prometheus-client.workspace = true
+protos.workspace = true
+prost.workspace = true
+prost-wkt-types.workspace = true
+tower.workspace = true
+http.workspace = true
+split-iter.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true

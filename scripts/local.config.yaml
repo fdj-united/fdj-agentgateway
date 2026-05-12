@@ -1,0 +1,241 @@
+# Rendered from helm/ + scripts/run-local-native.sh values.
+# Run with:  cargo run --release --bin agentgateway -- -f scripts/local.config.yaml
+# Regenerate by re-running scripts/run-local-native.sh (or run-local.sh) and copying
+# from $TMPDIR/kindred-mcp-gateway-local-native/config.yaml.
+
+frontendPolicies:
+  accessLog:
+    add:
+      mcp.method: "mcp.methodName"
+      mcp.session: "mcp.sessionId"
+      mcp.target: "mcp.tool.target"
+      mcp.tool: "mcp.tool.name"
+      status: "response.status_code"
+      user: "request.headers[\"X-User-Email\"]"
+binds:
+  - port: 8081
+    listeners:
+      - name: "ms365"
+        protocol: HTTP
+        routes:
+          - name: "teams-route"
+            policies:
+              cors:
+                allowOrigins:
+                  - "*"
+                allowHeaders:
+                  - "mcp-protocol-version"
+                  - "content-type"
+                  - "cache-control"
+                  - "Accept"
+                  - "Authorization"
+                  - "X-User-Email"
+              mcpAuthorization:
+                rules:
+                  - "mcp.tool.name in [\"get-team\", \"list-joined-teams\", \"list-team-channels\", \"get-team-channel\", \"list-team-members\", \"list-channel-messages\", \"get-channel-message\", \"list-channel-message-replies\", \"reply-to-channel-message\", \"send-channel-message\", \"list-chats\", \"get-chat\", \"list-chat-messages\", \"get-chat-message\", \"list-chat-message-replies\", \"reply-to-chat-message\", \"send-chat-message\"]"
+              mcpConfirmation:
+                ttlSeconds: 10
+                rules:
+                  - "mcp.tool.name in [\"send-chat-message\", \"send-channel-message\", \"reply-to-chat-message\", \"reply-to-channel-message\"]"
+                presentations:
+                  - tools: [send-chat-message]
+                    title: "Send Teams chat message"
+                    summary: "A chat message will be sent to the selected Teams conversation."
+                    fields:
+                      - { label: "Chat ID",      path: "chatId", format: code, importance: primary }
+                      - { label: "To",      path: "recipientDisplayName", format: text, importance: primary }
+                      - { label: "Message", path: "body.body.content",    format: text, importance: primary }
+                      - { label: "Format",  path: "body.body.contentType", format: code, importance: detail }
+                  - tools: [reply-to-chat-message]
+                    title: "Reply in Teams chat"
+                    summary: "A reply will be posted to the selected Teams chat thread."
+                    fields:
+                      - { label: "Chat ID",      path: "chatId", format: code, importance: primary }
+                      - { label: "To",      path: "recipientDisplayName", format: text, importance: primary }
+                      - { label: "Reply",   path: "body.body.content",    format: text, importance: primary }
+                      - { label: "Format",  path: "body.body.contentType", format: code, importance: detail }
+                  - tools: [send-channel-message]
+                    title: "Post Teams channel message"
+                    summary: "A message will be posted to the selected Teams channel."
+                    fields:
+                      - { label: "Team / Channel", path: "channelDisplayName",  format: text, importance: primary }
+                      - { label: "Message",        path: "body.body.content",   format: text, importance: primary }
+                      - { label: "Format",         path: "body.body.contentType", format: code, importance: detail }
+                  - tools: [reply-to-channel-message]
+                    title: "Reply in Teams channel"
+                    summary: "A reply will be posted to the selected Teams channel thread."
+                    fields:
+                      - { label: "Team / Channel", path: "channelDisplayName",  format: text, importance: primary }
+                      - { label: "Reply",          path: "body.body.content",   format: text, importance: primary }
+                      - { label: "Format",         path: "body.body.contentType", format: code, importance: detail }
+              mcpToolEnrichment:
+                rules:
+                  - tools: [send-chat-message, reply-to-chat-message]
+                    inject:
+                      - name: recipientDisplayName
+                        type: string
+                        required: true
+                        description: |
+                          Human-readable name of the chat recipient (e.g. "Alice Smith"
+                          or "#engineering team chat"). Populate from conversation
+                          context — if you have called a chat-lookup tool previously,
+                          use the resolved display name. This value is shown to the
+                          user for confirmation; it is NOT sent to the upstream Teams API.
+                  - tools: [send-channel-message, reply-to-channel-message]
+                    inject:
+                      - name: channelDisplayName
+                        type: string
+                        required: true
+                        description: |
+                          Human-readable channel identifier including the team prefix
+                          (e.g. "Acme / #engineering"). Populate from conversation
+                          context. Shown to the user for confirmation; it is NOT sent
+                          to the upstream Teams API.
+              mcpRateLimit:
+                maxCalls: 5
+                windowSeconds: 60
+                rules:
+                  - "mcp.tool.name in [\"send-chat-message\"]"
+              mcpArgRewrite:
+                rules:
+                  - tools:
+                      - "send-chat-message"
+                      - "send-channel-message"
+                      - "reply-to-chat-message"
+                      - "reply-to-channel-message"
+                    path: "body.body.content"
+                    op: "append"
+                    value: "<br><br><i>— Sent via KAIT (LOCAL NATIVE)</i>"
+                  - tools: [send-chat-message, send-channel-message, reply-to-chat-message, reply-to-channel-message]
+                    path: body.body.contentType
+                    op: replace
+                    value: "html"
+            matches:
+              - path:
+                  pathPrefix: "/teams"
+            backends:
+              - mcp:
+                  targets:
+                    - name: teams
+                      mcp:
+                        host: "https://m365.kindcoast-e367d61d.switzerlandnorth.azurecontainerapps.io/mcp"
+                      policies:
+                        backendTLS:
+                          insecure: true
+  - port: 8082
+    listeners:
+      - name: "atlassian"
+        protocol: HTTP
+        routes:
+          - name: "jira-route"
+            policies:
+              cors:
+                allowOrigins:
+                  - "*"
+                allowHeaders:
+                  - "mcp-protocol-version"
+                  - "content-type"
+                  - "cache-control"
+                  - "Accept"
+                  - "Authorization"
+                  - "X-User-Email"
+              mcpAuthorization:
+                rules:
+                  - "mcp.tool.name in [\"atlassianUserInfo\", \"getAccessibleAtlassianResources\", \"getJiraIssue\", \"editJiraIssue\", \"createJiraIssue\", \"getTransitionsForJiraIssue\", \"transitionJiraIssue\", \"lookupJiraAccountId\", \"searchJiraIssuesUsingJql\", \"addCommentToJiraIssue\", \"getJiraIssueRemoteIssueLinks\", \"getVisibleJiraProjects\", \"getJiraProjectIssueTypesMetadata\"]"
+              mcpAuthentication:
+                mode: permissive
+                issuer: https://cf.mcp.atlassian.com
+                jwks:
+                  url: https://auth.atlassian.com/.well-known/jwks.json
+                audiences:
+                  - http://localhost:8082/jira
+                resourceMetadata:
+                  resource: http://localhost:8082/jira
+                  scopesSupported:
+                    - read:jira-work
+                    - write:jira-work
+                    - read:jira-user
+                    - read:me
+                    - offline_access
+                  bearerMethodsSupported: [header]
+              mcpConfirmation:
+                ttlSeconds: 120
+                rules:
+                  - "mcp.tool.name in [\"createJiraIssue\", \"editJiraIssue\", \"transitionJiraIssue\", \"addCommentToJiraIssue\"]"
+                presentations:
+                  - tools: [createJiraIssue]
+                    title: "Create Jira issue"
+                    summary: "A new Jira issue will be created in the selected project."
+                    fields:
+                      - { label: "Project",     path: "projectKey",          format: code,     importance: primary }
+                      - { label: "Issue type",  path: "issueTypeName",       format: text,     importance: primary }
+                      - { label: "Summary",     path: "summary",             format: text,     importance: primary }
+                      - { label: "Assignee",    path: "assignee_account_id", format: code,     importance: primary }
+                      - { label: "Description", path: "description",         format: markdown, importance: detail }
+                      - { label: "Workspace",   path: "cloudId",             format: code,     importance: detail }
+                      - { label: "Format",      path: "contentFormat",       format: code,     importance: detail }
+            matches:
+              - path: { pathPrefix: "/jira" }
+              - path: { exact: "/.well-known/oauth-protected-resource/jira" }
+              - path: { exact: "/.well-known/oauth-authorization-server/jira" }
+            backends:
+              - mcp:
+                  targets:
+                    - name: jira
+                      mcp:
+                        host: "https://mcp.atlassian.com/v1/mcp"
+          - name: "confluence-route"
+            policies:
+              cors:
+                allowOrigins:
+                  - "*"
+                allowHeaders:
+                  - "mcp-protocol-version"
+                  - "content-type"
+                  - "cache-control"
+                  - "Accept"
+                  - "Authorization"
+                  - "X-User-Email"    
+              mcpAuthorization:
+                rules:
+                  - "mcp.tool.name in [\"atlassianUserInfo\", \"getAccessibleAtlassianResources\", \"createConfluenceFooterComment\", \"createConfluenceInlineComment\", \"createConfluencePage\", \"getConfluencePage\", \"getConfluencePageDescendants\", \"getConfluencePageFooterComments\", \"getConfluencePageInlineComments\", \"getConfluenceSpaces\", \"getPagesInConfluenceSpace\", \"searchConfluenceUsingCql\", \"updateConfluencePage\"]"
+              mcpAuthentication:
+                mode: permissive
+                issuer: https://cf.mcp.atlassian.com
+                jwks:
+                  url: https://auth.atlassian.com/.well-known/jwks.json
+                audiences:
+                  - http://localhost:8082/confluence
+                resourceMetadata:
+                  resource: http://localhost:8082/confluence
+              mcpConfirmation:
+                ttlSeconds: 120
+                rules:
+                  - "mcp.tool.name in [\"createConfluencePage\", \"updateConfluencePage\", \"createConfluenceFooterComment\", \"createConfluenceInlineComment\"]"
+                presentations:
+                  - tools: [createConfluencePage]
+                    title: "Create Confluence page"
+                    summary: "A new page will be created in the selected Confluence space."
+                    fields:
+                      - { label: "Title",     path: "title",         format: text,     importance: primary }
+                      - { label: "Space",     path: "spaceId",       format: code,     importance: primary }
+                      - { label: "Status",    path: "status",        format: code,     importance: detail }
+                      - { label: "Format",    path: "contentFormat", format: code,     importance: detail }
+                      - { label: "Body",      path: "body",          format: markdown, importance: detail }
+                      - { label: "Workspace", path: "cloudId",       format: code,     importance: detail }
+              mcpArgRewrite:
+                rules:
+                  - tools: [createConfluencePage]
+                    path: "body"
+                    op: "append"
+                    value: "\n\n---\n\n*This page is created from KAIT*"
+            matches:
+              - path: { pathPrefix: "/confluence" }
+              - path: { exact: "/.well-known/oauth-protected-resource/confluence" }
+              - path: { exact: "/.well-known/oauth-authorization-server/confluence" }
+            backends:
+              - mcp:
+                  targets:
+                    - name: confluence
+                      mcp:
+                        host: "https://mcp.atlassian.com/v1/mcp"

@@ -1,6 +1,8 @@
 @Library('jenkins-shared-library')_
 
-// Helper which extract clean version from git describe
+// Helper which extracts a clean semver from `git describe`.
+// Source-of-truth fallback is helm/Chart.yaml so chart + image versions stay
+// in lockstep when no git tag has been cut yet.
 def extractCleanVersion() {
     if (env.VERSION?.trim()) {
         return env.VERSION.trim()
@@ -8,7 +10,7 @@ def extractCleanVersion() {
 
     def gitVersion = sh(script: "git describe --tags --always", returnStdout: true).trim()
 
-    // Try to parse semver from git describe output (e.g. v0.0.1-3-gabcdef)
+    // Try to parse semver from git describe output (e.g. v0.0.9-3-gabcdef)
     def version = sh(
         script: """
             echo '${gitVersion}' | sed -n 's/^.*\\([0-9]\\+\\)\\.\\([0-9]\\+\\)\\.\\([0-9]\\+\\)\\(-\\([0-9]\\+\\)\\)\\?.*\$/\\1.\\2.\\3.\\5/p'
@@ -36,7 +38,7 @@ def extractCleanVersion() {
         return chartVersion
     }
 
-    return "0.0.1"
+    return "0.0.9"
 }
 
 genericPod([
@@ -44,11 +46,11 @@ genericPod([
 ]) {
     def version
     def chartName = "kindred-mcp-gateway"
-    def imageRegistry
-    def imageRepository
-    def imageTag
+    def imageName = "agentgateway"
     def jfrogRegistry = "jfrog.kindredgroup.com/docker-dev"
     def jfrogRepositoryPrefix = "kindred/dde"
+    def targetRepository = "${jfrogRepositoryPrefix}/${imageName}"
+    def gitRevision
 
     stage('Checkout') {
         checkout([
@@ -58,50 +60,42 @@ genericPod([
             userRemoteConfigs: scm.userRemoteConfigs
         ])
         version = extractCleanVersion()
-
-        // Read the Docker image reference from image.properties
-        def props = readProperties file: 'image.properties'
-        imageRegistry = props.IMAGE_REGISTRY
-        imageRepository = props.IMAGE_REPOSITORY
-        imageTag = props.IMAGE_TAG
+        gitRevision = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
 
         echo "==================================="
         echo "Chart version: ${version}"
-        echo "Source image:  ${imageRegistry}/${imageRepository}:${imageTag}"
+        echo "Image tag:     v${version}"
+        echo "Git revision:  ${gitRevision}"
+        echo "Target image:  ${jfrogRegistry}/${targetRepository}:v${version}"
         echo "==================================="
 
         env.VERSION = version
     }
 
-    stage('Push Docker Image') {
+    stage('Build & Push Docker Image') {
         container('docker') {
-            // Derive the image name from the source repository (e.g. "fdj-united/agentgateway" -> "agentgateway")
-            def imageName = imageRepository.tokenize('/').last()
-            def sourceImage = "${imageRegistry}/${imageRepository}:${imageTag}"
-            def targetRepository = "${jfrogRepositoryPrefix}/${imageName}"
+            def imageTag = "v${version}"
             def targetImage = "${jfrogRegistry}/${targetRepository}:${imageTag}"
 
-            echo "Mirroring image:"
-            echo "  source: ${sourceImage}"
-            echo "  target: ${targetImage}"
-
-            sh "docker pull ${sourceImage}"
-            sh "docker tag ${sourceImage} ${targetImage}"
+            echo "Building image from Dockerfile:"
+            echo "  target:       ${targetImage}"
+            echo "  --build-arg:  VERSION=${version}"
+            echo "  --build-arg:  GIT_REVISION=${gitRevision}"
 
             docker.withRegistry("https://${jfrogRegistry}", 'artifactory-docker-deploy') {
-                def image = docker.image(targetImage)
-                image.push(imageTag)
+                // The multi-stage Dockerfile targets linux/<TARGETARCH>. Jenkins
+                // agents are amd64; cross-arch builds belong in a separate
+                // buildx-enabled stage if/when needed.
+                def img = docker.build(
+                    targetImage,
+                    "--build-arg VERSION=${version} --build-arg GIT_REVISION=${gitRevision} ."
+                )
+                img.push(imageTag)
                 if (env.BRANCH_NAME == 'master') {
-                    image.push('latest')
+                    img.push('latest')
                     echo "Also pushed: ${jfrogRegistry}/${targetRepository}:latest"
                 }
             }
-
-            // Repoint the chart at the JFrog copy so the packaged values.yaml uses the mirrored image
-            imageRegistry = jfrogRegistry
-            imageRepository = targetRepository
-
-            echo "Chart will reference: ${imageRegistry}/${imageRepository}:${imageTag}"
         }
     }
 
@@ -112,18 +106,18 @@ genericPod([
             sh 'apk add --no-cache curl tar sed'
             sh 'curl -fsSL https://get.helm.sh/helm-v3.15.3-linux-amd64.tar.gz | tar xz && mv linux-amd64/helm /usr/local/bin/helm && rm -rf linux-amd64'
 
-            // Bake the Docker image reference into values.yaml before packaging
+            // Bake the JFrog image reference into values.yaml before packaging.
             sh """
-                sed -i 's|^  registry:.*|  registry: ${imageRegistry}|' helm/values.yaml
-                sed -i 's|^  repository:.*|  repository: ${imageRepository}|' helm/values.yaml
-                sed -i 's|^  tag:.*|  tag: ${imageTag}|' helm/values.yaml
+                sed -i 's|^  registry:.*|  registry: ${jfrogRegistry}|' helm/values.yaml
+                sed -i 's|^  repository:.*|  repository: ${targetRepository}|' helm/values.yaml
+                sed -i 's|^  tag:.*|  tag: v${version}|' helm/values.yaml
             """
 
-            // Fetch subchart dependencies (e.g. the upstream agentgateway control plane)
-            // and vendor them into helm/charts/ so the published .tgz is self-contained.
+            // Vendor any subchart dependencies into helm/charts/ so the .tgz is
+            // self-contained. No-op if there are no `dependencies:` declared.
             sh "helm dependency update helm"
 
-            sh "helm package --app-version ${imageTag} --version ${version} helm"
+            sh "helm package --app-version v${version} --version ${version} helm"
 
             withCredentials([usernamePassword(
                 credentialsId: 'artifactory-helm-deploy',
@@ -163,7 +157,7 @@ genericPod([
                     git config user.email "dummy.robobuild@kindredgroup.com"
                     git config user.name "Robo creating releases"
                     git tag -a v${version} -m "Release v${version}" || echo "Tag v${version} already exists, skipping"
-                    git push https://\${GIT_USER}:\${GIT_PASSWORD}@bitbucket.kindredgroup.com/bitbucket/scm/mcp/kindred-mcp-gateway.git v${version} || echo "Tag already pushed"
+                    git push https://\${GIT_USER}:\${GIT_PASSWORD}@bitbucket.kindredgroup.com/bitbucket/scm/dde/kindred-mcp-gateway.git v${version} || echo "Tag already pushed"
                 """
             }
         } else {
@@ -173,7 +167,7 @@ genericPod([
 
     echo "==================================="
     echo "Build complete:"
-    echo "  Image: ${imageRegistry}/${imageRepository}:${imageTag}"
-    echo "  Helm: ${chartName}-${version}"
+    echo "  Image: ${jfrogRegistry}/${targetRepository}:v${version}"
+    echo "  Helm:  ${chartName}-${version}"
     echo "==================================="
 }

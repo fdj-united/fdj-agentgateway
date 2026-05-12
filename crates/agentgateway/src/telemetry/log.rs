@@ -1,0 +1,1645 @@
+use std::borrow::Cow;
+use std::fmt::Debug;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
+use std::time::{Duration, SystemTime};
+
+use agent_core::Timestamp;
+use agent_core::metrics::CustomField;
+use agent_core::strng;
+use agent_core::strng::{RichStrng, Strng};
+use agent_core::telemetry::{OptionExt, OtelLogSink, ValueBag, debug, display};
+use bytes::Buf;
+use crossbeam::atomic::AtomicCell;
+use frozen_collections::FzHashSet;
+use http_body::{Body, Frame, SizeHint};
+use indexmap::IndexMap;
+use itertools::Itertools;
+use opentelemetry::TraceFlags;
+use opentelemetry::trace::{
+	Span, SpanBuilder, SpanContext, SpanKind, TraceContextExt as _, TraceState, Tracer,
+};
+use serde::de::DeserializeOwned;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
+use tracing::{Level, trace};
+
+use crate::cel::{ContextBuilder, Expression, LLMContext};
+use crate::http::Request;
+use crate::http::health;
+use crate::llm::InputFormat;
+use crate::mcp::{MCPInfo, MCPOperation};
+use crate::proxy::ProxyResponseReason;
+use crate::telemetry::metrics::{
+	GenAILabels, GenAILabelsTokenUsage, HTTPLabels, MCPCall, Metrics, RouteIdentifier,
+};
+use crate::telemetry::trc;
+use crate::telemetry::trc::TraceParent;
+use crate::transport::stream::{TCPConnectionInfo, TLSConnectionInfo};
+use crate::types::agent::{BackendInfo, BindKey, ListenerName, RouteName, Target};
+use crate::types::loadbalancer::ActiveHandle;
+use crate::{cel, llm, mcp};
+
+use opentelemetry::logs::{AnyValue, LogRecord as _, Logger, LoggerProvider as _, Severity};
+use opentelemetry::{Context as OtelContext, Key, KeyValue};
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+
+/// AsyncLog is a wrapper around an item that can be atomically set.
+/// The intent is to provide additional info to the log after we have lost the RequestLog reference,
+/// generally for things that rely on the response body.
+#[derive(Clone)]
+pub struct AsyncLog<T>(Arc<AtomicCell<Option<T>>>);
+
+impl<T> AsyncLog<T> {
+	// non_atomic_mutate is a racey method to modify the current value.
+	// If there is no current value, a default is used.
+	// This is NOT atomically safe; during the mutation, loads() on the item will be empty.
+	// This is ok for our usage cases
+	pub fn non_atomic_mutate(&self, f: impl FnOnce(&mut T)) {
+		let Some(mut cur) = self.0.take() else {
+			return;
+		};
+		f(&mut cur);
+		self.0.store(Some(cur));
+	}
+}
+
+impl<T> AsyncLog<T> {
+	pub fn store(&self, v: Option<T>) {
+		self.0.store(v)
+	}
+	pub fn take(&self) -> Option<T> {
+		self.0.take()
+	}
+}
+
+impl<T: Copy> AsyncLog<T> {
+	pub fn load(&self) -> Option<T> {
+		self.0.load()
+	}
+}
+
+impl<T> Default for AsyncLog<T> {
+	fn default() -> Self {
+		AsyncLog(Arc::new(AtomicCell::new(None)))
+	}
+}
+
+impl<T: Debug> Debug for AsyncLog<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("AsyncLog").finish_non_exhaustive()
+	}
+}
+
+#[derive(serde::Serialize, Debug, Default, Clone)]
+pub struct MetricsConfig {
+	pub metric_fields: Arc<MetricFields>,
+	pub excluded_metrics: FzHashSet<String>,
+}
+
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct Config {
+	/// Deprecated: use frontendPolicies.accessLog
+	pub filter: Option<Arc<cel::Expression>>,
+	/// Deprecated: use frontendPolicies.accessLog
+	pub fields: LoggingFields,
+	/// Level sets the level for logs
+	pub level: String,
+	/// Format sets the logging format (text or json)
+	pub format: crate::LoggingFormat,
+}
+
+#[derive(serde::Serialize, Default, Clone, Debug)]
+pub struct LoggingFields {
+	pub remove: Arc<FzHashSet<String>>,
+	pub add: Arc<OrderedStringMap<Arc<cel::Expression>>>,
+}
+
+#[derive(serde::Serialize, Default, Clone, Debug)]
+pub struct MetricFields {
+	pub add: OrderedStringMap<Arc<cel::Expression>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderedStringMap<V> {
+	map: std::collections::HashMap<Box<str>, V>,
+	order: Box<[Box<str>]>,
+}
+
+impl<V> OrderedStringMap<V> {}
+
+impl<V> OrderedStringMap<V> {
+	pub fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+	pub fn len(&self) -> usize {
+		self.map.len()
+	}
+	pub fn contains_key(&self, k: &str) -> bool {
+		self.map.contains_key(k)
+	}
+	pub fn values_unordered(&self) -> impl Iterator<Item = &V> {
+		self.map.values()
+	}
+	pub fn iter(&self) -> impl Iterator<Item = (&Box<str>, &V)> {
+		self
+			.order
+			.iter()
+			.map(|k| (k, self.map.get(k).expect("key must be present")))
+	}
+}
+
+impl<V> Default for OrderedStringMap<V> {
+	fn default() -> Self {
+		Self {
+			map: Default::default(),
+			order: Default::default(),
+		}
+	}
+}
+
+impl<V: Serialize> Serialize for OrderedStringMap<V> {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let mut m = serializer.serialize_map(Some(self.len()))?;
+		for (k, v) in self.iter() {
+			m.serialize_entry(k.as_ref(), v)?;
+		}
+		m.end()
+	}
+}
+
+impl<'de, V: DeserializeOwned> Deserialize<'de> for OrderedStringMap<V> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let im = IndexMap::<String, V>::deserialize(deserializer)?;
+		Ok(OrderedStringMap::from_iter(im))
+	}
+}
+
+#[cfg(feature = "schema")]
+impl<V: schemars::JsonSchema> schemars::JsonSchema for OrderedStringMap<V> {
+	fn schema_name() -> std::borrow::Cow<'static, str> {
+		format!("OrderedStringMap_{}", V::schema_name()).into()
+	}
+
+	fn json_schema(schema_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+		<std::collections::BTreeMap<String, V>>::json_schema(schema_gen)
+	}
+}
+
+impl<K, V> FromIterator<(K, V)> for OrderedStringMap<V>
+where
+	K: AsRef<str>,
+{
+	fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+		let items = iter.into_iter().collect_vec();
+		let order: Box<[Box<str>]> = items.iter().map(|(k, _)| k.as_ref().into()).collect();
+		let map: std::collections::HashMap<Box<str>, V> = items
+			.into_iter()
+			.map(|(k, v)| (k.as_ref().into(), v))
+			.collect();
+		Self { map, order }
+	}
+}
+
+impl LoggingFields {
+	pub fn has(&self, k: &str) -> bool {
+		self.remove.contains(k) || self.add.contains_key(k)
+	}
+}
+
+#[derive(Debug, Default)]
+pub struct TraceSampler {
+	pub random_sampling: Option<Arc<cel::Expression>>,
+	pub client_sampling: Option<Arc<cel::Expression>>,
+}
+
+impl TraceSampler {
+	pub fn trace_sampled(&self, req: &Request, tp: Option<&TraceParent>) -> bool {
+		let TraceSampler {
+			random_sampling,
+			client_sampling,
+		} = &self;
+		let expr = if tp.is_some() {
+			let Some(cs) = client_sampling else {
+				// If client_sampling is not set, default to include it
+				return true;
+			};
+			cs
+		} else {
+			let Some(rs) = random_sampling else {
+				// If random_sampling is not set, default to NOT include it
+				return false;
+			};
+			rs
+		};
+		let exec = cel::Executor::new_request(req);
+		exec.eval_rng(expr.as_ref())
+	}
+}
+
+#[derive(Debug)]
+pub struct CelLogging {
+	pub cel_context: cel::ContextBuilder,
+	pub filter: Option<Arc<cel::Expression>>,
+	pub fields: LoggingFields,
+	pub metric_fields: Arc<MetricFields>,
+}
+
+pub struct CelLoggingExecutor<'a> {
+	pub executor: cel::Executor<'a>,
+	pub filter: &'a Option<Arc<cel::Expression>>,
+	pub fields: &'a LoggingFields,
+	pub metric_fields: &'a Arc<MetricFields>,
+}
+
+impl<'a> CelLoggingExecutor<'a> {
+	fn eval_filter(&self) -> bool {
+		match self.filter.as_deref() {
+			Some(f) => self.executor.eval_bool(f),
+			None => true,
+		}
+	}
+
+	pub fn eval(
+		&self,
+		fields: &'a OrderedStringMap<Arc<Expression>>,
+	) -> Vec<(Cow<str>, Option<Value>)> {
+		self.eval_keep_empty(fields, false)
+	}
+
+	pub fn eval_keep_empty(
+		&self,
+		fields: &'a OrderedStringMap<Arc<Expression>>,
+		keep_empty: bool,
+	) -> Vec<(Cow<str>, Option<Value>)> {
+		let mut raws = Vec::with_capacity(fields.len());
+		for (k, v) in fields.iter() {
+			let field = self.executor.eval(v.as_ref());
+			if let Err(err) = &field {
+				trace!(target: "cel", ?err, expression=?v, "expression failed");
+			}
+			if let Ok(cel::Value::Null) = &field {
+				trace!(target: "cel",  expression=?v, "expression evaluated to null");
+			}
+			let celv = field.ok().filter(|v| !matches!(v, cel::Value::Null));
+
+			// We return Option here to match the schema but don't bother adding None values since they
+			// will be dropped anyways
+			if let Some(celv) = celv {
+				Self::resolve_value(&mut raws, Cow::Borrowed(k.as_ref()), &celv, false);
+			} else if keep_empty {
+				raws.push((Cow::Borrowed(k.as_ref()), None));
+			}
+		}
+		raws
+	}
+
+	fn resolve_value(
+		raws: &mut Vec<(Cow<'a, str>, Option<Value>)>,
+		k: Cow<'a, str>,
+		celv: &cel::Value,
+		always_flatten: bool,
+	) {
+		match agent_celx::FlattenSignal::from_value(celv) {
+			Some(agent_celx::FlattenSignal::List(li)) => {
+				raws.reserve(li.len());
+				for (idx, v) in li.as_ref().iter().enumerate() {
+					Self::resolve_value(raws, Cow::Owned(format!("{k}.{idx}")), v, false);
+				}
+				return;
+			},
+			Some(agent_celx::FlattenSignal::ListRecursive(li)) => {
+				raws.reserve(li.len());
+				for (idx, v) in li.as_ref().iter().enumerate() {
+					Self::resolve_value(raws, Cow::Owned(format!("{k}.{idx}")), v, true);
+				}
+				return;
+			},
+			Some(agent_celx::FlattenSignal::Map(m)) => {
+				raws.reserve(m.len());
+				for (mk, mv) in m.iter() {
+					Self::resolve_value(raws, Cow::Owned(format!("{k}.{mk}")), mv, false);
+				}
+				return;
+			},
+			Some(agent_celx::FlattenSignal::MapRecursive(m)) => {
+				raws.reserve(m.len());
+				for (mk, mv) in m.iter() {
+					Self::resolve_value(raws, Cow::Owned(format!("{k}.{mk}")), mv, true);
+				}
+				return;
+			},
+			None => {},
+		}
+
+		if always_flatten {
+			match celv {
+				cel::Value::List(li) => {
+					raws.reserve(li.len());
+					for (idx, v) in li.as_ref().iter().enumerate() {
+						let nk = Cow::Owned(format!("{k}.{idx}"));
+						Self::resolve_value(raws, nk, v, true);
+					}
+				},
+				cel::Value::Map(m) => {
+					raws.reserve(m.len());
+					for (mk, mv) in m.iter() {
+						let nk = Cow::Owned(format!("{k}.{mk}"));
+						Self::resolve_value(raws, nk, mv, true);
+					}
+				},
+				_ => raws.push((k, celv.json().ok())),
+			}
+		} else {
+			raws.push((k, celv.json().ok()));
+		}
+	}
+
+	fn eval_additions(&self) -> Vec<(Cow<str>, Option<Value>)> {
+		self.eval(&self.fields.add)
+	}
+}
+
+impl CelLogging {
+	pub fn new(cfg: Config, metrics: MetricsConfig) -> Self {
+		let mut cel_context = cel::ContextBuilder::new();
+		if let Some(f) = &cfg.filter {
+			cel_context.register_expression(f.as_ref());
+		}
+		for v in cfg.fields.add.values_unordered() {
+			cel_context.register_expression(v.as_ref());
+		}
+		for v in metrics.metric_fields.add.values_unordered() {
+			cel_context.register_expression(v.as_ref());
+		}
+
+		Self {
+			cel_context,
+			filter: cfg.filter,
+			fields: cfg.fields,
+			metric_fields: metrics.metric_fields,
+		}
+	}
+
+	pub fn register(&mut self, fields: &LoggingFields) {
+		for v in fields.add.values_unordered() {
+			self.cel_context.register_expression(v.as_ref());
+		}
+	}
+
+	pub fn ctx(&mut self) -> &mut ContextBuilder {
+		&mut self.cel_context
+	}
+
+	pub fn build<'a>(&'a self, inputs: CelLoggingBuildInputs<'a>) -> CelLoggingExecutor<'a> {
+		let CelLogging {
+			cel_context: _,
+			filter,
+			fields,
+			metric_fields,
+		} = self;
+		let executor = if inputs.req.is_none() && inputs.source_context.is_some() {
+			// TCP case: use new_tcp_logger
+			cel::Executor::new_tcp_logger(inputs.source_context, inputs.end_time)
+		} else {
+			// HTTP case: use new_logger
+			cel::Executor::new_logger(
+				inputs.req,
+				inputs.resp,
+				inputs.llm_response,
+				inputs.mcp,
+				Some(inputs.end_time),
+			)
+		};
+		CelLoggingExecutor {
+			executor,
+			filter,
+			fields,
+			metric_fields,
+		}
+	}
+}
+
+pub struct CelLoggingBuildInputs<'a> {
+	pub req: Option<&'a cel::RequestSnapshot>,
+	pub resp: Option<&'a cel::ResponseSnapshot>,
+	pub llm_response: Option<&'a LLMContext>,
+	pub mcp: Option<&'a MCPInfo>,
+	pub end_time: &'a cel::RequestTime,
+	pub source_context: Option<&'a cel::SourceContext>,
+}
+
+#[derive(Debug)]
+pub struct DropOnLog {
+	log: Option<RequestLog>,
+}
+
+impl DropOnLog {
+	pub fn as_mut(&mut self) -> Option<&mut RequestLog> {
+		self.log.as_mut()
+	}
+	pub fn as_ref(&self) -> Option<&RequestLog> {
+		self.log.as_ref()
+	}
+	pub fn with(&mut self, f: impl FnOnce(&mut RequestLog)) {
+		if let Some(l) = self.log.as_mut() {
+			f(l)
+		}
+	}
+
+	/// Computes (health, eviction_duration, restore_health) for finish_request.
+	/// `unhealthy` should already be evaluated (preferably with the shared CEL executor when available).
+	/// When no CEL expression is set, the default treats 4xx, 5xx, or connection failures as unhealthy.
+	fn eviction_unhealthy(log: &RequestLog, cel_exec: &CelLoggingExecutor<'_>) -> bool {
+		let default_unhealthy = log.status.is_none_or(|s| s.is_server_error());
+		let Some(policy) = &log.health_policy else {
+			return default_unhealthy;
+		};
+		let Some(expr) = &policy.unhealthy_expression else {
+			return default_unhealthy;
+		};
+		cel_exec.executor.eval_bool(expr.as_ref())
+	}
+
+	/// Returns (health, eviction_duration, restore_health).
+	fn eviction_decision(
+		log: &RequestLog,
+		current_health: f64,
+		consecutive_failure_count: u64,
+		times_ejected: u64,
+		unhealthy: bool,
+	) -> (bool, Option<Duration>, Option<f64>) {
+		let Some(policy) = &log.health_policy else {
+			let health = !unhealthy;
+			return (health, None, None);
+		};
+		let fallback_duration = log.retry_after.or(log.retry_backoff);
+		policy.eviction_decision(
+			current_health,
+			consecutive_failure_count,
+			times_ejected,
+			unhealthy,
+			fallback_duration,
+		)
+	}
+
+	fn add_llm_metrics(
+		log: &RequestLog,
+		route_identifier: &RouteIdentifier,
+		end_time: Timestamp,
+		duration: Duration,
+		llm_response: Option<&LLMContext>,
+		custom_metric_fields: &CustomField,
+	) {
+		if let Some(llm_response) = llm_response {
+			let gen_ai_labels = Arc::new(GenAILabels {
+				gen_ai_operation_name: strng::literal!("chat").into(),
+				gen_ai_system: llm_response.provider.clone().into(),
+				gen_ai_request_model: llm_response.request_model.clone().into(),
+				gen_ai_response_model: llm_response.response_model.clone().into(),
+				custom: custom_metric_fields.clone(),
+				route: route_identifier.clone(),
+			});
+			if let Some(it) = llm_response.input_tokens {
+				log
+					.metrics
+					.gen_ai_token_usage
+					.get_or_create(&GenAILabelsTokenUsage {
+						gen_ai_token_type: strng::literal!("input").into(),
+						common: gen_ai_labels.clone().into(),
+					})
+					.observe(it as f64)
+			}
+			if let Some(ot) = llm_response.output_tokens {
+				log
+					.metrics
+					.gen_ai_token_usage
+					.get_or_create(&GenAILabelsTokenUsage {
+						gen_ai_token_type: strng::literal!("output").into(),
+						common: gen_ai_labels.clone().into(),
+					})
+					.observe(ot as f64)
+			}
+			if let Some(crt) = llm_response.cached_input_tokens {
+				log
+					.metrics
+					.gen_ai_token_usage
+					.get_or_create(&GenAILabelsTokenUsage {
+						gen_ai_token_type: strng::literal!("input_cache_read").into(),
+						common: gen_ai_labels.clone().into(),
+					})
+					.observe(crt as f64)
+			}
+			if let Some(cwt) = llm_response.cache_creation_input_tokens {
+				log
+					.metrics
+					.gen_ai_token_usage
+					.get_or_create(&GenAILabelsTokenUsage {
+						gen_ai_token_type: strng::literal!("input_cache_write").into(),
+						common: gen_ai_labels.clone().into(),
+					})
+					.observe(cwt as f64)
+			}
+			log
+				.metrics
+				.gen_ai_request_duration
+				.get_or_create(&gen_ai_labels)
+				.observe(duration.as_secs_f64());
+			if let Some(ft) = llm_response.first_token {
+				let ttft = ft.duration_since(log.start.as_instant());
+				// Duration from start of request to first token
+				// This is the start of when WE got the request, but it should probably be when we SENT the upstream.
+				log
+					.metrics
+					.gen_ai_time_to_first_token
+					.get_or_create(&gen_ai_labels)
+					.observe(ttft.as_secs_f64());
+
+				if let Some(ot) = llm_response.output_tokens {
+					let first_to_last = end_time.as_instant().duration_since(ft);
+					let throughput = first_to_last.as_secs_f64() / (ot as f64);
+					log
+						.metrics
+						.gen_ai_time_per_output_token
+						.get_or_create(&gen_ai_labels)
+						.observe(throughput);
+				}
+			}
+		}
+	}
+}
+
+impl From<RequestLog> for DropOnLog {
+	fn from(log: RequestLog) -> Self {
+		Self { log: Some(log) }
+	}
+}
+
+impl RequestLog {
+	pub fn new(
+		cel: CelLogging,
+		metrics: Arc<Metrics>,
+		start: Timestamp,
+		tcp_info: TCPConnectionInfo,
+	) -> Self {
+		RequestLog {
+			cel,
+			metrics,
+			start,
+			tcp_info,
+			tls_info: None,
+			tracer: None,
+			trace_spans: Arc::new(Mutex::new(Default::default())),
+			otel_logger: None,
+			endpoint: None,
+			bind_name: None,
+			listener_name: None,
+			route_name: None,
+			backend_info: None,
+			backend_protocol: None,
+			host: None,
+			method: None,
+			path: None,
+			path_match: None,
+			version: None,
+			status: None,
+			reason: None,
+			retry_after: None,
+			health_policy: None,
+			retry_backoff: None,
+			jwt_sub: None,
+			retry_attempt: None,
+			error: None,
+			grpc_status: Default::default(),
+			mcp_status: Default::default(),
+			incoming_span: None,
+			outgoing_span: None,
+			llm_request: None,
+			llm_response: Default::default(),
+			a2a_method: None,
+			inference_pool: None,
+			request_handle: None,
+			request_snapshot: None,
+			response_snapshot: None,
+			source_context: None,
+			response_bytes: 0,
+		}
+	}
+
+	pub fn span_writer(&self) -> SpanWriter {
+		let inner = self.span_writer_inner();
+		SpanWriter { inner }
+	}
+	fn span_writer_inner(&self) -> Option<SpanWriterInner> {
+		let tp = self.outgoing_span.clone()?;
+		let tc = self.tracer.clone()?;
+
+		Some(SpanWriterInner {
+			tracer: tc,
+			parent: tp,
+			inner: self.trace_spans.clone(),
+		})
+	}
+}
+
+#[derive(Debug)]
+pub struct RequestLog {
+	pub cel: CelLogging,
+	pub metrics: Arc<Metrics>,
+	pub start: Timestamp,
+	pub tcp_info: TCPConnectionInfo,
+
+	// Set only for TLS traffic
+	pub tls_info: Option<TLSConnectionInfo>,
+
+	// Set only if the trace is sampled
+	pub tracer: Option<std::sync::Arc<trc::Tracer>>,
+	/// Additional spans created during the request (e.g. upstream call spans).
+	/// These are flushed on drop when tracing is enabled.
+	pub trace_spans: Arc<Mutex<Vec<(SpanBuilder, OtelContext)>>>,
+
+	// Set only if OTLP logging is configured
+	pub otel_logger: Option<std::sync::Arc<OtelAccessLogger>>,
+
+	pub endpoint: Option<Target>,
+
+	pub bind_name: Option<BindKey>,
+	pub listener_name: Option<ListenerName>,
+	pub route_name: Option<RouteName>,
+	pub backend_info: Option<BackendInfo>,
+	pub backend_protocol: Option<cel::BackendProtocol>,
+
+	pub host: Option<String>,
+	pub method: Option<::http::Method>,
+	pub path: Option<String>,
+	pub path_match: Option<Strng>,
+	pub version: Option<::http::Version>,
+	pub status: Option<crate::http::StatusCode>,
+	pub reason: Option<ProxyResponseReason>,
+	pub retry_after: Option<Duration>,
+
+	/// Health policy for backend (e.g. AI provider) failover. Set from route policies when request_handle is used.
+	pub health_policy: Option<health::Policy>,
+	/// Retry backoff from route policy; used as fallback eviction duration when health_policy has no explicit duration.
+	pub retry_backoff: Option<Duration>,
+
+	pub jwt_sub: Option<String>,
+
+	pub retry_attempt: Option<u8>,
+	pub error: Option<String>,
+
+	pub grpc_status: AsyncLog<u8>,
+	pub mcp_status: AsyncLog<mcp::MCPInfo>,
+
+	pub incoming_span: Option<trc::TraceParent>,
+	pub outgoing_span: Option<trc::TraceParent>,
+
+	pub llm_request: Option<llm::LLMRequest>,
+	pub llm_response: AsyncLog<llm::LLMInfo>,
+
+	pub a2a_method: Option<Strng>,
+
+	pub inference_pool: Option<SocketAddr>,
+
+	pub request_handle: Option<ActiveHandle>,
+	pub request_snapshot: Option<cel::RequestSnapshot>,
+	pub response_snapshot: Option<cel::ResponseSnapshot>,
+	/// Source context for TCP connections (where we don't have an HTTP request)
+	pub source_context: Option<cel::SourceContext>,
+
+	pub response_bytes: u64,
+}
+
+impl Drop for DropOnLog {
+	fn drop(&mut self) {
+		let Some(mut log) = self.log.take() else {
+			return;
+		};
+
+		let route_identifier = RouteIdentifier {
+			bind: (&log.bind_name).into(),
+			gateway: log
+				.listener_name
+				.as_ref()
+				.map(|l| l.as_gateway_name())
+				.into(),
+			listener: log.listener_name.as_ref().map(|l| &l.listener_name).into(),
+			route: log.route_name.as_ref().map(|l| l.as_route_name()).into(),
+			route_rule: log
+				.route_name
+				.as_ref()
+				.and_then(|l| l.rule_name.as_ref())
+				.into(),
+		};
+
+		let is_tcp = matches!(&log.backend_protocol, &Some(cel::BackendProtocol::tcp));
+
+		let mut http_labels = HTTPLabels {
+			backend: log
+				.backend_info
+				.as_ref()
+				.map(|info| info.backend_name.clone())
+				.into(),
+			protocol: log.backend_protocol.into(),
+			route: route_identifier.clone(),
+			method: log.method.clone().into(),
+			status: log.status.as_ref().map(|s| s.as_u16()).into(),
+			reason: log.reason.into(),
+			custom: CustomField::default(),
+		};
+
+		// Always run request_handle/finish_request first so LLM provider eviction (failover) runs
+		// even when logging/tracing/metrics are disabled.
+		let end_time = Timestamp::now();
+		let duration = end_time.duration_since(&log.start);
+		let enable_trace = log.tracer.is_some();
+
+		let llm_response = log.llm_response.take().map(Into::into);
+
+		let mcp = log.mcp_status.take();
+		let mcp_cel = mcp.as_ref().filter(|m| !m.is_empty());
+		let cel_end_time = cel::RequestTime(end_time.as_datetime());
+		let cel_exec = log.cel.build(CelLoggingBuildInputs {
+			req: log.request_snapshot.as_ref(),
+			resp: log.response_snapshot.as_ref(),
+			llm_response: llm_response.as_ref(),
+			mcp: mcp_cel,
+			end_time: &cel_end_time,
+			source_context: log.source_context.as_ref(),
+		});
+		if let Some(rh) = log.request_handle.take() {
+			let current_health = rh.health_score();
+			let consecutive_failures = rh.consecutive_failures();
+			let times_ejected = rh.times_ejected();
+			let unhealthy = Self::eviction_unhealthy(&log, &cel_exec);
+			let (health, eviction_duration, restore_health) = Self::eviction_decision(
+				&log,
+				current_health,
+				consecutive_failures,
+				times_ejected,
+				unhealthy,
+			);
+			rh.finish_request(health, duration, eviction_duration, restore_health);
+		}
+
+		let custom_metric_fields = CustomField::new(
+			// For metrics, keep empty values which will become 'unknown'
+			cel_exec
+				.eval_keep_empty(&cel_exec.metric_fields.add, true)
+				.into_iter()
+				.map(|(k, v)| {
+					(
+						strng::new(k),
+						v.and_then(|v| match v {
+							Value::String(s) => Some(strng::new(s)),
+							_ => None,
+						}),
+					)
+				}),
+		);
+		http_labels.custom = custom_metric_fields.clone();
+		if !is_tcp {
+			log.metrics.requests.get_or_create(&http_labels).inc();
+		}
+		if log.response_bytes > 0 {
+			log
+				.metrics
+				.response_bytes
+				.get_or_create(&http_labels)
+				.inc_by(log.response_bytes);
+		}
+		// Record HTTP request duration for all requests
+		log
+			.metrics
+			.request_duration
+			.get_or_create(&http_labels)
+			.observe(duration.as_secs_f64());
+
+		if let Some(retry_count) = log.retry_attempt {
+			log
+				.metrics
+				.retries
+				.get_or_create(&http_labels)
+				.inc_by(retry_count as u64);
+		}
+
+		Self::add_llm_metrics(
+			&log,
+			&route_identifier,
+			end_time,
+			duration,
+			llm_response.as_ref(),
+			&custom_metric_fields,
+		);
+		if let Some(mcp) = &mcp
+			&& mcp.method_name.is_some()
+		{
+			// Check mcp.method_name is set, so we don't count things like GET and DELETE
+			log
+				.metrics
+				.mcp_requests
+				.get_or_create(&MCPCall {
+					method: mcp.method_name.as_ref().map(RichStrng::from).into(),
+					resource_type: mcp.resource_type().into(),
+					server: mcp.target_name().map(RichStrng::from).into(),
+					resource: mcp.resource_name().map(RichStrng::from).into(),
+
+					route: route_identifier.clone(),
+					custom: custom_metric_fields.clone(),
+				})
+				.inc();
+		}
+
+		let maybe_enable_log = agent_core::telemetry::enabled("request", &Level::INFO);
+		let enable_logs = maybe_enable_log && cel_exec.eval_filter();
+		if !enable_logs && !enable_trace {
+			return;
+		}
+
+		let dur = format!("{}ms", duration.as_millis());
+		let grpc = log.grpc_status.load();
+
+		let input_tokens = llm_response.as_ref().and_then(|l| l.input_tokens);
+
+		let trace_id = log.outgoing_span.as_ref().map(|id| id.trace_id());
+		let span_id = log.outgoing_span.as_ref().map(|id| id.span_id());
+		let fields = cel_exec.fields;
+		let reason = log.reason.and_then(|r| match r {
+			ProxyResponseReason::Upstream => None,
+			_ => Some(r),
+		});
+		let mcp_target = mcp
+			.as_ref()
+			.and_then(|m| m.target_name())
+			.map(str::to_owned);
+		let mcp_resource_type = mcp.as_ref().and_then(|m| m.resource_type());
+		let mcp_resource_uri = mcp.as_ref().and_then(|m| {
+			if matches!(m.resource_type(), Some(MCPOperation::Resource)) {
+				m.resource_name().map(str::to_owned)
+			} else {
+				None
+			}
+		});
+
+		let mut kv = vec![
+			("gateway", route_identifier.gateway.as_deref().map(display)),
+			(
+				"listener",
+				route_identifier.listener.as_deref().map(display),
+			),
+			(
+				"route_rule",
+				route_identifier.route_rule.as_deref().map(display),
+			),
+			("route", route_identifier.route.as_deref().map(display)),
+			("endpoint", log.endpoint.display()),
+			("src.addr", Some(display(&log.tcp_info.peer_addr))),
+			("http.method", log.method.display()),
+			("http.host", log.host.display()),
+			("http.path", log.path.display()),
+			// TODO: incoming vs outgoing
+			("http.version", log.version.as_ref().map(debug)),
+			(
+				"http.status",
+				log.status.as_ref().map(|s| s.as_u16().into()),
+			),
+			("grpc.status", grpc.map(Into::into)),
+			(
+				"tls.sni",
+				if log.host.is_none() {
+					log.tls_info.as_ref().and_then(|s| s.server_name.display())
+				} else {
+					None
+				},
+			),
+			("trace.id", trace_id.display()),
+			("span.id", span_id.display()),
+			("jwt.sub", log.jwt_sub.display()),
+			("protocol", log.backend_protocol.as_ref().map(debug)),
+			("a2a.method", log.a2a_method.display()),
+			(
+				"mcp.method.name",
+				mcp
+					.as_ref()
+					.and_then(|m| m.method_name.as_ref())
+					.map(display),
+			),
+			("mcp.target", mcp_target.as_ref().map(display)),
+			("mcp.resource.type", mcp_resource_type.as_ref().map(display)),
+			("mcp.resource.uri", mcp_resource_uri.as_ref().map(display)),
+			(
+				"mcp.session.id",
+				mcp
+					.as_ref()
+					.and_then(|m| m.session_id.as_ref())
+					.map(display),
+			),
+			(
+				"inferencepool.selected_endpoint",
+				log.inference_pool.display(),
+			),
+			// OpenTelemetry Gen AI Semantic Conventions v1.40.0
+			(
+				"gen_ai.operation.name",
+				log.llm_request.as_ref().map(|r| {
+					if r.input_format == InputFormat::Embeddings {
+						"embeddings".into()
+					} else {
+						"chat".into()
+					}
+				}),
+			),
+			(
+				"gen_ai.provider.name",
+				log.llm_request.as_ref().map(|l| display(&l.provider)),
+			),
+			(
+				"gen_ai.request.model",
+				log.llm_request.as_ref().map(|l| display(&l.request_model)),
+			),
+			(
+				"gen_ai.response.model",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.response_model.display()),
+			),
+			("gen_ai.usage.input_tokens", input_tokens.map(Into::into)),
+			(
+				"gen_ai.usage.cache_creation.input_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.cache_creation_input_tokens)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.usage.cache_read.input_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.cached_input_tokens)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.usage.output_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.output_tokens)
+					.map(Into::into),
+			),
+			// Not part of official semconv
+			(
+				"gen_ai.usage.output_image_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.output_image_tokens)
+					.map(Into::into),
+			),
+			// Not part of official semconv
+			(
+				"gen_ai.usage.output_audio_tokens",
+				llm_response
+					.as_ref()
+					.and_then(|l| l.output_audio_tokens)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.request.temperature",
+				log
+					.llm_request
+					.as_ref()
+					.and_then(|l| l.params.temperature)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.embeddings.dimension.count",
+				log
+					.llm_request
+					.as_ref()
+					.and_then(|l| l.params.dimensions)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.request.encoding_formats",
+				log
+					.llm_request
+					.as_ref()
+					.and_then(|l| l.params.encoding_format.display()),
+			),
+			(
+				"gen_ai.request.top_p",
+				log
+					.llm_request
+					.as_ref()
+					.and_then(|l| l.params.top_p)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.request.max_tokens",
+				log
+					.llm_request
+					.as_ref()
+					.and_then(|l| l.params.max_tokens)
+					.map(|v| (v as i64).into()),
+			),
+			(
+				"gen_ai.request.frequency_penalty",
+				log
+					.llm_request
+					.as_ref()
+					.and_then(|l| l.params.frequency_penalty)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.request.presence_penalty",
+				log
+					.llm_request
+					.as_ref()
+					.and_then(|l| l.params.presence_penalty)
+					.map(Into::into),
+			),
+			(
+				"gen_ai.request.seed",
+				log
+					.llm_request
+					.as_ref()
+					.and_then(|l| l.params.seed)
+					.map(Into::into),
+			),
+			("retry.attempt", log.retry_attempt.display()),
+			("error", log.error.quoted()),
+			("reason", reason.display()),
+			("duration", Some(dur.as_str().into())),
+		];
+
+		if enable_trace && let Some(t) = &log.tracer {
+			t.send(&log, &end_time, &cel_exec, kv.as_slice());
+			// Flush any buffered spans created during request processing.
+			// Does best effort, if the lock is poisoned, skip flushing.
+			if let Ok(mut spans) = log.trace_spans.lock() {
+				for (sb, context) in spans.drain(..) {
+					sb.start_with_context(t.tracer.as_ref(), &context).end();
+				}
+			}
+		};
+		if enable_logs {
+			kv.reserve(fields.add.len());
+			for (k, v) in &mut kv {
+				// Remove filtered lines, or things we are about to add
+				if fields.has(k) {
+					*v = None;
+				}
+			}
+			// To avoid lifetime issues need to store the expression before we give it to ValueBag reference.
+			// TODO: we could allow log() to take a list of borrows and then a list of OwnedValueBag
+			let raws = cel_exec.eval_additions();
+			for (k, v) in &raws {
+				// TODO: convert directly instead of via json()
+				let eval = v.as_ref().map(ValueBag::capture_serde1);
+				kv.push((k, eval));
+			}
+
+			agent_core::telemetry::log("info", "request", &kv);
+
+			if let Some(otel) = &log.otel_logger {
+				otel.emit("info", "request", &kv);
+			}
+		}
+	}
+}
+
+pin_project_lite::pin_project! {
+		/// A data stream created from a [`Body`].
+		#[derive(Debug)]
+		pub struct LogBody<B> {
+				#[pin]
+				body: B,
+				log: DropOnLog,
+		}
+}
+
+impl<B> LogBody<B> {
+	/// Create a new `LogBody`
+	pub fn new(body: B, log: DropOnLog) -> Self {
+		Self { body, log }
+	}
+}
+
+impl<B: Body + Debug> Body for LogBody<B>
+where
+	B::Data: Debug,
+{
+	type Data = B::Data;
+	type Error = B::Error;
+
+	fn poll_frame(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+	) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+		let this = self.project();
+		let result = ready!(this.body.poll_frame(cx));
+		match result {
+			Some(Ok(frame)) => {
+				if let Some(trailer) = frame.trailers_ref()
+					&& let Some(grpc) = this.log.as_mut().map(|log| log.grpc_status.clone())
+				{
+					crate::proxy::httpproxy::maybe_set_grpc_status(&grpc, trailer);
+				}
+				if let Some(log) = this.log.as_mut()
+					&& let Some(data) = frame.data_ref()
+				{
+					// Count the bytes in this data frame
+					log.response_bytes = log.response_bytes.saturating_add(data.remaining() as u64);
+				}
+				Poll::Ready(Some(Ok(frame)))
+			},
+			res => Poll::Ready(res),
+		}
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.body.is_end_stream()
+	}
+
+	fn size_hint(&self) -> SizeHint {
+		self.body.size_hint()
+	}
+}
+
+pub struct OtelAccessLogger {
+	provider: SdkLoggerProvider,
+	logger: opentelemetry_sdk::logs::SdkLogger,
+}
+
+impl std::fmt::Debug for OtelAccessLogger {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("OtelAccessLogger").finish()
+	}
+}
+
+fn to_any_value(v: &ValueBag) -> AnyValue {
+	if let Some(b) = v.to_str() {
+		AnyValue::String(b.to_string().into())
+	} else if let Some(b) = v.to_i64() {
+		AnyValue::Int(b)
+	} else if let Some(b) = v.to_f64() {
+		AnyValue::Double(b)
+	} else if let Some(b) = v.to_bool() {
+		AnyValue::Boolean(b)
+	} else {
+		AnyValue::String(v.to_string().into())
+	}
+}
+
+/// Policy-aware OTLP gRPC log exporter that routes via `GrpcReferenceChannel`, ensuring
+/// backend policies are looked up and applied by `PolicyClient::call_reference`.
+#[derive(Clone)]
+struct PolicyGrpcLogExporter {
+	tonic_client:
+		opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient<
+			crate::http::ext_proc::GrpcReferenceChannel,
+		>,
+	is_shutdown: Arc<bool>,
+	resource: Resource,
+	runtime: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for PolicyGrpcLogExporter {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PolicyGrpcLogExporter").finish()
+	}
+}
+
+impl PolicyGrpcLogExporter {
+	fn new(
+		inputs: Arc<crate::ProxyInputs>,
+		target: Arc<crate::types::agent::SimpleBackendReference>,
+		policies: Vec<crate::types::agent::BackendPolicy>,
+		runtime: tokio::runtime::Handle,
+	) -> Self {
+		use crate::http::ext_proc::GrpcReferenceChannel;
+		let channel = GrpcReferenceChannel {
+			target,
+			policies: Arc::new(policies),
+			client: crate::proxy::httpproxy::PolicyClient { inputs },
+		};
+		let tonic_client =
+			opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient::new(
+				channel,
+			);
+		Self {
+			tonic_client,
+			is_shutdown: Arc::new(false),
+			resource: Resource::builder().build(),
+			runtime,
+		}
+	}
+}
+
+impl opentelemetry_sdk::logs::LogExporter for PolicyGrpcLogExporter {
+	fn export(
+		&self,
+		batch: opentelemetry_sdk::logs::LogBatch<'_>,
+	) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+		use opentelemetry_proto::transform::logs::tonic::group_logs_by_resource_and_scope;
+		use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+
+		let is_shutdown = self.is_shutdown.clone();
+		let mut client = self.tonic_client.clone();
+		let resource: opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema =
+			(&self.resource).into();
+		let resource_logs = group_logs_by_resource_and_scope(batch, &resource);
+		let handle = self.runtime.clone();
+
+		async move {
+			if *is_shutdown {
+				return Err(OTelSdkError::AlreadyShutdown);
+			}
+			let req =
+				opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest { resource_logs };
+			handle
+				.spawn(async move { client.export(req).await })
+				.await
+				.map_err(|e| OTelSdkError::InternalFailure(e.to_string()))?
+				.map(|_| ())
+				.map_err(|e: tonic::Status| OTelSdkError::InternalFailure(e.message().to_string()))
+				as OTelSdkResult
+		}
+	}
+
+	fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+		Ok(())
+	}
+
+	fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+		self.resource = resource.clone();
+	}
+}
+
+fn build_resource(defaults: Option<&trc::GlobalResourceDefaults>) -> Resource {
+	let mut resource_builder = Resource::builder();
+	if let Some(d) = defaults {
+		for kv in &d.attrs {
+			resource_builder = resource_builder.with_attribute(kv.clone());
+		}
+	}
+	resource_builder = resource_builder.with_service_name(
+		defaults
+			.and_then(|d| d.service_name.clone())
+			.unwrap_or_else(|| "agentgateway".to_string()),
+	);
+	resource_builder = resource_builder.with_attribute(KeyValue::new(
+		"service.version",
+		agent_core::version::BuildInfo::new().version,
+	));
+	resource_builder.build()
+}
+
+impl OtelAccessLogger {
+	pub fn new(
+		policy_client: crate::proxy::httpproxy::PolicyClient,
+		backend_ref: crate::types::agent::SimpleBackendReference,
+		policies: Vec<crate::types::agent::BackendPolicy>,
+		protocol: crate::types::agent::TracingProtocol,
+		path: String,
+	) -> anyhow::Result<Self> {
+		let defaults = trc::global_resource_defaults();
+		let resource = build_resource(defaults);
+
+		let exporter_runtime = policy_client
+			.inputs
+			.cfg
+			.admin_runtime_handle
+			.clone()
+			.unwrap_or_else(tokio::runtime::Handle::current);
+
+		let provider = if protocol == crate::types::agent::TracingProtocol::Grpc {
+			let exporter = PolicyGrpcLogExporter::new(
+				policy_client.inputs.clone(),
+				Arc::new(backend_ref),
+				policies,
+				exporter_runtime,
+			);
+			SdkLoggerProvider::builder()
+				.with_resource(resource)
+				.with_batch_exporter(exporter)
+				.build()
+		} else {
+			let http_client = trc::PolicyOtelHttpClient {
+				policy_client,
+				backend_ref,
+				policies,
+				runtime: exporter_runtime,
+			};
+			let exporter = opentelemetry_otlp::LogExporter::builder()
+				.with_http()
+				.with_http_client(http_client)
+				.with_endpoint(path)
+				.build()?;
+			SdkLoggerProvider::builder()
+				.with_resource(resource)
+				.with_batch_exporter(exporter)
+				.build()
+		};
+
+		let logger = provider.logger("agentgateway.access");
+
+		Ok(Self { provider, logger })
+	}
+
+	pub fn shutdown(&self) {
+		let _ = self.provider.shutdown();
+	}
+}
+
+impl OtelLogSink for OtelAccessLogger {
+	fn emit<'v>(&self, level: &str, target: &str, kv: &[(&str, Option<ValueBag<'v>>)]) {
+		let severity = match level {
+			"error" => Severity::Error,
+			"warn" => Severity::Warn,
+			"info" => Severity::Info,
+			"debug" => Severity::Debug,
+			"trace" => Severity::Trace,
+			_ => Severity::Info,
+		};
+		let severity_text: &'static str = match level {
+			"error" => "ERROR",
+			"warn" => "WARN",
+			"info" => "INFO",
+			"debug" => "DEBUG",
+			"trace" => "TRACE",
+			_ => "INFO",
+		};
+
+		let mut record = self.logger.create_log_record();
+		record.set_severity_number(severity);
+		record.set_severity_text(severity_text);
+		record.set_target(target.to_string());
+
+		let mut trace_id_val: Option<u128> = None;
+		let mut span_id_val: Option<u64> = None;
+
+		for &(k, ref v) in kv {
+			let Some(v) = v else { continue };
+
+			match k {
+				"trace.id" => {
+					if let Some(s) = v.to_str()
+						&& let Ok(id) = u128::from_str_radix(&s, 16)
+					{
+						trace_id_val = Some(id);
+					}
+					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
+				},
+				"span.id" => {
+					if let Some(s) = v.to_str()
+						&& let Ok(id) = u64::from_str_radix(&s, 16)
+					{
+						span_id_val = Some(id);
+					}
+					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
+				},
+				_ => {
+					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
+				},
+			}
+		}
+
+		if let Some(tid) = trace_id_val {
+			record.set_trace_context(
+				opentelemetry::trace::TraceId::from(tid),
+				span_id_val
+					.map(opentelemetry::trace::SpanId::from)
+					.unwrap_or(opentelemetry::trace::SpanId::INVALID),
+				None,
+			);
+		}
+
+		self.logger.emit(record);
+	}
+
+	fn shutdown(&self) {
+		let _ = self.provider.shutdown();
+	}
+}
+
+// SpanWriter is a construct that can start otel spans
+#[derive(Debug, Default, Clone)]
+pub struct SpanWriter {
+	inner: Option<SpanWriterInner>,
+}
+
+impl SpanWriter {
+	pub fn start(&self, name: impl Into<Cow<'static, str>>) -> SpanWriteOnDrop {
+		match self.inner.clone() {
+			Some(i) => i.start(name),
+			None => SpanWriteOnDrop::default(),
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct SpanWriterInner {
+	parent: trc::TraceParent,
+	tracer: Arc<trc::Tracer>,
+	inner: Arc<Mutex<Vec<(SpanBuilder, OtelContext)>>>,
+}
+
+impl SpanWriterInner {
+	fn parent_context(&self) -> OtelContext {
+		let parent = SpanContext::new(
+			self.parent.trace_id.into(),
+			self.parent.span_id.into(),
+			TraceFlags::new(self.parent.flags),
+			true,
+			TraceState::default(),
+		);
+		OtelContext::new().with_remote_span_context(parent)
+	}
+
+	#[allow(unused)]
+	pub fn write(
+		&self,
+		name: impl Into<Cow<'static, str>>,
+		f: impl FnOnce(SpanBuilder) -> SpanBuilder,
+	) {
+		// Create a unique child span ID for this recorded span.
+		let child = self.parent.new_span();
+		let mut sb = self
+			.tracer
+			.tracer
+			.span_builder(name)
+			.with_kind(SpanKind::Server)
+			.with_trace_id(child.trace_id.into())
+			.with_span_id(child.span_id.into());
+
+		sb = f(sb);
+		// Capture end time at write time so it measures the intended operation duration.
+		sb = sb.with_end_time(SystemTime::now());
+
+		// Store for later flush when the request log is finalized.
+		if let Ok(mut spans) = self.inner.lock() {
+			spans.push((sb, self.parent_context()));
+		}
+	}
+
+	pub fn start(&self, name: impl Into<Cow<'static, str>>) -> SpanWriteOnDrop {
+		// Create a unique child span ID for this recorded span.
+		let child = self.parent.new_span();
+		let sb = self
+			.tracer
+			.tracer
+			.span_builder(name)
+			.with_kind(SpanKind::Server)
+			.with_trace_id(child.trace_id.into())
+			.with_span_id(child.span_id.into())
+			.with_start_time(SystemTime::now());
+
+		SpanWriteOnDrop {
+			sb: Some(sb),
+			context: self.parent_context(),
+			inner: self.inner.clone(),
+		}
+	}
+}
+
+#[derive(Default)]
+pub struct SpanWriteOnDrop {
+	sb: Option<SpanBuilder>,
+	context: OtelContext,
+	inner: Arc<Mutex<Vec<(SpanBuilder, OtelContext)>>>,
+}
+impl SpanWriteOnDrop {
+	pub fn rename_span(&mut self, name: impl Into<Cow<'static, str>>) {
+		if let Some(sb) = self.sb.as_mut() {
+			sb.name = name.into();
+		}
+	}
+}
+impl Drop for SpanWriteOnDrop {
+	fn drop(&mut self) {
+		let Some(mut sb) = self.sb.take() else { return };
+		sb = sb.with_end_time(SystemTime::now());
+
+		// Store for later flush when the request log is finalized.
+		if let Ok(mut spans) = self.inner.lock() {
+			spans.push((sb, self.context.clone()));
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::future::ready;
+	use std::net::SocketAddr;
+	use std::sync::{Arc, Mutex};
+	use std::time::Instant;
+
+	use opentelemetry::trace::{SpanKind, TracerProvider};
+	use opentelemetry_sdk::error::OTelSdkResult;
+	use opentelemetry_sdk::trace::{SimpleSpanProcessor, SpanData, SpanExporter};
+	use prometheus_client::registry::Registry;
+
+	use super::*;
+	use crate::telemetry::metrics::Metrics;
+	use crate::telemetry::trc;
+	use crate::transport::stream::TCPConnectionInfo;
+
+	#[derive(Clone, Debug, Default)]
+	struct RecordingSpanExporter {
+		spans: Arc<Mutex<Vec<SpanData>>>,
+	}
+
+	impl RecordingSpanExporter {
+		fn finished_spans(&self) -> Vec<SpanData> {
+			self.spans.lock().unwrap().clone()
+		}
+	}
+
+	impl SpanExporter for RecordingSpanExporter {
+		fn export(
+			&self,
+			batch: Vec<SpanData>,
+		) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+			self.spans.lock().unwrap().extend(batch);
+			ready(Ok(()))
+		}
+	}
+
+	fn test_tracer() -> (Arc<trc::Tracer>, RecordingSpanExporter) {
+		let exporter = RecordingSpanExporter::default();
+		let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+			.with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
+			.build();
+		let tracer = provider.tracer("test-tracer");
+		(
+			Arc::new(trc::Tracer {
+				tracer: Arc::new(tracer),
+				provider,
+				fields: Arc::new(LoggingFields::default()),
+			}),
+			exporter,
+		)
+	}
+
+	fn test_request_log() -> RequestLog {
+		let cel = CelLogging {
+			cel_context: crate::cel::ContextBuilder::new(),
+			filter: None,
+			fields: LoggingFields::default(),
+			metric_fields: Arc::new(MetricFields::default()),
+		};
+		let mut registry = Registry::default();
+		let metrics = Arc::new(Metrics::new(&mut registry, Default::default()));
+		RequestLog::new(
+			cel,
+			metrics,
+			Timestamp::now(),
+			TCPConnectionInfo {
+				peer_addr: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+				local_addr: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+				start: Instant::now(),
+				raw_peer_addr: None,
+			},
+		)
+	}
+
+	#[test]
+	fn span_writer_flushes_recorded_spans_as_children_of_request_span() {
+		let (tracer, exporter) = test_tracer();
+		let mut request = test_request_log();
+		request.tracer = Some(tracer.clone());
+
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		request.outgoing_span = Some(outgoing.clone());
+
+		{
+			let _span = request.span_writer().start("buffered child span");
+		}
+
+		drop(DropOnLog::from(request));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		assert_eq!(spans.len(), 2);
+
+		let child = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "buffered child span")
+			.expect("buffered span should be exported");
+		assert_eq!(child.span_kind, SpanKind::Server);
+		assert_eq!(child.parent_span_id, outgoing.span_id.into());
+		assert_eq!(child.span_context.trace_id(), outgoing.trace_id.into());
+		assert!(child.parent_span_is_remote);
+	}
+}
