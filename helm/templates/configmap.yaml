@@ -1,0 +1,174 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.deployment.name }}-config
+  namespace: {{ .Release.Namespace }}
+data:
+  config.yaml: |
+    {{- if .Values.frontendPolicies }}
+    frontendPolicies:
+      {{- with .Values.frontendPolicies.accessLog }}
+      accessLog:
+        add:
+          {{- range $k, $v := . }}
+          {{ $k }}: {{ $v | quote }}
+          {{- end }}
+      {{- end }}
+    {{- end }}
+    binds:
+      {{- range $listener := .Values.listeners }}
+      {{- $listenerCors := $listener.cors | default $.Values.cors }}
+      {{- $catchAll := and (eq (len $listener.backends) 1) (not (index $listener.backends 0).routePath) }}
+      - port: {{ $listener.port }}
+        listeners:
+          - name: {{ $listener.name | quote }}
+            protocol: {{ $listener.protocol | default "HTTP" }}
+            {{- with $listener.hostname }}
+            hostname: {{ . | quote }}
+            {{- end }}
+            routes:
+              {{- range $backend := $listener.backends }}
+              {{- $cors := $backend.cors | default $listenerCors }}
+              {{- $allowHeaders := ($backend.cors).allowHeaders | default $listenerCors.allowHeaders }}
+              {{- $exposeHeaders := ($backend.cors).exposeHeaders | default $listenerCors.exposeHeaders }}
+              - name: {{ printf "%s-route" $backend.name | quote }}
+                policies:
+                  {{- if $cors.allowOrigins }}
+                  cors:
+                    allowOrigins:
+                      {{- range $cors.allowOrigins }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- with $allowHeaders }}
+                    allowHeaders:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                    {{- with $exposeHeaders }}
+                    exposeHeaders:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+                  {{- with $backend.authorization }}
+                  mcpAuthorization:
+                    rules:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                  {{- end }}
+                  {{- with $backend.mcpAuthentication }}
+                  mcpAuthentication:
+                    {{- with .mode }}
+                    mode: {{ . | quote }}
+                    {{- end }}
+                    issuer: {{ .issuer | quote }}
+                    {{- with .audiences }}
+                    audiences:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                    {{- with .jwks }}
+                    jwks:
+                      {{- with .url }}
+                      url: {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                    {{- with .provider }}
+                    provider:
+                      {{- toYaml . | nindent 22 }}
+                    {{- end }}
+                    {{- with .resourceMetadata }}
+                    resourceMetadata:
+                      {{- with .resource }}
+                      resource: {{ . | quote }}
+                      {{- end }}
+                      {{- with .scopesSupported }}
+                      scopesSupported:
+                        {{- range . }}
+                        - {{ . | quote }}
+                        {{- end }}
+                      {{- end }}
+                      {{- with .bearerMethodsSupported }}
+                      bearerMethodsSupported:
+                        {{- range . }}
+                        - {{ . | quote }}
+                        {{- end }}
+                      {{- end }}
+                      {{- with .resourceDocumentation }}
+                      resourceDocumentation: {{ . | quote }}
+                      {{- end }}
+                      {{- with .resourcePolicyUri }}
+                      resourcePolicyUri: {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+                  {{- with $backend.confirmation }}
+                  mcpConfirmation:
+                    {{- with .ttlSeconds }}
+                    ttlSeconds: {{ . }}
+                    {{- end }}
+                    rules:
+                      {{- range .rules }}
+                      - {{ . | quote }}
+                      {{- end }}
+                  {{- end }}
+                  {{- with $backend.rateLimit }}
+                  mcpRateLimit:
+                    {{- with .maxCalls }}
+                    maxCalls: {{ . }}
+                    {{- end }}
+                    {{- with .windowSeconds }}
+                    windowSeconds: {{ . }}
+                    {{- end }}
+                    {{- with .rules }}
+                    rules:
+                      {{- range . }}
+                      - {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+                  {{- with $backend.argRewrite }}
+                  mcpArgRewrite:
+                    rules:
+                      {{- range . }}
+                      - tools:
+                          {{- range .tools }}
+                          - {{ . | quote }}
+                          {{- end }}
+                        path: {{ .path | quote }}
+                        {{- with .op }}
+                        op: {{ . | quote }}
+                        {{- end }}
+                        value: {{ .value | quote }}
+                      {{- end }}
+                  {{- end }}
+                {{- if not $catchAll }}
+                matches:
+                  - path:
+                      pathPrefix: {{ $backend.routePath | quote }}
+                  {{- range $backend.extraMatches }}
+                  - path:
+                      {{- if .exact }}
+                      exact: {{ .exact | quote }}
+                      {{- else if .pathPrefix }}
+                      pathPrefix: {{ .pathPrefix | quote }}
+                      {{- end }}
+                  {{- end }}
+                {{- end }}
+                backends:
+                  - mcp:
+                      targets:
+                        - name: {{ $backend.name }}
+                          mcp:
+                            host: {{ $backend.mcp.host | quote }}
+                          {{- if $backend.mcp.insecureTLS }}
+                          policies:
+                            backendTLS:
+                              insecure: true
+                          {{- end }}
+              {{- end }}
+      {{- end }}

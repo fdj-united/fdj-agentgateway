@@ -1,0 +1,48 @@
+{{- if and .Values.ingress .Values.ingress.enabled }}
+{{- $hosts := list }}
+{{- range .Values.listeners }}
+  {{- if and .ingress .ingress.host }}
+    {{- $hosts = append $hosts .ingress.host }}
+  {{- end }}
+{{- end }}
+{{- if $hosts }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.deployment.name }}-public
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if and .Values.ingress.tls .Values.ingress.tls.enabled .Values.ingress.tls.secretName }}
+  tls:
+    - hosts:
+        {{- range $hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ .secretName | quote }}
+  {{- end }}
+  rules:
+    {{- range .Values.listeners }}
+    {{- if and .ingress .ingress.host }}
+    - host: {{ .ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $.Values.service.name }}
+                port:
+                  number: {{ .port }}
+    {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

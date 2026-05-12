@@ -1,0 +1,8 @@
+apiVersion: v2
+name: kindred-mcp-gateway
+description: |
+  Standalone deployment of the Kindred MCP Gateway proxy. Renders a ConfigMap
+  with the proxy config plus a Deployment and Service.
+type: application
+version: 0.1.0
+appVersion: "v0.0.7"

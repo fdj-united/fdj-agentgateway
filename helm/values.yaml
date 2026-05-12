@@ -1,0 +1,86 @@
+image:
+  registry: ""
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Deployment-level knobs
+deployment:
+  name: kindred-mcp-gateway
+  replicas: 1
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+service:
+  name: kindred-mcp-gateway
+  type: ClusterIP
+  annotations: {}
+
+ingress:
+  enabled: false  # Enable and configure per environment
+  className: nginx-internal
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-connections: "5"
+
+admin:
+  enabled: false
+  host: ""
+  oauth2Proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+    port: 4180
+    # Required values when admin.enabled is true:
+    issuerUrl: ""
+    clientId: ""
+    existingSecretName: ""
+    secretKeys:
+      clientSecret: ""    
+      cookieSecret: ""    
+    emailDomain: "*"
+    cookieSecure: true
+    cookieDomain: ""
+    scope: "openid profile email"
+    extraArgs: []
+    resources: {}
+  ingress:
+    className: ""
+    annotations: {}
+    tls:
+      enabled: false
+      secretName: ""
+
+# Frontend policies applied to all requests through the proxy.
+frontendPolicies:
+  accessLog:
+    mcp.tool: 'mcp.tool.name'
+    mcp.target: 'mcp.tool.target'
+    mcp.session: 'mcp.sessionId'
+    mcp.method: 'mcp.methodName'
+    user: 'request.headers["X-User-Email"]'
+    status: 'response.status_code'
+
+# Default CORS — applied to every listener that doesn't override it.
+cors:
+  allowOrigins: []
+  allowHeaders: []
+  allowMethods: []
+  exposeHeaders: []
+
+listeners: []
