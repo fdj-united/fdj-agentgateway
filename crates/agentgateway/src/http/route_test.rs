@@ -1,0 +1,1428 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::RwLock;
+
+use agent_core::strng;
+use divan::Bencher;
+use itertools::Itertools;
+use regex::Regex;
+
+use crate::http::Request;
+use crate::http::tests_common::*;
+use crate::store::Stores;
+use crate::types::agent::{
+	HeaderMatch, HeaderValueMatch, Listener, ListenerProtocol, MethodMatch, PathMatch, QueryMatch,
+	QueryValueMatch, Route, RouteMatch, RouteSet,
+};
+use crate::types::discovery::{
+	GatewayAddress, NamespacedHostname, NetworkAddress, Service, gatewayaddress::Destination,
+};
+use crate::*;
+
+fn run_test(req: &Request, routes: &[(&str, Vec<&str>, Vec<RouteMatch>)]) -> Option<String> {
+	let stores = Stores::with_ipv6_enabled(true);
+	let dummy_dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1000);
+
+	let listener = setup_listener(routes);
+
+	let result = super::select_best_route(stores.clone(), dummy_dest, &listener, req);
+	result.map(|(r, _)| r.key.to_string())
+}
+
+fn setup_listener(routes: &[(&str, Vec<&str>, Vec<RouteMatch>)]) -> Arc<Listener> {
+	let mk_route = |name: &str, hostnames: Vec<&str>, matches: Vec<RouteMatch>| Route {
+		key: name.into(),
+		service_key: None,
+		hostnames: hostnames.into_iter().map(|s| s.into()).collect(),
+		matches,
+		name: Default::default(),
+		backends: vec![],
+		inline_policies: vec![],
+	};
+
+	Arc::new(Listener {
+		key: Default::default(),
+		name: Default::default(),
+		hostname: Default::default(),
+		protocol: ListenerProtocol::HTTP,
+		tcp_routes: Default::default(),
+		routes: RouteSet::from_list(
+			routes
+				.iter()
+				.map(|r| {
+					let r = r.clone();
+					mk_route(r.0, r.1, r.2)
+				})
+				.collect(),
+		),
+	})
+}
+
+fn attach_waypoint_service(req: &mut Request, stores: &Stores, service_key: &NamespacedHostname) {
+	let svc = stores
+		.read_discovery()
+		.services
+		.get_by_namespaced_host(service_key)
+		.expect("test service must exist in discovery store");
+	req.extensions_mut().insert(proxy::WaypointService(svc));
+}
+
+#[test]
+fn test_hostname_matching() {
+	let basic_match = vec![RouteMatch {
+		headers: vec![],
+		path: PathMatch::PathPrefix("/".into()),
+		method: None,
+		query: vec![],
+	}];
+	let routes = vec![
+		// Route with no hostnames (matches any hostname)
+		("no-hostnames", vec![], basic_match.clone()),
+		// Route with exact hostname match
+		(
+			"exact-hostname",
+			vec!["test.example.com"],
+			basic_match.clone(),
+		),
+		// Route with wildcard hostname
+		(
+			"wildcard-hostname",
+			vec!["*.example.com"],
+			basic_match.clone(),
+		),
+		// Route with multiple hostnames
+		(
+			"multiple-hostnames",
+			vec!["foo.example.com", "*.bar.example.com"],
+			basic_match.clone(),
+		),
+	];
+
+	struct TestCase {
+		name: &'static str,
+		host: &'static str,
+		expected_route: Option<&'static str>,
+	}
+
+	let cases = vec![
+		// Test exact hostname matching
+		TestCase {
+			name: "exact hostname match",
+			host: "test.example.com",
+			expected_route: Some("exact-hostname"),
+		},
+		// Test wildcard hostname matching
+		TestCase {
+			name: "wildcard hostname match - subdomain",
+			host: "sub.example.com",
+			expected_route: Some("wildcard-hostname"),
+		},
+		TestCase {
+			name: "wildcard hostname match - nested subdomain",
+			host: "foo.baz.example.com",
+			expected_route: Some("wildcard-hostname"),
+		},
+		// Test multiple hostnames in route
+		TestCase {
+			name: "multiple hostnames - exact match",
+			host: "foo.example.com",
+			expected_route: Some("multiple-hostnames"),
+		},
+		TestCase {
+			name: "multiple hostnames - wildcard match",
+			host: "test.bar.example.com",
+			// this also matches 'wildcard' but this one is a more exact match
+			expected_route: Some("multiple-hostnames"),
+		},
+		// Test no hostnames route (should match any hostname)
+		TestCase {
+			name: "no hostnames route matches any hostname",
+			host: "unknown",
+			expected_route: Some("no-hostnames"),
+		},
+	];
+
+	for case in cases {
+		let req = request(&format!("http://{}/", case.host), http::Method::GET, &[]);
+		let result = run_test(&req, routes.as_slice());
+		assert_eq!(
+			result,
+			case.expected_route.map(|s| s.to_string()),
+			"{}",
+			case.name
+		);
+	}
+}
+
+#[test]
+fn test_path_matching() {
+	let routes = vec![
+		("exact-path", PathMatch::Exact("/api/v1/users".into())),
+		("prefix-path", PathMatch::PathPrefix("/api/".into())),
+		(
+			"regex-path",
+			PathMatch::Regex(Regex::new(r"^/api/v\d+/users$").unwrap()),
+		),
+		("root-prefix", PathMatch::PathPrefix("/".into())),
+	];
+
+	struct TestCase {
+		name: &'static str,
+		path: &'static str,
+		expected_route: Option<&'static str>,
+	}
+
+	let cases = vec![
+		// Test exact path matching
+		TestCase {
+			name: "exact path match",
+			path: "/api/v1/users",
+			expected_route: Some("exact-path"),
+		},
+		TestCase {
+			// TODO: is this right?
+			name: "exact path with trailing slash should not match",
+			path: "/api/v1/users/",
+			expected_route: Some("prefix-path"),
+		},
+		// Test prefix path matching
+		TestCase {
+			name: "prefix path match",
+			path: "/api/blah/users",
+			expected_route: Some("prefix-path"),
+		},
+		TestCase {
+			name: "prefix path match with subpath",
+			path: "/api/v1/users/123",
+			expected_route: Some("prefix-path"),
+		},
+		// Test regex path matching
+		TestCase {
+			name: "regex path match",
+			path: "/api/v2/users",
+			expected_route: Some("regex-path"),
+		},
+		TestCase {
+			name: "regex path match v3",
+			path: "/api/v3/users",
+			expected_route: Some("regex-path"),
+		},
+		// Test root prefix fallback
+		TestCase {
+			name: "root prefix fallback",
+			path: "/other/path",
+			expected_route: Some("root-prefix"),
+		},
+	];
+
+	for case in cases {
+		let req = request(
+			&format!("http://example.com{}", case.path),
+			http::Method::GET,
+			&[],
+		);
+		let routes = routes
+			.clone()
+			.into_iter()
+			.map(|(name, pm)| {
+				(
+					name,
+					vec![],
+					vec![RouteMatch {
+						headers: vec![],
+						path: pm.clone(),
+						method: None,
+						query: vec![],
+					}],
+				)
+			})
+			.collect_vec();
+		let result = run_test(&req, routes.as_slice());
+		assert_eq!(
+			result,
+			case.expected_route.map(|s| s.to_string()),
+			"{}",
+			case.name
+		);
+	}
+}
+
+#[test]
+fn test_method_matching() {
+	let routes = vec![
+		(
+			"get-only",
+			Some(MethodMatch {
+				method: "GET".into(),
+			}),
+		),
+		(
+			"post-only",
+			Some(MethodMatch {
+				method: "POST".into(),
+			}),
+		),
+		("any-method", None),
+	];
+
+	struct TestCase {
+		name: &'static str,
+		method: http::Method,
+		expected_route: Option<&'static str>,
+	}
+
+	let cases = vec![
+		TestCase {
+			name: "GET method matches get-only route",
+			method: http::Method::GET,
+			expected_route: Some("get-only"),
+		},
+		TestCase {
+			name: "POST method matches post-only route",
+			method: http::Method::POST,
+			expected_route: Some("post-only"),
+		},
+		TestCase {
+			name: "PUT method matches any-method route",
+			method: http::Method::PUT,
+			expected_route: Some("any-method"),
+		},
+		TestCase {
+			name: "DELETE method matches any-method route",
+			method: http::Method::DELETE,
+			expected_route: Some("any-method"),
+		},
+	];
+
+	for case in cases {
+		let req = request("http://example.com/", case.method, &[]);
+		let routes = routes
+			.clone()
+			.into_iter()
+			.map(|(name, mm)| {
+				(
+					name,
+					vec![],
+					vec![RouteMatch {
+						headers: vec![],
+						path: PathMatch::PathPrefix("/".into()),
+						method: mm,
+						query: vec![],
+					}],
+				)
+			})
+			.collect_vec();
+		let result = run_test(&req, routes.as_slice());
+		assert_eq!(
+			result,
+			case.expected_route.map(|s| s.to_string()),
+			"{}",
+			case.name
+		);
+	}
+}
+
+#[test]
+fn test_header_matching() {
+	let routes = vec![
+		("no-headers", vec![]),
+		(
+			"exact-header",
+			vec![HeaderMatch {
+				name: crate::http::HeaderOrPseudo::Header(http::HeaderName::from_static("content-type")),
+				value: HeaderValueMatch::Exact(http::HeaderValue::from_static("application/json")),
+			}],
+		),
+		(
+			"regex-header",
+			vec![HeaderMatch {
+				name: crate::http::HeaderOrPseudo::Header(http::HeaderName::from_static("user-agent")),
+				value: HeaderValueMatch::Regex(Regex::new(r"^Mozilla/.*$").unwrap()),
+			}],
+		),
+		(
+			"multiple-headers",
+			vec![
+				HeaderMatch {
+					name: crate::http::HeaderOrPseudo::Header(http::HeaderName::from_static("content-type")),
+					value: HeaderValueMatch::Exact(http::HeaderValue::from_static("application/json")),
+				},
+				HeaderMatch {
+					name: crate::http::HeaderOrPseudo::Header(http::HeaderName::from_static("authorization")),
+					value: HeaderValueMatch::Regex(Regex::new(r"^Bearer .*$").unwrap()),
+				},
+			],
+		),
+	];
+
+	struct TestCase {
+		name: &'static str,
+		headers: Vec<(&'static str, &'static str)>,
+		expected_route: Option<&'static str>,
+	}
+
+	let cases = vec![
+		TestCase {
+			name: "no headers matches no-headers route",
+			headers: vec![],
+			expected_route: Some("no-headers"),
+		},
+		TestCase {
+			name: "exact header match",
+			headers: vec![("content-type", "application/json")],
+			expected_route: Some("exact-header"),
+		},
+		TestCase {
+			name: "regex header match",
+			headers: vec![(
+				"user-agent",
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+			)],
+			expected_route: Some("regex-header"),
+		},
+		TestCase {
+			name: "multiple headers match",
+			headers: vec![
+				("content-type", "application/json"),
+				("authorization", "Bearer token123"),
+			],
+			expected_route: Some("multiple-headers"),
+		},
+		TestCase {
+			name: "header mismatch returns no match",
+			headers: vec![("content-type", "text/html")],
+			expected_route: Some("no-headers"),
+		},
+	];
+
+	for case in cases {
+		let req = request("http://example.com/", http::Method::GET, &case.headers);
+		let routes = routes
+			.clone()
+			.into_iter()
+			.map(|(name, hm)| {
+				(
+					name,
+					vec![],
+					vec![RouteMatch {
+						headers: hm,
+						path: PathMatch::PathPrefix("/".into()),
+						method: None,
+						query: vec![],
+					}],
+				)
+			})
+			.collect_vec();
+		let result = run_test(&req, routes.as_slice());
+		assert_eq!(
+			result,
+			case.expected_route.map(|s| s.to_string()),
+			"{}",
+			case.name
+		);
+	}
+}
+
+#[test]
+fn test_pseudo_header_matching() {
+	let routes = vec![
+		("no-headers", vec![]),
+		(
+			"authority-exact",
+			vec![HeaderMatch {
+				name: crate::http::HeaderOrPseudo::Authority,
+				value: HeaderValueMatch::Exact(http::HeaderValue::from_static("api.example.com")),
+			}],
+		),
+		(
+			"authority-regex",
+			vec![HeaderMatch {
+				name: crate::http::HeaderOrPseudo::Authority,
+				value: HeaderValueMatch::Regex(Regex::new(r"^.*\.example\.com$").unwrap()),
+			}],
+		),
+		(
+			"method-post",
+			vec![HeaderMatch {
+				name: crate::http::HeaderOrPseudo::Method,
+				value: HeaderValueMatch::Exact(http::HeaderValue::from_static("POST")),
+			}],
+		),
+		(
+			"scheme-https",
+			vec![HeaderMatch {
+				name: crate::http::HeaderOrPseudo::Scheme,
+				value: HeaderValueMatch::Exact(http::HeaderValue::from_static("https")),
+			}],
+		),
+		(
+			"path-regex",
+			vec![HeaderMatch {
+				name: crate::http::HeaderOrPseudo::Path,
+				value: HeaderValueMatch::Regex(Regex::new(r"^/api/.*$").unwrap()),
+			}],
+		),
+		(
+			"multiple-pseudo",
+			vec![
+				HeaderMatch {
+					name: crate::http::HeaderOrPseudo::Authority,
+					value: HeaderValueMatch::Exact(http::HeaderValue::from_static("api.example.com")),
+				},
+				HeaderMatch {
+					name: crate::http::HeaderOrPseudo::Method,
+					value: HeaderValueMatch::Exact(http::HeaderValue::from_static("POST")),
+				},
+			],
+		),
+	];
+
+	struct TestCase {
+		name: &'static str,
+		url: &'static str,
+		method: http::Method,
+		expected_route: Option<&'static str>,
+	}
+
+	let cases = vec![
+		TestCase {
+			name: "no pseudo headers matches no-headers route",
+			url: "http://example.com/",
+			method: http::Method::GET,
+			expected_route: Some("no-headers"),
+		},
+		TestCase {
+			name: "exact authority match",
+			url: "http://api.example.com/",
+			method: http::Method::GET,
+			expected_route: Some("authority-exact"),
+		},
+		TestCase {
+			name: "regex authority match",
+			url: "http://test.example.com/",
+			method: http::Method::GET,
+			expected_route: Some("authority-regex"),
+		},
+		TestCase {
+			name: "method POST match",
+			url: "http://example.com/",
+			method: http::Method::POST,
+			expected_route: Some("method-post"),
+		},
+		TestCase {
+			name: "scheme https match",
+			url: "https://example.com/",
+			method: http::Method::GET,
+			expected_route: Some("scheme-https"),
+		},
+		TestCase {
+			name: "path regex match",
+			url: "http://example.com/api/users",
+			method: http::Method::GET,
+			expected_route: Some("path-regex"),
+		},
+		TestCase {
+			name: "multiple pseudo headers match",
+			url: "http://api.example.com/",
+			method: http::Method::POST,
+			expected_route: Some("multiple-pseudo"),
+		},
+		TestCase {
+			name: "authority mismatch returns no match",
+			url: "http://other.com/",
+			method: http::Method::GET,
+			expected_route: Some("no-headers"),
+		},
+	];
+
+	for case in cases {
+		let req = request(case.url, case.method, &[]);
+		let routes = routes
+			.clone()
+			.into_iter()
+			.map(|(name, hm)| {
+				(
+					name,
+					vec![],
+					vec![RouteMatch {
+						headers: hm,
+						path: PathMatch::PathPrefix("/".into()),
+						method: None,
+						query: vec![],
+					}],
+				)
+			})
+			.collect_vec();
+		let result = run_test(&req, routes.as_slice());
+		assert_eq!(
+			result,
+			case.expected_route.map(|s| s.to_string()),
+			"{}",
+			case.name
+		);
+	}
+}
+
+#[test]
+fn test_query_parameter_matching() {
+	let routes = vec![
+		("no-query", vec![]),
+		(
+			"exact-query",
+			vec![QueryMatch {
+				name: "version".into(),
+				value: QueryValueMatch::Exact("v1".into()),
+			}],
+		),
+		(
+			"regex-query",
+			vec![QueryMatch {
+				name: "id".into(),
+				value: QueryValueMatch::Regex(Regex::new(r"^\d+$").unwrap()),
+			}],
+		),
+		(
+			"multiple-query",
+			vec![
+				QueryMatch {
+					name: "version".into(),
+					value: QueryValueMatch::Exact("v2".into()),
+				},
+				QueryMatch {
+					name: "format".into(),
+					value: QueryValueMatch::Exact("json".into()),
+				},
+			],
+		),
+	];
+
+	struct TestCase {
+		name: &'static str,
+		query: &'static str,
+		expected_route: Option<&'static str>,
+	}
+
+	let cases = vec![
+		TestCase {
+			name: "no query parameters matches no-query route",
+			query: "",
+			expected_route: Some("no-query"),
+		},
+		TestCase {
+			name: "exact query parameter match",
+			query: "version=v1",
+			expected_route: Some("exact-query"),
+		},
+		TestCase {
+			name: "regex query parameter match",
+			query: "id=123",
+			expected_route: Some("regex-query"),
+		},
+		TestCase {
+			name: "multiple query parameters match",
+			query: "version=v2&format=json",
+			expected_route: Some("multiple-query"),
+		},
+		TestCase {
+			name: "query parameter mismatch returns no match",
+			query: "version=v3",
+			expected_route: Some("no-query"),
+		},
+		TestCase {
+			name: "regex query parameter mismatch",
+			query: "id=abc",
+			expected_route: Some("no-query"),
+		},
+	];
+
+	for case in cases {
+		let uri = if case.query.is_empty() {
+			"http://example.com/".to_string()
+		} else {
+			format!("http://example.com/?{}", case.query)
+		};
+		let routes = routes
+			.clone()
+			.into_iter()
+			.map(|(name, qm)| {
+				(
+					name,
+					vec![],
+					vec![RouteMatch {
+						headers: vec![],
+						path: PathMatch::PathPrefix("/".into()),
+						method: None,
+						query: qm,
+					}],
+				)
+			})
+			.collect_vec();
+		let req = request(&uri, http::Method::GET, &[]);
+		let result = run_test(&req, routes.as_slice());
+		assert_eq!(
+			result,
+			case.expected_route.map(|s| s.to_string()),
+			"{}",
+			case.name
+		);
+	}
+}
+
+#[test]
+fn test_route_precedence() {
+	let routes = vec![
+		// Route with exact hostname (should have higher precedence than wildcard)
+		(
+			"exact-hostname-exact-path",
+			vec!["test.example.com"],
+			PathMatch::Exact("/api/users".into()),
+			None,
+			vec![],
+		),
+		(
+			"wildcard-hostname-exact-path",
+			vec!["*.example.com"],
+			PathMatch::Exact("/api/users".into()),
+			None,
+			vec![],
+		),
+		// Route with longer prefix path (should have higher precedence)
+		(
+			"longer-prefix",
+			vec!["test.example.com"],
+			PathMatch::PathPrefix("/api/users/".into()),
+			None,
+			vec![],
+		),
+		(
+			"shorter-prefix",
+			vec!["test.example.com"],
+			PathMatch::PathPrefix("/api/".into()),
+			None,
+			vec![],
+		),
+		// Route with method match (should have higher precedence than no method)
+		(
+			"with-method",
+			vec!["test.example.com"],
+			PathMatch::PathPrefix("/api/".into()),
+			Some(MethodMatch {
+				method: "GET".into(),
+			}),
+			vec![],
+		),
+		(
+			"without-method",
+			vec!["test.example.com"],
+			PathMatch::PathPrefix("/api/".into()),
+			None,
+			vec![],
+		),
+		// Route with more header matches (should have higher precedence)
+		(
+			"more-headers",
+			vec!["test.example.com"],
+			PathMatch::PathPrefix("/api/".into()),
+			None,
+			vec![
+				HeaderMatch {
+					name: crate::http::HeaderOrPseudo::Header(http::HeaderName::from_static("content-type")),
+					value: HeaderValueMatch::Exact(http::HeaderValue::from_static("application/json")),
+				},
+				HeaderMatch {
+					name: crate::http::HeaderOrPseudo::Header(http::HeaderName::from_static("authorization")),
+					value: HeaderValueMatch::Exact(http::HeaderValue::from_static("Bearer token")),
+				},
+			],
+		),
+		(
+			"fewer-headers",
+			vec!["test.example.com"],
+			PathMatch::PathPrefix("/api/".into()),
+			None,
+			vec![HeaderMatch {
+				name: crate::http::HeaderOrPseudo::Header(http::HeaderName::from_static("content-type")),
+				value: HeaderValueMatch::Exact(http::HeaderValue::from_static("application/json")),
+			}],
+		),
+	];
+
+	struct TestCase {
+		name: &'static str,
+		host: &'static str,
+		path: &'static str,
+		method: http::Method,
+		headers: Vec<(&'static str, &'static str)>,
+		expected_route: Option<&'static str>,
+	}
+
+	let cases = vec![
+		// Test hostname precedence: exact over wildcard
+		TestCase {
+			name: "exact hostname takes precedence over wildcard",
+			host: "test.example.com",
+			path: "/api/users",
+			method: http::Method::GET,
+			headers: vec![],
+			expected_route: Some("exact-hostname-exact-path"),
+		},
+		// Test path precedence: longer prefix over shorter
+		TestCase {
+			name: "longer path prefix takes precedence",
+			host: "test.example.com",
+			path: "/api/users/123",
+			method: http::Method::GET,
+			headers: vec![],
+			expected_route: Some("longer-prefix"),
+		},
+		// Test method precedence: with method over without
+		TestCase {
+			name: "method match takes precedence over no method",
+			host: "test.example.com",
+			path: "/api/other",
+			method: http::Method::GET,
+			headers: vec![],
+			expected_route: Some("with-method"),
+		},
+		// Test header precedence: more headers over fewer
+		TestCase {
+			name: "more header matches takes precedence",
+			host: "test.example.com",
+			path: "/api/other",
+			method: http::Method::POST,
+			headers: vec![
+				("content-type", "application/json"),
+				("authorization", "Bearer token"),
+			],
+			expected_route: Some("more-headers"),
+		},
+	];
+
+	for case in cases {
+		let uri = format!("http://{}{}", case.host, case.path);
+		let req = request(&uri, case.method, &case.headers);
+		let routes = routes
+			.clone()
+			.into_iter()
+			.map(|(name, host, path, method, headers)| {
+				(
+					name,
+					host,
+					vec![RouteMatch {
+						headers,
+						path,
+						method,
+						query: vec![],
+					}],
+				)
+			})
+			.collect_vec();
+		let result = run_test(&req, routes.as_slice());
+		assert_eq!(
+			result,
+			case.expected_route.map(|s| s.to_string()),
+			"{}",
+			case.name
+		);
+	}
+}
+
+// Helper to create a Stores with pre-populated discovery services.
+fn stores_with_services(services: Vec<Service>) -> Stores {
+	let mut discovery_store = crate::store::DiscoveryStore::new();
+	for svc in services {
+		discovery_store.insert_service_internal(svc);
+	}
+	Stores {
+		discovery: crate::store::DiscoveryStoreUpdater::new(Arc::new(RwLock::new(discovery_store))),
+		binds: crate::store::BindStoreUpdater::new(Arc::new(RwLock::new(
+			crate::store::BindStore::with_ipv6_enabled(true),
+		))),
+	}
+}
+
+fn hbone_listener() -> Arc<Listener> {
+	Arc::new(Listener {
+		key: Default::default(),
+		name: Default::default(),
+		hostname: Default::default(),
+		protocol: ListenerProtocol::HBONE,
+		tcp_routes: Default::default(),
+		routes: RouteSet::from_list(vec![]),
+	})
+}
+
+fn make_service(
+	name: &str,
+	namespace: &str,
+	hostname: &str,
+	vip: &str,
+	network: &str,
+	waypoint: Option<GatewayAddress>,
+) -> Service {
+	Service {
+		name: strng::new(name),
+		namespace: strng::new(namespace),
+		hostname: strng::new(hostname),
+		vips: vec![NetworkAddress {
+			network: strng::new(network),
+			address: vip.parse().unwrap(),
+		}],
+		ports: std::collections::HashMap::from([(80, 8080)]),
+		waypoint,
+		..Default::default()
+	}
+}
+
+#[tokio::test]
+async fn test_waypoint_hostname_match() {
+	// Service whose waypoint destination is a Hostname matching our identity
+	let svc = make_service(
+		"my-app",
+		"default",
+		"my-app.default.svc.cluster.local",
+		"10.0.0.100",
+		"network",
+		Some(GatewayAddress {
+			destination: Destination::Hostname(NamespacedHostname {
+				namespace: strng::new("istio-system"),
+				hostname: strng::new("my-waypoint.istio-system.svc.cluster.local"),
+			}),
+			hbone_mtls_port: 15008,
+		}),
+	);
+	let stores = stores_with_services(vec![svc]);
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[],
+	);
+	let listener = hbone_listener();
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(result.is_some(), "should return default waypoint route");
+	let (route, _) = result.unwrap();
+	assert_eq!(route.key.as_str(), "_waypoint-default");
+}
+
+#[tokio::test]
+async fn test_waypoint_hostname_mismatch() {
+	// Service whose waypoint points to a different gateway
+	let svc = make_service(
+		"my-app",
+		"default",
+		"my-app.default.svc.cluster.local",
+		"10.0.0.100",
+		"network",
+		Some(GatewayAddress {
+			destination: Destination::Hostname(NamespacedHostname {
+				namespace: strng::new("istio-system"),
+				hostname: strng::new("other-waypoint.istio-system.svc.cluster.local"),
+			}),
+			hbone_mtls_port: 15008,
+		}),
+	);
+	let stores = stores_with_services(vec![svc]);
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+	let req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[],
+	);
+	let listener = hbone_listener();
+
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(
+		result.is_none(),
+		"should reject service bound to a different waypoint"
+	);
+}
+
+#[tokio::test]
+async fn test_waypoint_hostname_fqdn_match() {
+	// Service whose waypoint hostname is a FQDN in a different namespace
+	let svc = make_service(
+		"my-app",
+		"default",
+		"my-app.default.svc.cluster.local",
+		"10.0.0.100",
+		"network",
+		Some(GatewayAddress {
+			destination: Destination::Hostname(NamespacedHostname {
+				namespace: strng::new("istio-system"),
+				hostname: strng::new("my-waypoint.istio-system.svc.cluster.local"),
+			}),
+			hbone_mtls_port: 15008,
+		}),
+	);
+	let stores = stores_with_services(vec![svc]);
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[],
+	);
+	let listener = hbone_listener();
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(result.is_some(), "should match waypoint with FQDN hostname");
+}
+
+#[tokio::test]
+async fn test_waypoint_address_match() {
+	// Service whose waypoint destination is an Address matching our VIP
+	let waypoint_vip = "10.0.1.1";
+	let svc = make_service(
+		"my-app",
+		"default",
+		"my-app.default.svc.cluster.local",
+		"10.0.0.100",
+		"network",
+		Some(GatewayAddress {
+			destination: Destination::Address(NetworkAddress {
+				network: strng::new("network"),
+				address: waypoint_vip.parse().unwrap(),
+			}),
+			hbone_mtls_port: 15008,
+		}),
+	);
+	// Also add the waypoint's own service so it can look up its VIPs
+	let waypoint_svc = make_service(
+		"my-waypoint",
+		"istio-system",
+		"my-waypoint.istio-system.svc.cluster.local",
+		waypoint_vip,
+		"network",
+		None,
+	);
+	let stores = stores_with_services(vec![svc, waypoint_svc]);
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[],
+	);
+	let listener = hbone_listener();
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(result.is_some(), "should match waypoint by address VIP");
+	let (route, _) = result.unwrap();
+	assert_eq!(route.key.as_str(), "_waypoint-default");
+}
+
+#[tokio::test]
+async fn test_waypoint_address_mismatch() {
+	// Service whose waypoint destination address doesn't match our VIP
+	let svc = make_service(
+		"my-app",
+		"default",
+		"my-app.default.svc.cluster.local",
+		"10.0.0.100",
+		"network",
+		Some(GatewayAddress {
+			destination: Destination::Address(NetworkAddress {
+				network: strng::new("network"),
+				address: "10.0.1.99".parse().unwrap(), // different from our VIP
+			}),
+			hbone_mtls_port: 15008,
+		}),
+	);
+	// Our waypoint service with a different VIP
+	let waypoint_svc = make_service(
+		"my-waypoint",
+		"istio-system",
+		"my-waypoint.istio-system.svc.cluster.local",
+		"10.0.1.1",
+		"network",
+		None,
+	);
+	let stores = stores_with_services(vec![svc, waypoint_svc]);
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+	let req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[],
+	);
+	let listener = hbone_listener();
+
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(
+		result.is_none(),
+		"should reject service bound to a different waypoint address"
+	);
+}
+
+#[tokio::test]
+async fn test_waypoint_no_waypoint_on_service() {
+	// Service with no waypoint assignment
+	let svc = make_service(
+		"my-app",
+		"default",
+		"my-app.default.svc.cluster.local",
+		"10.0.0.100",
+		"network",
+		None, // no waypoint
+	);
+	let stores = stores_with_services(vec![svc]);
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+	let req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[],
+	);
+	let listener = hbone_listener();
+
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(
+		result.is_none(),
+		"should return None for service without waypoint"
+	);
+}
+
+#[tokio::test]
+async fn test_waypoint_no_self_addr() {
+	// HBONE listener without self_addr configured
+	let svc = make_service(
+		"my-app",
+		"default",
+		"my-app.default.svc.cluster.local",
+		"10.0.0.100",
+		"network",
+		Some(GatewayAddress {
+			destination: Destination::Hostname(NamespacedHostname {
+				namespace: strng::new("istio-system"),
+				hostname: strng::new("my-waypoint.istio-system.svc.cluster.local"),
+			}),
+			hbone_mtls_port: 15008,
+		}),
+	);
+	let stores = stores_with_services(vec![svc]);
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+	let req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[],
+	);
+	let listener = hbone_listener();
+
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(
+		result.is_none(),
+		"should return None when self_addr is not configured"
+	);
+}
+
+#[tokio::test]
+async fn test_waypoint_unknown_vip() {
+	// Request to a VIP that doesn't match any known service
+	let stores = stores_with_services(vec![]);
+	let dst = SocketAddr::new("10.0.0.200".parse().unwrap(), 80);
+	let req = request("http://unknown.svc.cluster.local/", http::Method::GET, &[]);
+	let listener = hbone_listener();
+
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(result.is_none(), "should return None for unknown VIP");
+}
+
+/// Create stores with a service and optionally insert service-keyed routes into the bind store.
+fn stores_with_service_routes(svc: Service, routes: Vec<Route>) -> Stores {
+	let stores = stores_with_services(vec![svc]);
+	{
+		let mut binds = stores.binds.write();
+		for r in routes {
+			let sk = r
+				.service_key
+				.clone()
+				.expect("test routes must have service_key");
+			binds.insert_service_route(r, sk);
+		}
+	}
+	stores
+}
+
+fn service_route(key: &str, service_key: NamespacedHostname, matches: Vec<RouteMatch>) -> Route {
+	Route {
+		key: strng::new(key),
+		service_key: Some(service_key),
+		name: Default::default(),
+		hostnames: vec![], // GAMMA: hostname matching skipped for service routes
+		matches,
+		backends: vec![],
+		inline_policies: vec![],
+	}
+}
+
+fn svc_nh() -> NamespacedHostname {
+	NamespacedHostname {
+		namespace: strng::new("default"),
+		hostname: strng::new("my-app.default.svc.cluster.local"),
+	}
+}
+
+fn waypoint_svc() -> Service {
+	make_service(
+		"my-app",
+		"default",
+		"my-app.default.svc.cluster.local",
+		"10.0.0.100",
+		"network",
+		Some(GatewayAddress {
+			destination: Destination::Hostname(NamespacedHostname {
+				namespace: strng::new("istio-system"),
+				hostname: strng::new("my-waypoint.istio-system.svc.cluster.local"),
+			}),
+			hbone_mtls_port: 15008,
+		}),
+	)
+}
+
+#[tokio::test]
+async fn test_service_route_path_match() {
+	let stores = stores_with_service_routes(
+		waypoint_svc(),
+		vec![
+			service_route(
+				"api-route",
+				svc_nh(),
+				vec![RouteMatch {
+					path: PathMatch::PathPrefix(strng::new("/api")),
+					headers: vec![],
+					method: None,
+					query: vec![],
+				}],
+			),
+			service_route(
+				"health-route",
+				svc_nh(),
+				vec![RouteMatch {
+					path: PathMatch::Exact(strng::new("/healthz")),
+					headers: vec![],
+					method: None,
+					query: vec![],
+				}],
+			),
+		],
+	);
+	let listener = hbone_listener();
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+
+	// /api/v1 matches the prefix route
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/api/v1",
+		http::Method::GET,
+		&[],
+	);
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+	let result = super::select_best_route(stores.clone(), dst, &listener, &req);
+	assert_eq!(result.unwrap().0.key.as_str(), "api-route");
+
+	// /healthz matches the exact route (higher priority than prefix)
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/healthz",
+		http::Method::GET,
+		&[],
+	);
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+	let result = super::select_best_route(stores.clone(), dst, &listener, &req);
+	assert_eq!(result.unwrap().0.key.as_str(), "health-route");
+}
+
+#[tokio::test]
+async fn test_service_route_method_match() {
+	let stores = stores_with_service_routes(
+		waypoint_svc(),
+		vec![
+			service_route(
+				"get-route",
+				svc_nh(),
+				vec![RouteMatch {
+					path: PathMatch::PathPrefix(strng::new("/")),
+					headers: vec![],
+					method: Some(MethodMatch {
+						method: strng::new("GET"),
+					}),
+					query: vec![],
+				}],
+			),
+			service_route(
+				"post-route",
+				svc_nh(),
+				vec![RouteMatch {
+					path: PathMatch::PathPrefix(strng::new("/")),
+					headers: vec![],
+					method: Some(MethodMatch {
+						method: strng::new("POST"),
+					}),
+					query: vec![],
+				}],
+			),
+		],
+	);
+	let listener = hbone_listener();
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::POST,
+		&[],
+	);
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+	let result = super::select_best_route(stores.clone(), dst, &listener, &req);
+	assert_eq!(result.unwrap().0.key.as_str(), "post-route");
+}
+
+#[tokio::test]
+async fn test_service_route_header_match() {
+	let stores = stores_with_service_routes(
+		waypoint_svc(),
+		vec![service_route(
+			"header-route",
+			svc_nh(),
+			vec![RouteMatch {
+				path: PathMatch::PathPrefix(strng::new("/")),
+				headers: vec![HeaderMatch {
+					name: crate::http::HeaderOrPseudo::Header(http::HeaderName::from_static("x-custom")),
+					value: HeaderValueMatch::Exact(http::HeaderValue::from_static("special")),
+				}],
+				method: None,
+				query: vec![],
+			}],
+		)],
+	);
+	let listener = hbone_listener();
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+
+	// With matching header -> matches
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[("x-custom", "special")],
+	);
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+	let result = super::select_best_route(stores.clone(), dst, &listener, &req);
+	assert_eq!(result.unwrap().0.key.as_str(), "header-route");
+
+	// Without matching header -> GAMMA reject (service routes exist, none match)
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/",
+		http::Method::GET,
+		&[],
+	);
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+	let result = super::select_best_route(stores.clone(), dst, &listener, &req);
+	assert!(
+		result.is_none(),
+		"should reject when service routes exist but none match"
+	);
+}
+
+#[tokio::test]
+async fn test_service_route_rejects_unmatched() {
+	// GAMMA: if service routes exist but request doesn't match any, reject
+	let stores = stores_with_service_routes(
+		waypoint_svc(),
+		vec![service_route(
+			"only-api",
+			svc_nh(),
+			vec![RouteMatch {
+				path: PathMatch::PathPrefix(strng::new("/api")),
+				headers: vec![],
+				method: None,
+				query: vec![],
+			}],
+		)],
+	);
+	let listener = hbone_listener();
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/other",
+		http::Method::GET,
+		&[],
+	);
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+	let result = super::select_best_route(stores.clone(), dst, &listener, &req);
+	assert!(
+		result.is_none(),
+		"GAMMA: should reject when service routes exist but none match"
+	);
+}
+
+#[tokio::test]
+async fn test_no_service_routes_falls_through_to_default() {
+	// No service-keyed routes -> default passthrough route
+	let stores = stores_with_services(vec![waypoint_svc()]);
+	let listener = hbone_listener();
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/anything",
+		http::Method::GET,
+		&[],
+	);
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+	let result = super::select_best_route(stores, dst, &listener, &req);
+	assert!(
+		result.is_some(),
+		"should fall through to default route when no service routes"
+	);
+	assert_eq!(result.unwrap().0.key.as_str(), "_waypoint-default");
+}
+
+#[divan::bench(args = [(1,1), (100, 100), (5000,100)])]
+fn bench(b: Bencher, (host, route): (u64, u64)) {
+	let mut routes = vec![];
+	for host in 0..host {
+		for path in 0..route {
+			let m = vec![RouteMatch {
+				headers: vec![],
+				path: PathMatch::PathPrefix(strng::literal!("/{path}")),
+				method: None,
+				query: vec![],
+			}];
+			routes.push((
+				format!("{host}-{path}"),
+				vec![format!("{}", host)],
+				m.clone(),
+			));
+		}
+	}
+
+	let listener = Arc::new(Listener {
+		key: Default::default(),
+		name: Default::default(),
+		hostname: Default::default(),
+		protocol: ListenerProtocol::HTTP,
+		tcp_routes: Default::default(),
+		routes: RouteSet::from_list(
+			routes
+				.into_iter()
+				.map(|(name, host, matches)| Route {
+					key: name.into(),
+					service_key: None,
+					name: Default::default(),
+					hostnames: host.into_iter().map(|s| s.into()).collect(),
+					matches,
+					backends: vec![],
+					inline_policies: vec![],
+				})
+				.collect(),
+		),
+	});
+	let stores = Stores::with_ipv6_enabled(true);
+	let dummy_dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1000);
+	let req = request("http://example.com", http::Method::GET, &[]);
+
+	b.bench_local(|| {
+		divan::black_box(super::select_best_route(
+			stores.clone(),
+			dummy_dest,
+			&listener,
+			divan::black_box(&req),
+		))
+	});
+}

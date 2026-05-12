@@ -1,0 +1,97 @@
+# Image configuration
+DOCKER_REGISTRY ?= ghcr.io
+DOCKER_REPO ?= agentgateway
+IMAGE_NAME ?= agentgateway
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || jj log -r @ -T 'commit_id.shortest(12)' --no-graph 2>/dev/null || echo unknown)
+GIT_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || jj log -r @ -T 'commit_id' --no-graph 2>/dev/null || echo unknown)
+IMAGE_TAG ?= $(VERSION)
+IMAGE_FULL_NAME ?= $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(IMAGE_NAME):$(IMAGE_TAG)
+DOCKER_BUILDER ?= docker
+DOCKER_BUILD_ARGS ?= --build-arg VERSION=$(VERSION) --build-arg GIT_REVISION=$(GIT_REVISION)
+export PATH := ./tools:$(PATH)
+
+# docker
+.PHONY: docker
+docker:
+ifeq ($(OS),Windows_NT)
+	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) -f Dockerfile.windows -t $(IMAGE_FULL_NAME) .
+else
+	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) -t $(IMAGE_FULL_NAME) . --progress=plain
+endif
+
+.PHONY: docker-ci
+docker-ci:
+ifeq ($(OS),Windows_NT)
+	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) --build-arg PROFILE=ci -f Dockerfile.windows -t $(IMAGE_FULL_NAME) .
+else
+	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) --build-arg PROFILE=ci -t $(IMAGE_FULL_NAME) . --progress=plain
+endif
+
+.PHONY: docker-musl
+docker-musl:
+	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) -t $(IMAGE_FULL_NAME)-musl --build-arg=BUILDER=musl . --progress=plain
+
+CARGO_BUILD_ARGS ?=
+# build
+.PHONY: build
+build:
+	cargo build --release --features ui $(CARGO_BUILD_ARGS)
+.PHONY: build-target
+build-target:
+	cargo build --features ui $(CARGO_BUILD_ARGS) --target $(TARGET) --profile $(PROFILE)
+
+# lint
+.PHONY: lint
+lint:
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
+
+.PHONY: fix-lint
+fix-lint:
+	cargo clippy --fix --allow-staged --allow-dirty --allow-no-vcs
+	cargo fmt
+
+.PHONY: format
+format:
+	cargo fmt
+
+# test
+.PHONY: test
+test:
+	cargo test --all-targets
+
+# clean
+.PHONY: clean
+clean:
+	cargo clean
+
+objects := $(wildcard examples/*/config.json)
+
+.PHONY: check-clean-repo
+check-clean-repo:
+	@tools/check_clean_repo.sh
+
+.PHONY: gen
+gen: generate-apis generate-schema format
+	@:
+
+.PHONY: generate-schema
+generate-schema:
+	@cargo xtask schema
+
+# Code generation for xds apis
+.PHONY: generate-apis
+generate-apis:
+	@PATH="./common/tools:$(PATH)" buf generate --path crates/protos/proto/resource.proto
+
+.PHONY: run-validation-deps
+run-validation-deps:
+	@tools/manage-validation-deps.sh start
+
+.PHONY: stop-validation-deps
+stop-validation-deps:
+	@tools/manage-validation-deps.sh stop
+
+.PHONY: validate
+validate:
+	@tools/validate-configs.sh

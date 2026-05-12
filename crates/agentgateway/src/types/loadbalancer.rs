@@ -1,0 +1,906 @@
+use arc_swap::ArcSwap;
+use indexmap::IndexMap;
+use itertools::Itertools;
+use rand::RngExt;
+use serde::ser::SerializeSeq;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use tokio::sync::mpsc;
+use tokio::time::sleep_until;
+
+use crate::types::discovery::{Endpoint, Service, Workload};
+use crate::*;
+
+type EndpointKey = Strng;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointWithInfo<T> {
+	pub endpoint: Arc<T>,
+	pub info: Arc<EndpointInfo>,
+}
+
+impl<T> EndpointWithInfo<T> {
+	pub fn new(ep: T) -> Self {
+		Self {
+			endpoint: Arc::new(ep),
+			info: Default::default(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointGroup<T> {
+	active: IndexMap<EndpointKey, EndpointWithInfo<T>>,
+	rejected: IndexMap<EndpointKey, EndpointWithInfo<T>>,
+}
+
+impl<T> Default for EndpointGroup<T> {
+	fn default() -> Self {
+		EndpointGroup::<T> {
+			active: IndexMap::new(),
+			rejected: IndexMap::new(),
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct EndpointSet<T> {
+	buckets: Vec<Atomic<EndpointGroup<T>>>,
+	tx_eviction: mpsc::Sender<EvictionEvent>,
+
+	// Updates to `bucket` are atomically swapped to make read actions fast.
+	// However, this introduces a TOCTOU race when we have add/delete and evictions on the same time.
+	// Practically speaking, these are all handled by the single main thread, but use a mutex to verify this.
+	// Note: we could have both of these handled by the worker, but the add/remove come from XDS without any async support.
+	action_mutex: Arc<Mutex<()>>,
+}
+fn contains_target_port(ep: &Endpoint, wanted_target: u16) -> bool {
+	ep.port.values().any(|tp| *tp == wanted_target)
+}
+impl EndpointSet<Endpoint> {
+	pub fn insert(&self, ep: Endpoint) {
+		// Currently, buckets are not supported
+		self.insert_key(ep.workload_uid.clone(), ep, 0)
+	}
+	pub fn select_endpoint(
+		&self,
+		workloads: &store::WorkloadStore,
+		svc: &Service,
+		svc_port: u16,
+		override_dest: Option<SocketAddr>,
+	) -> Option<(Arc<Endpoint>, ActiveHandle, Arc<Workload>)> {
+		let target_port = svc.ports.get(&svc_port).copied();
+
+		if target_port.is_none() {
+			// Port doesn't exist on the service at all, this is invalid
+			debug!("service {} does not have port {}", svc.hostname, svc_port);
+			return None;
+		};
+
+		let iter = svc.endpoints.iter();
+		let selected = if let Some(o) = override_dest {
+			iter.iter().find_map(|(ep, ep_info)| {
+				let Some(wl) = workloads.find_uid(&ep.workload_uid) else {
+					debug!("failed to fetch workload for {}", ep.workload_uid);
+					return None;
+				};
+				if !wl.workload_ips.contains(&o.ip()) {
+					return None;
+				}
+				if !contains_target_port(ep, o.port()) {
+					return None;
+				}
+				Some((ep.clone(), ep_info, wl))
+			})
+		} else {
+			let index = iter.index();
+			if index.is_empty() {
+				return None;
+			}
+			// Intentionally allow `rand::seq::index::sample` so we can pick the same element twice
+			// This avoids starvation where the worst endpoint gets 0 traffic
+			let a = rand::rng().random_range(0..index.len());
+			let b = rand::rng().random_range(0..index.len());
+			let best = [a, b]
+				.into_iter()
+				.filter_map(|idx| {
+					let (_, EndpointWithInfo { endpoint, info }) =
+						index.get_index(idx).expect("index already checked");
+					let Some(wl) = workloads.find_uid(&endpoint.workload_uid) else {
+						debug!("failed to fetch workload for {}", endpoint.workload_uid);
+						return None;
+					};
+					if target_port.unwrap_or_default() == 0 && !endpoint.port.contains_key(&svc_port) {
+						// Filter workload out, it doesn't have a matching port
+						// This is not great, since if we have a lot of partial endpoints we hit bad cases.
+						// However, this is rare enough in typical workloads that its not a big deal ATM.
+						trace!(
+							"filter endpoint {}, it does not have service port {}",
+							endpoint.workload_uid, svc_port
+						);
+						return None;
+					}
+					Some((endpoint.clone(), info, wl))
+				})
+				.max_by(|(_, a, _), (_, b, _)| a.score().total_cmp(&b.score()));
+			if let Some(best) = best {
+				Some(best)
+			} else {
+				// Fallback to O(n) lookup
+				iter
+					.iter()
+					.filter_map(|(ep, ep_info)| {
+						let Some(wl) = workloads.find_uid(&ep.workload_uid) else {
+							debug!("failed to fetch workload for {}", ep.workload_uid);
+							return None;
+						};
+						if target_port.unwrap_or_default() == 0 && !ep.port.contains_key(&svc_port) {
+							// Filter workload out, it doesn't have a matching port
+							trace!(
+								"filter endpoint {}, it does not have service port {}",
+								ep.workload_uid, svc_port
+							);
+							return None;
+						}
+						Some((ep.clone(), ep_info, wl))
+					})
+					.max_by(|(_, a, _), (_, b, _)| a.score().total_cmp(&b.score()))
+			}
+		};
+		let (ep, ep_info, wl) = selected?;
+		let handle = svc
+			.endpoints
+			.start_request(ep.workload_uid.clone(), ep_info);
+		Some((ep, handle, wl))
+	}
+}
+
+#[derive(Debug)]
+pub enum EndpointEvent<T> {
+	Add(EndpointKey, EndpointWithInfo<T>, usize),
+	Delete(EndpointKey),
+}
+
+#[derive(Debug)]
+pub enum EvictionEvent {
+	Evict {
+		key: EndpointKey,
+		until: Instant,
+		restore_health: Option<f64>,
+	},
+}
+
+/// Entry for the uneviction heap. Ordered so the earliest `until` is popped first (min-heap via reversed Ord).
+#[derive(Debug)]
+struct UnevictEntry(Instant, EndpointKey, Option<f64>);
+
+impl PartialEq for UnevictEntry {
+	fn eq(&self, other: &Self) -> bool {
+		self.0 == other.0 && self.1 == other.1
+	}
+}
+impl Eq for UnevictEntry {}
+impl PartialOrd for UnevictEntry {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+impl Ord for UnevictEntry {
+	fn cmp(&self, other: &Self) -> Ordering {
+		// Reverse so earliest instant is "greater" and gets popped first from BinaryHeap (max-heap).
+		other.0.cmp(&self.0).then_with(|| self.1.cmp(&other.1))
+	}
+}
+
+impl<T: Clone + Sync + Send + 'static> Default for EndpointSet<T> {
+	fn default() -> Self {
+		Self::new_empty(1)
+	}
+}
+
+impl<T: Clone + Sync + Send + 'static> EndpointSet<T> {
+	pub fn new(initial_set: Vec<Vec<(EndpointKey, T)>>) -> Self {
+		let buckets = initial_set
+			.into_iter()
+			.map(|items| {
+				let eg = EndpointGroup {
+					active: IndexMap::from_iter(
+						items
+							.into_iter()
+							.map(|(k, v)| (k, EndpointWithInfo::new(v))),
+					),
+					rejected: Default::default(),
+				};
+				Arc::new(ArcSwap::new(Arc::new(eg)))
+			})
+			.collect_vec();
+		Self::new_with_buckets(buckets)
+	}
+	pub fn new_empty(priority_levels: usize) -> Self {
+		Self::new_with_buckets(vec![Default::default(); priority_levels])
+	}
+	fn new_with_buckets(buckets: Vec<Atomic<EndpointGroup<T>>>) -> Self {
+		let (tx_eviction, rx_eviction) = mpsc::channel(10);
+		Self::worker(rx_eviction, buckets.clone());
+		Self {
+			buckets,
+			tx_eviction,
+			action_mutex: Arc::new(Mutex::new(())),
+		}
+	}
+
+	pub fn start_request(&self, key: Strng, info: &Arc<EndpointInfo>) -> ActiveHandle {
+		info.start_request(key, self.tx_eviction.clone())
+	}
+
+	fn find_bucket(&self, key: &EndpointKey) -> Option<Arc<EndpointGroup<T>>> {
+		self.buckets.iter().find_map(|x| {
+			let b = x.load_full();
+			if b.active.contains_key(key) || b.rejected.contains_key(key) {
+				Some(b)
+			} else {
+				None
+			}
+		})
+	}
+
+	fn find_bucket_atomic(
+		buckets: &[Atomic<EndpointGroup<T>>],
+		key: &EndpointKey,
+	) -> Option<Atomic<EndpointGroup<T>>> {
+		buckets.iter().find_map(|x| {
+			let b = x.load_full();
+			if b.active.contains_key(key) || b.rejected.contains_key(key) {
+				Some(x.clone())
+			} else {
+				None
+			}
+		})
+	}
+
+	fn best_bucket(&self) -> Arc<EndpointGroup<T>> {
+		// find the first bucket with healthy endpoints
+		self
+			.buckets
+			.iter()
+			.find_map(|x| {
+				let b = x.load_full();
+				if !b.active.is_empty() { Some(b) } else { None }
+			})
+			// TODO: allow selecting across multiple buckets.
+			.unwrap_or_else(|| self.buckets[0].load_full())
+	}
+
+	pub fn any<F>(&self, mut f: F) -> bool
+	where
+		F: FnMut(&T) -> bool,
+	{
+		for b in self.buckets.iter() {
+			let bb = b.load_full();
+			if bb.active.iter().any(|(_k, info)| f(info.endpoint.as_ref())) {
+				return true;
+			};
+			if bb
+				.rejected
+				.iter()
+				.any(|(_k, info)| f(info.endpoint.as_ref()))
+			{
+				return true;
+			};
+		}
+		false
+	}
+
+	pub fn iter(&self) -> ActiveEndpointsIter<T> {
+		ActiveEndpointsIter(self.best_bucket())
+	}
+
+	pub fn insert_key(&self, key: EndpointKey, ep: T, bucket: usize) {
+		self.event(EndpointEvent::Add(key, EndpointWithInfo::new(ep), bucket))
+	}
+	pub fn remove(&self, key: EndpointKey) {
+		self.event(EndpointEvent::Delete(key))
+	}
+	fn event(&self, item: EndpointEvent<T>) {
+		let _mu = self.action_mutex.lock();
+
+		match item {
+			EndpointEvent::Add(key, ep, bucket) => {
+				let mut eps = Arc::unwrap_or_clone(self.buckets[bucket].load_full());
+				eps.rejected.swap_remove(&key);
+				eps.active.insert(key, ep);
+				self.buckets[bucket].store(Arc::new(eps));
+			},
+			EndpointEvent::Delete(key) => {
+				let Some(bucket) = Self::find_bucket_atomic(self.buckets.as_slice(), &key) else {
+					return;
+				};
+				let mut eps = Arc::unwrap_or_clone(bucket.load_full());
+				eps.active.swap_remove(&key);
+				eps.rejected.swap_remove(&key);
+				bucket.store(Arc::new(eps));
+			},
+		}
+	}
+	fn worker(
+		mut eviction_events: mpsc::Receiver<EvictionEvent>,
+		buckets: Vec<Atomic<EndpointGroup<T>>>,
+	) {
+		tokio::task::spawn(async move {
+			let mut uneviction_heap: BinaryHeap<UnevictEntry> = Default::default();
+			let handle_eviction = |uneviction_heap: &mut BinaryHeap<UnevictEntry>| {
+				let UnevictEntry(_until, key, restore_health) =
+					uneviction_heap.pop().expect("heap is empty");
+
+				trace!(%key, "unevict");
+				let Some(bucket) = Self::find_bucket_atomic(buckets.as_slice(), &key) else {
+					return;
+				};
+				let mut eps = Arc::unwrap_or_clone(bucket.load_full());
+				if let Some(ep) = eps.rejected.swap_remove(&key) {
+					ep.info.evicted_until.store(None);
+					if let Some(h) = restore_health {
+						// Health scoring assumes normalized values in [0.0, 1.0].
+						ep.info.health.set(h.clamp(0.0, 1.0));
+					}
+					eps.active.insert(key, ep);
+				}
+				bucket.store(Arc::new(eps));
+			};
+			let handle_recv_evict = |uneviction_heap: &mut BinaryHeap<UnevictEntry>,
+			                         o: Option<EvictionEvent>| {
+				let Some(item) = o else {
+					return;
+				};
+
+				let EvictionEvent::Evict {
+					key,
+					until,
+					restore_health,
+				} = item;
+
+				let Some(bucket) = Self::find_bucket_atomic(buckets.as_slice(), &key) else {
+					return;
+				};
+				let mut eps = Arc::unwrap_or_clone(bucket.load_full());
+
+				uneviction_heap.push(UnevictEntry(until, key.clone(), restore_health));
+				if let Some(ep) = eps.active.swap_remove(&key) {
+					eps.rejected.insert(key, ep);
+				}
+				bucket.store(Arc::new(eps));
+			};
+			loop {
+				let evict_at = uneviction_heap.peek().map(|e| e.0);
+				tokio::select! {
+					true = maybe_sleep_until(evict_at) => handle_eviction(&mut uneviction_heap),
+					item = eviction_events.recv() => {
+						if item.is_none() { return };
+						handle_recv_evict(&mut uneviction_heap, item)
+					}
+				}
+			}
+		});
+	}
+	pub async fn evict(&mut self, key: EndpointKey, time: Instant) {
+		let Some(bucket) = self.find_bucket(&key) else {
+			return;
+		};
+		if let Some(cur) = bucket.active.get(&key) {
+			let prev = cur
+				.info
+				.evicted_until
+				.compare_and_swap(&None::<Arc<_>>, Some(Arc::new(time)));
+			if prev.is_none() {
+				let tx = self.tx_eviction.clone();
+				tokio::spawn(async move {
+					let _ = tx
+						.send(EvictionEvent::Evict {
+							key,
+							until: time,
+							restore_health: None,
+						})
+						.await;
+				});
+			}
+		}
+	}
+}
+
+const ALPHA: f64 = 0.3;
+
+#[derive(Debug, Serialize)]
+pub struct EndpointInfo {
+	/// health keeps track of the success rate for the endpoint.
+	health: Ewma,
+	/// request latency tracks the latency of requests
+	request_latency: Ewma,
+	/// pending_requests keeps track of the total number of pending requests.
+	pending_requests: ActiveCounter,
+	/// total_requests keeps track of the total number of requests.
+	total_requests: AtomicU64,
+	/// Number of consecutive unhealthy responses (reset to 0 on success).
+	consecutive_failures: AtomicU64,
+	/// Number of times this endpoint has been ejected. Used as a multiplier on
+	/// the base ejection duration so repeatedly-failing hosts stay out longer.
+	/// Reset to 0 when the endpoint handles a successful request.
+	times_ejected: AtomicU64,
+	#[serde(with = "serde_instant_option")]
+	/// evicted_until is the time at which the endpoint will be evicted.
+	evicted_until: AtomicOption<Instant>,
+}
+
+impl Default for EndpointInfo {
+	fn default() -> Self {
+		Self {
+			health: Ewma::new(1.0),
+			// TODO: this will overload them on the first request
+			request_latency: Default::default(),
+			pending_requests: Default::default(),
+			total_requests: Default::default(),
+			consecutive_failures: Default::default(),
+			times_ejected: Default::default(),
+			evicted_until: Arc::new(Default::default()),
+		}
+	}
+}
+
+impl EndpointInfo {
+	pub fn new() -> Self {
+		Self::default()
+	}
+	/// Current health score (0.0–1.0) for threshold-based eviction.
+	pub fn health_score(&self) -> f64 {
+		self.health.load()
+	}
+	pub fn consecutive_failures(&self) -> u64 {
+		self.consecutive_failures.load(AtomicOrdering::Relaxed)
+	}
+	pub fn times_ejected(&self) -> u64 {
+		self.times_ejected.load(AtomicOrdering::Relaxed)
+	}
+	// Todo: fine-tune the algorithm here
+	pub fn score(&self) -> f64 {
+		let latency_penalty =
+			self.request_latency.load() * (1.0 + self.pending_requests.countf() * 0.1);
+		self.health.load() / (1.0 + latency_penalty)
+	}
+	pub fn start_request(
+		self: &Arc<Self>,
+		key: Strng,
+		tx_sender: mpsc::Sender<EvictionEvent>,
+	) -> ActiveHandle {
+		self.total_requests.fetch_add(1, AtomicOrdering::Relaxed);
+		ActiveHandle {
+			info: self.clone(),
+			key,
+			tx: tx_sender,
+			counter: self.pending_requests.0.clone(),
+		}
+	}
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct Ewma(atomic_float::AtomicF64);
+
+impl Ewma {
+	pub fn new(f: f64) -> Self {
+		Ewma(atomic_float::AtomicF64::new(f))
+	}
+	pub fn load(&self) -> f64 {
+		self.0.load(AtomicOrdering::Relaxed)
+	}
+	/// Set the value directly (e.g. when unevicting to give the endpoint a recovery score).
+	pub fn set(&self, value: f64) {
+		self.0.store(value, AtomicOrdering::Relaxed);
+	}
+	pub fn record(&self, nv: f64) {
+		let _ = self
+			.0
+			.fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::Relaxed, |old| {
+				Some(if old == 0.0 {
+					nv
+				} else {
+					ALPHA * nv + (1.0 - ALPHA) * old
+				})
+			});
+	}
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ActiveCounter(Arc<()>);
+
+impl Serialize for ActiveCounter {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		self.count().serialize(serializer)
+	}
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveHandle {
+	info: Arc<EndpointInfo>,
+	key: Strng,
+	tx: mpsc::Sender<EvictionEvent>,
+	#[allow(dead_code)]
+	counter: Arc<()>,
+}
+
+impl ActiveHandle {
+	/// Current endpoint health score (0.0–1.0) for eviction threshold checks.
+	pub fn health_score(&self) -> f64 {
+		self.info.health_score()
+	}
+	pub fn consecutive_failures(&self) -> u64 {
+		self.info.consecutive_failures()
+	}
+	pub fn times_ejected(&self) -> u64 {
+		self.info.times_ejected()
+	}
+	pub fn finish_request(
+		self,
+		success: bool,
+		latency: Duration,
+		eviction_time: Option<Duration>,
+		restore_health: Option<f64>,
+	) {
+		if success {
+			self.info.request_latency.record(latency.as_secs_f64());
+			self.info.health.record(1.0);
+			self
+				.info
+				.consecutive_failures
+				.store(0, AtomicOrdering::Relaxed);
+			self.info.times_ejected.store(0, AtomicOrdering::Relaxed);
+		} else {
+			self.info.health.record(0.0);
+			self
+				.info
+				.consecutive_failures
+				.fetch_add(1, AtomicOrdering::Relaxed);
+		};
+		if let Some(eviction_time) = eviction_time {
+			self
+				.info
+				.times_ejected
+				.fetch_add(1, AtomicOrdering::Relaxed);
+			let time = Instant::now() + eviction_time;
+			let prev = self
+				.info
+				.evicted_until
+				.compare_and_swap(&None::<Arc<_>>, Some(Arc::new(time)));
+			if prev.is_none() {
+				let tx = self.tx.clone();
+				let key = self.key.clone();
+				tokio::spawn(async move {
+					let _ = tx
+						.send(EvictionEvent::Evict {
+							key,
+							until: time,
+							restore_health,
+						})
+						.await;
+				});
+			}
+		}
+	}
+}
+
+impl ActiveCounter {
+	pub fn new(&self) -> ActiveCounter {
+		Default::default()
+	}
+	/// Count returns the number of active instances.
+	pub fn count(&self) -> usize {
+		// We have a count, so ignore that one
+		Arc::strong_count(&self.0) - 1
+	}
+	pub fn countf(&self) -> f64 {
+		self.count() as f64
+	}
+}
+
+// tokio::select evaluates each pattern before checking the (optional) associated condition. Work
+// around that by returning false to fail the pattern match when sleep is not viable.
+async fn maybe_sleep_until(till: Option<Instant>) -> bool {
+	match till {
+		Some(till) => {
+			sleep_until(till.into()).await;
+			true
+		},
+		None => false,
+	}
+}
+
+impl<T> serde::Serialize for EndpointSet<T>
+where
+	EndpointWithInfo<T>: Serialize,
+	T: Serialize,
+{
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let mut seq = serializer.serialize_seq(Some(self.buckets.len()))?;
+		for b in self.buckets.iter() {
+			seq.serialize_element(&b.load_full())?;
+		}
+		seq.end()
+	}
+}
+
+pub struct ActiveEndpointsIter<T>(Arc<EndpointGroup<T>>);
+impl<T> ActiveEndpointsIter<T> {
+	pub fn iter(&self) -> impl ExactSizeIterator<Item = (&Arc<T>, &Arc<EndpointInfo>)> {
+		self.index().iter().map(|(_k, v)| (&v.endpoint, &v.info))
+	}
+	pub fn index(&self) -> &IndexMap<EndpointKey, EndpointWithInfo<T>> {
+		if self.0.active.is_empty() {
+			// If we have no active endpoints, return the rejected ones
+			&self.0.rejected
+		} else {
+			&self.0.active
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// --- Ewma ---
+
+	#[test]
+	fn ewma_initial_value() {
+		let ewma = Ewma::new(1.0);
+		assert_eq!(ewma.load(), 1.0);
+	}
+
+	#[test]
+	fn ewma_default_is_zero() {
+		let ewma = Ewma::default();
+		assert_eq!(ewma.load(), 0.0);
+	}
+
+	#[test]
+	fn ewma_set_overwrites() {
+		let ewma = Ewma::new(1.0);
+		ewma.set(0.42);
+		assert_eq!(ewma.load(), 0.42);
+	}
+
+	#[test]
+	fn ewma_first_record_from_zero_sets_directly() {
+		let ewma = Ewma::default(); // 0.0
+		ewma.record(1.0);
+		// When old==0.0, result is nv directly
+		assert_eq!(ewma.load(), 1.0);
+	}
+
+	#[test]
+	fn ewma_record_sequence_failures() {
+		let ewma = Ewma::new(1.0);
+		// ALPHA = 0.3, record(0.0) simulates a failure
+		ewma.record(0.0); // 0.3*0 + 0.7*1.0 = 0.7
+		assert!((ewma.load() - 0.7).abs() < 1e-10);
+		ewma.record(0.0); // 0.3*0 + 0.7*0.7 = 0.49
+		assert!((ewma.load() - 0.49).abs() < 1e-10);
+		ewma.record(0.0); // 0.3*0 + 0.7*0.49 = 0.343
+		assert!((ewma.load() - 0.343).abs() < 1e-10);
+	}
+
+	#[test]
+	fn ewma_recovery_after_failures() {
+		let ewma = Ewma::new(0.343);
+		ewma.record(1.0); // 0.3*1.0 + 0.7*0.343 = 0.5401
+		assert!((ewma.load() - 0.5401).abs() < 1e-10);
+	}
+
+	#[test]
+	fn ewma_restore_health_full_reset() {
+		let ewma = Ewma::new(1.0);
+		// 3 failures: 1.0 → 0.7 → 0.49 → 0.343
+		ewma.record(0.0);
+		ewma.record(0.0);
+		ewma.record(0.0);
+		assert!((ewma.load() - 0.343).abs() < 1e-10);
+
+		// Simulate uneviction with restoreHealth = 1.0
+		ewma.set(1.0);
+		assert_eq!(ewma.load(), 1.0);
+
+		// Failures start fresh from 1.0
+		ewma.record(0.0); // 0.7
+		assert!((ewma.load() - 0.7).abs() < 1e-10);
+		ewma.record(0.0); // 0.49
+		assert!((ewma.load() - 0.49).abs() < 1e-10);
+	}
+
+	#[test]
+	fn ewma_restore_health_zero() {
+		let ewma = Ewma::new(1.0);
+		ewma.record(0.0);
+		ewma.record(0.0);
+		ewma.record(0.0);
+
+		// Simulate uneviction with restoreHealth = 0.0
+		ewma.set(0.0);
+		assert_eq!(ewma.load(), 0.0);
+
+		// record(0.0) when old==0.0: result = nv = 0.0 (stays at zero)
+		ewma.record(0.0);
+		assert_eq!(ewma.load(), 0.0);
+	}
+
+	#[test]
+	fn ewma_restore_health_partial() {
+		let ewma = Ewma::new(1.0);
+		ewma.record(0.0);
+		ewma.record(0.0);
+		ewma.record(0.0);
+
+		// Simulate uneviction with restoreHealth = 0.5
+		ewma.set(0.5);
+		assert_eq!(ewma.load(), 0.5);
+
+		// Next failure: 0.3*0 + 0.7*0.5 = 0.35
+		ewma.record(0.0);
+		assert!((ewma.load() - 0.35).abs() < 1e-10);
+	}
+
+	// --- EndpointInfo ---
+
+	#[test]
+	fn endpoint_info_default_health() {
+		let info = EndpointInfo::default();
+		assert_eq!(info.health_score(), 1.0);
+		assert_eq!(info.consecutive_failures(), 0);
+		assert_eq!(info.times_ejected(), 0);
+	}
+
+	// --- EndpointSet eviction integration ---
+
+	#[tokio::test]
+	async fn endpoint_set_eviction_and_uneviction() {
+		let key: Strng = "ep1".into();
+		let eps = EndpointSet::new(vec![vec![(key.clone(), "backend1")]]);
+
+		// Endpoint is initially in the active set
+		let group = eps.best_bucket();
+		assert!(group.active.contains_key(&key));
+		assert!(!group.rejected.contains_key(&key));
+
+		// Start a request and finish with eviction
+		let info = group.active.get(&key).unwrap().info.clone();
+		let handle = eps.start_request(key.clone(), &info);
+		handle.finish_request(
+			false,
+			Duration::from_millis(10),
+			Some(Duration::from_millis(100)),
+			Some(1.0),
+		);
+
+		// Give the eviction event time to be processed
+		tokio::time::sleep(Duration::from_millis(50)).await;
+
+		// Endpoint should now be rejected
+		let group = eps.best_bucket();
+		assert!(
+			group.rejected.contains_key(&key),
+			"endpoint should be evicted"
+		);
+
+		// Wait for uneviction (100ms eviction duration + buffer)
+		tokio::time::sleep(Duration::from_millis(150)).await;
+
+		// Endpoint should be back in active with health reset to 1.0
+		let group = eps.best_bucket();
+		assert!(
+			group.active.contains_key(&key),
+			"endpoint should be unevicted"
+		);
+		let ep_info = &group.active.get(&key).unwrap().info;
+		assert_eq!(ep_info.health_score(), 1.0, "health should be reset to 1.0");
+	}
+
+	#[tokio::test]
+	async fn endpoint_set_uneviction_restore_health_zero() {
+		let key: Strng = "ep1".into();
+		let eps = EndpointSet::new(vec![vec![(key.clone(), "backend1")]]);
+
+		let group = eps.best_bucket();
+		let info = group.active.get(&key).unwrap().info.clone();
+		let handle = eps.start_request(key.clone(), &info);
+		handle.finish_request(
+			false,
+			Duration::from_millis(10),
+			Some(Duration::from_millis(100)),
+			Some(0.0),
+		);
+
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		let group = eps.best_bucket();
+		assert!(group.rejected.contains_key(&key));
+
+		// Wait for uneviction
+		tokio::time::sleep(Duration::from_millis(150)).await;
+
+		let group = eps.best_bucket();
+		assert!(group.active.contains_key(&key));
+		let ep_info = &group.active.get(&key).unwrap().info;
+		assert_eq!(
+			ep_info.health_score(),
+			0.0,
+			"health should be set to 0.0 on uneviction"
+		);
+	}
+
+	#[tokio::test]
+	async fn endpoint_set_uneviction_no_restore_health() {
+		let key: Strng = "ep1".into();
+		let eps = EndpointSet::new(vec![vec![(key.clone(), "backend1")]]);
+
+		let group = eps.best_bucket();
+		let info = group.active.get(&key).unwrap().info.clone();
+
+		// Record a failure to lower health before eviction
+		info.health.record(0.0); // 0.3*0 + 0.7*1.0 = 0.7
+
+		let handle = eps.start_request(key.clone(), &info);
+		handle.finish_request(
+			false,
+			Duration::from_millis(10),
+			Some(Duration::from_millis(100)),
+			None,
+		);
+
+		tokio::time::sleep(Duration::from_millis(50)).await;
+
+		// Wait for uneviction
+		tokio::time::sleep(Duration::from_millis(150)).await;
+
+		let group = eps.best_bucket();
+		assert!(group.active.contains_key(&key));
+		let ep_info = &group.active.get(&key).unwrap().info;
+		// Health was recorded as 0.0 in finish_request (failure),
+		// starting from 0.7: 0.3*0 + 0.7*0.7 = 0.49
+		assert!(
+			(ep_info.health_score() - 0.49).abs() < 1e-10,
+			"health should be unchanged from pre-eviction EWMA, got {}",
+			ep_info.health_score()
+		);
+	}
+
+	#[test]
+	fn consecutive_failures_increments_on_failure() {
+		let info = EndpointInfo::default();
+		assert_eq!(info.consecutive_failures(), 0);
+
+		info
+			.consecutive_failures
+			.fetch_add(1, AtomicOrdering::Relaxed);
+		assert_eq!(info.consecutive_failures(), 1);
+
+		info
+			.consecutive_failures
+			.fetch_add(1, AtomicOrdering::Relaxed);
+		assert_eq!(info.consecutive_failures(), 2);
+	}
+
+	#[test]
+	fn consecutive_failures_not_reset_by_uneviction() {
+		let info = EndpointInfo::default();
+		// Simulate 3 failures
+		info.consecutive_failures.store(3, AtomicOrdering::Relaxed);
+		// Simulate what uneviction does: only resets health, not consecutive_failures
+		info.health.set(1.0);
+		assert_eq!(
+			info.consecutive_failures(),
+			3,
+			"consecutive_failures should NOT be reset on uneviction"
+		);
+	}
+}

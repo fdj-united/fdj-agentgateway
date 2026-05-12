@@ -1,0 +1,1056 @@
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::Instant;
+
+use ::http::StatusCode;
+use ::http::header::CONTENT_TYPE;
+use ::http::request::Parts;
+use agent_core::version::BuildInfo;
+use anyhow::anyhow;
+use futures_util::StreamExt;
+use headers::HeaderMapExt;
+use rmcp::model::{
+	CallToolResult, ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest,
+	ConstString, Content, Implementation, InitializeRequest, JsonRpcRequest, ProtocolVersion,
+	RequestId, RootsCapabilities, ServerJsonRpcMessage, ServerResult,
+};
+use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
+use sse_stream::{KeepAlive, Sse, SseBody, SseStream};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Mutex;
+
+use crate::http::Response;
+use crate::mcp::handler::{Relay, RelayInputs};
+use crate::mcp::mergestream::Messages;
+use crate::mcp::streamablehttp::{ServerSseMessage, StreamableHttpPostResponse};
+use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
+use crate::mcp::{ClientError, rbac};
+use crate::proxy::ProxyError;
+use crate::{mcp, *};
+
+/// Per-tool call counter for the rate limit window.
+#[derive(Debug, Clone)]
+struct RateLimitEntry {
+	count: u32,
+	window_started_at: Instant,
+}
+
+impl RateLimitEntry {
+	fn new() -> Self {
+		Self { count: 1, window_started_at: Instant::now() }
+	}
+
+	/// Returns whether the window has expired and resets it if so.
+	/// Returns the current count (after incrementing if still in window).
+	fn increment_or_reset(&mut self, window: std::time::Duration) -> u32 {
+		if Instant::now().duration_since(self.window_started_at) >= window {
+			self.count = 1;
+			self.window_started_at = Instant::now();
+		} else {
+			self.count += 1;
+		}
+		self.count
+	}
+}
+
+/// A tool call intercepted by the two-phase confirmation flow.
+/// Stored per-session, keyed by `(tool_name, args_hash)` so that:
+///   - parallel calls with different args each get their own pending entry
+///     (they no longer collide on tool-name alone), and
+///   - a confirmation re-call only matches when the LLM re-issues IDENTICAL
+///     args, defeating attempts to swap recipient/payload after approval.
+/// Single-use: consumed on Phase 2.
+#[derive(Debug, Clone)]
+struct PendingApproval {
+	expires_at: Instant,
+}
+
+impl PendingApproval {
+	fn new(ttl: std::time::Duration) -> Self {
+		Self {
+			expires_at: Instant::now() + ttl,
+		}
+	}
+
+	fn is_expired(&self) -> bool {
+		Instant::now() > self.expires_at
+	}
+}
+
+/// Order-independent hash of a JSON value: object keys are sorted before hashing
+/// so two semantically-equal arg maps produce the same hash regardless of how
+/// the LLM serialized them.
+fn hash_value(v: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
+	use serde_json::Value;
+	use std::hash::Hash;
+	match v {
+		Value::Null => 0u8.hash(hasher),
+		Value::Bool(b) => {
+			1u8.hash(hasher);
+			b.hash(hasher);
+		},
+		Value::Number(n) => {
+			2u8.hash(hasher);
+			n.to_string().hash(hasher);
+		},
+		Value::String(s) => {
+			3u8.hash(hasher);
+			s.hash(hasher);
+		},
+		Value::Array(arr) => {
+			4u8.hash(hasher);
+			arr.len().hash(hasher);
+			for item in arr {
+				hash_value(item, hasher);
+			}
+		},
+		Value::Object(map) => {
+			5u8.hash(hasher);
+			let mut keys: Vec<&String> = map.keys().collect();
+			keys.sort();
+			keys.len().hash(hasher);
+			for k in keys {
+				k.hash(hasher);
+				hash_value(map.get(k).unwrap(), hasher);
+			}
+		},
+	}
+}
+
+pub(crate) fn hash_args(args: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	match args {
+		Some(map) => {
+			let v = serde_json::Value::Object(map.clone());
+			hash_value(&v, &mut hasher);
+		},
+		None => 0u8.hash(&mut hasher),
+	}
+	hasher.finish()
+}
+
+#[derive(Debug, Clone)]
+pub struct Session {
+	encoder: http::sessionpersistence::Encoder,
+	relay: Arc<Relay>,
+	pub id: Arc<str>,
+	tx: Option<Sender<ServerJsonRpcMessage>>,
+	/// Pending two-phase confirmations, keyed by `<tool-name>|<args-hash>`.
+	/// Arc allows the HashMap to be shared across Session clones (same session, multiple requests).
+	pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+	/// Per-tool call counters for rate limiting, keyed by fully-qualified tool name.
+	tool_call_counts: Arc<Mutex<HashMap<String, RateLimitEntry>>>,
+	/// Whether this session was created in stateful mode (confirmation requires statefulness).
+	is_stateful: bool,
+}
+
+impl Session {
+	/// send a message to upstream server(s)
+	pub async fn send(
+		&mut self,
+		parts: Parts,
+		message: ClientJsonRpcMessage,
+	) -> Result<Response, ProxyError> {
+		let req_id = match &message {
+			ClientJsonRpcMessage::Request(r) => Some(r.id.clone()),
+			_ => None,
+		};
+		Self::handle_error(req_id, self.send_internal(parts, message).await).await
+	}
+
+	/// send a message to upstream server(s), when using stateless mode. In stateless mode, every message
+	/// is wrapped in an InitializeRequest (except the actual InitializeRequest from the downstream).
+	/// This ensures servers that require an InitializeRequest behave correctly.
+	/// In the future, we may have a mode where we know the downstream is stateless as well, and can just forward as-is.
+	pub async fn stateless_send_and_initialize(
+		&mut self,
+		parts: Parts,
+		message: ClientJsonRpcMessage,
+	) -> Result<Response, ProxyError> {
+		let (req_id, request_type) = match &message {
+			ClientJsonRpcMessage::Request(r) => (Some(r.id.clone()), Some(&r.request)),
+			_ => (None, None),
+		};
+		let is_init = request_type.is_some_and(|r| matches!(r, ClientRequest::InitializeRequest(_)));
+		if !is_init {
+			let init_request = rmcp::model::InitializeRequest::new(get_client_info());
+			// first, determine how widely to send the initialize
+			match request_type {
+				Some(ClientRequest::CallToolRequest(_)) | Some(ClientRequest::GetPromptRequest(_)) => {
+					// Single-target methods only hit one backend, so initialize/initialized should be scoped
+					// to that backend rather than fanning out.
+					let name = match request_type {
+						Some(ClientRequest::CallToolRequest(ctr)) => ctr.params.name.to_string(),
+						Some(ClientRequest::GetPromptRequest(gpr)) => gpr.params.name.clone(),
+						_ => unreachable!("match arm guarantees single-target request type"),
+					};
+					let (service_name, _) = match self.relay.parse_resource_name(&name) {
+						Ok(target) => target,
+						Err(err) => return Self::handle_error(req_id.clone(), Err(err)).await,
+					};
+					let res = self
+						.send_init_single(parts.clone(), init_request, service_name)
+						.await;
+					if let Some(sessions) = self.relay.get_sessions() {
+						let s = http::sessionpersistence::SessionState::MCP(
+							http::sessionpersistence::MCPSessionState::new(sessions),
+						);
+						if let Ok(id) = s.encode(&self.encoder) {
+							self.id = id.into();
+						}
+					}
+					Self::handle_error(Some(RequestId::Number(0)), res).await?;
+					// Now send the initialized notification
+					let _ = Self::handle_error(
+						None,
+						self
+							.send_initialized_notification_single(parts.clone(), service_name)
+							.await,
+					)
+					.await?;
+				},
+				_ => {
+					// We should fan out the initialize request to all MCP servers
+					let _ = self
+						.send(
+							parts.clone(),
+							ClientJsonRpcMessage::request(init_request.into(), RequestId::Number(0)),
+						)
+						.await?;
+					let notification = ClientJsonRpcMessage::notification(
+						rmcp::model::InitializedNotification {
+							method: Default::default(),
+							extensions: Default::default(),
+						}
+						.into(),
+					);
+					let _ = self.send(parts.clone(), notification).await?;
+				},
+			}
+		}
+		// Now we can send the message like normal (if it's tools/call, it'll go to the initialized target)
+		self.send(parts, message).await
+	}
+
+	pub fn with_inputs(mut self, inputs: RelayInputs) -> Self {
+		self.relay = Arc::new(self.relay.with_policies(inputs.policies));
+		// pending_approvals and is_stateful are intentionally preserved across with_inputs calls
+		self
+	}
+
+	/// delete any active sessions
+	pub async fn delete_session(&self, parts: Parts) -> Result<Response, ProxyError> {
+		let ctx = IncomingRequestContext::new(&parts);
+		let (_span, log, _cel) = mcp::handler::setup_request_log(parts, "delete_session");
+		let session_id = self.id.to_string();
+		log.non_atomic_mutate(|l| {
+			// NOTE: l.method_name keep None to respect the metrics logic: not handle GET, DELETE.
+			l.session_id = Some(session_id);
+		});
+		Self::handle_error(None, self.relay.send_fanout_deletion(ctx).await).await
+	}
+
+	/// forward_legacy_sse takes an upstream Response and forwards all messages to the SSE data stream.
+	/// In SSE, POST requests always just get a 202 response and the messages go on a separate stream.
+	/// Note: its plausible we could rewrite the rest of the proxy to return a more structured type than
+	/// `Response` here, so we don't have to re-process it. However, since SSE is deprecated its best to
+	/// optimize for the non-deprecated code paths; this works fine.
+	pub async fn forward_legacy_sse(&self, resp: Response) -> Result<(), ClientError> {
+		let Some(tx) = self.tx.clone() else {
+			return Err(ClientError::new(anyhow!(
+				"may only be called for SSE streams",
+			)));
+		};
+		let content_type = resp.headers().get(CONTENT_TYPE);
+		let sse = match content_type {
+			Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
+				trace!("forward SSE got SSE stream response");
+				let content_encoding = resp.headers().typed_get::<headers::ContentEncoding>();
+				let (body, _encoding) =
+					crate::http::compression::decompress_body(resp.into_body(), content_encoding.as_ref())
+						.map_err(ClientError::new)?;
+				let event_stream = SseStream::from_byte_stream(body.into_data_stream()).boxed();
+				StreamableHttpPostResponse::Sse(event_stream, None)
+			},
+			Some(ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
+				trace!("forward SSE got single JSON response");
+				let message = json::from_response_body::<ServerJsonRpcMessage>(resp)
+					.await
+					.map_err(ClientError::new)?;
+				StreamableHttpPostResponse::Json(message, None)
+			},
+			_ => {
+				trace!("forward SSE got accepted, no action needed");
+				return Ok(());
+			},
+		};
+		let mut ms: Messages = sse.try_into()?;
+		tokio::spawn(async move {
+			while let Some(Ok(msg)) = ms.next().await {
+				let Ok(()) = tx.send(msg).await else {
+					return;
+				};
+			}
+		});
+		Ok(())
+	}
+
+	/// get_stream establishes a stream for server-sent messages
+	pub async fn get_stream(&self, parts: Parts) -> Result<Response, ProxyError> {
+		let ctx = IncomingRequestContext::new(&parts);
+		let (_span, log, _cel) = mcp::handler::setup_request_log(parts, "get_stream");
+		let session_id = self.id.to_string();
+		log.non_atomic_mutate(|l| {
+			// NOTE: l.method_name keep None to respect the metrics logic: which do not want to handle GET, DELETE.
+			l.session_id = Some(session_id);
+		});
+		Self::handle_error(None, self.relay.send_fanout_get(ctx).await).await
+	}
+
+	async fn handle_error(
+		req_id: Option<RequestId>,
+		d: Result<Response, UpstreamError>,
+	) -> Result<Response, ProxyError> {
+		match d {
+			Ok(r) => Ok(r),
+			Err(UpstreamError::Http(ClientError::Status(resp))) => {
+				let resp = http::SendDirectResponse::new(*resp)
+					.await
+					.map_err(ProxyError::Body)?;
+				Err(mcp::Error::UpstreamError(Box::new(resp)).into())
+			},
+			Err(UpstreamError::Proxy(p)) => Err(p),
+			Err(UpstreamError::Authorization {
+				resource_type,
+				resource_name,
+			}) if req_id.is_some() => {
+				Err(mcp::Error::Authorization(req_id.unwrap(), resource_type, resource_name).into())
+			},
+			// TODO: this is too broad. We have a big tangle of errors to untangle though
+			Err(e) => Err(mcp::Error::SendError(req_id, e.to_string()).into()),
+		}
+	}
+
+	async fn send_init_single(
+		&self,
+		parts: Parts,
+		mut init_request: InitializeRequest,
+		service_name: &str,
+	) -> Result<Response, UpstreamError> {
+		let method = init_request.method.as_str().to_string();
+		let ctx = IncomingRequestContext::new(&parts);
+		let (_, log, _) = mcp::handler::setup_request_log(parts, &method);
+		let session_id = self.id.to_string();
+		log.non_atomic_mutate(|l| {
+			l.method_name = Some(method.clone());
+			l.session_id = Some(session_id);
+		});
+
+		init_request.params.capabilities.roots = self.get_roots_capabilities();
+		self
+			.relay
+			.send_single(
+				JsonRpcRequest::new(RequestId::Number(0), init_request.into()),
+				ctx,
+				service_name,
+				Some(log),
+			)
+			.await
+	}
+
+	async fn send_initialized_notification_single(
+		&self,
+		parts: Parts,
+		service_name: &str,
+	) -> Result<Response, UpstreamError> {
+		let initialized = rmcp::model::InitializedNotification {
+			method: Default::default(),
+			extensions: Default::default(),
+		};
+		let method = initialized.method.as_str().to_string();
+		let ctx = IncomingRequestContext::new(&parts);
+		let (_, log, _) = mcp::handler::setup_request_log(parts, &method);
+		let session_id = self.id.to_string();
+		log.non_atomic_mutate(|l| {
+			l.method_name = Some(method.clone());
+			l.session_id = Some(session_id);
+		});
+
+		self
+			.relay
+			.send_notification_single(initialized.into(), ctx, service_name)
+			.await
+	}
+
+	async fn send_internal(
+		&mut self,
+		parts: Parts,
+		message: ClientJsonRpcMessage,
+	) -> Result<Response, UpstreamError> {
+		// Sending a message entails fanning out the message to each upstream, and then aggregating the responses.
+		// The responses may include any number of notifications on the same HTTP response, and then finish with the
+		// response to the request.
+		// To merge these, we use a MergeStream which will join all of the notifications together, and then apply
+		// some per-request merge logic across all the responses.
+		// For example, this may return [server1-notification, server2-notification, server2-notification, merge(server1-response, server2-response)].
+		// It's very common to not have any notifications, though.
+		match message {
+			ClientJsonRpcMessage::Request(mut r) => {
+				let method = r.request.method().to_string();
+				let ctx = IncomingRequestContext::new(&parts);
+				let (mut span, log, cel) = mcp::handler::setup_request_log(parts, &method);
+				let session_id = self.id.to_string();
+				log.non_atomic_mutate(|l| {
+					l.method_name = Some(method.clone());
+					l.session_id = Some(session_id);
+				});
+				match &mut r.request {
+					ClientRequest::InitializeRequest(ir) => {
+						// Currently, we cannot support roots until we have a mapping of downstream and upstream ID.
+						// However, the clients can tell the server they support roots.
+						// Instead, we hijack this to tell them not to so they do not send requests that we cannot
+						// actually support
+						// This could probably be more easily done without multiplexing but for now neither supports.
+						ir.params.capabilities.roots = self.get_roots_capabilities();
+
+						let pv = ir.params.protocol_version.clone();
+						let res = self
+							.relay
+							.send_fanout(
+								r,
+								ctx,
+								self
+									.relay
+									.merge_initialize(pv, self.relay.is_multiplexing()),
+							)
+							.await;
+						if let Some(sessions) = self.relay.get_sessions() {
+							let s = http::sessionpersistence::SessionState::MCP(
+								http::sessionpersistence::MCPSessionState::new(sessions),
+							);
+							if let Ok(id) = s.encode(&self.encoder) {
+								self.id = id.into();
+							}
+						}
+						res
+					},
+					ClientRequest::ListToolsRequest(_) => {
+						self
+							.relay
+							.send_fanout(r, ctx, self.relay.merge_tools(cel))
+							.await
+					},
+					// TODO(keithmattix): should we forward pings or should we do our own independent pings
+					// as heuristic for the connection pool (and handle client pings as a local reply from agentgateway)?
+					ClientRequest::PingRequest(_) | ClientRequest::SetLevelRequest(_) => {
+						self
+							.relay
+							.send_fanout(r, ctx, self.relay.merge_empty())
+							.await
+					},
+					ClientRequest::ListPromptsRequest(_) => {
+						self
+							.relay
+							.send_fanout(r, ctx, self.relay.merge_prompts(cel))
+							.await
+					},
+					ClientRequest::ListResourcesRequest(_) => {
+						if !self.relay.is_multiplexing() {
+							self
+								.relay
+								.send_fanout(r, ctx, self.relay.merge_resources(cel))
+								.await
+						} else {
+							// TODO(https://github.com/agentgateway/agentgateway/issues/404)
+							// Find a mapping of URL
+							Err(UpstreamError::InvalidMethodWithMultiplexing(
+								r.request.method().to_string(),
+							))
+						}
+					},
+					ClientRequest::ListResourceTemplatesRequest(_) => {
+						if !self.relay.is_multiplexing() {
+							self
+								.relay
+								.send_fanout(r, ctx, self.relay.merge_resource_templates(cel))
+								.await
+						} else {
+							// TODO(https://github.com/agentgateway/agentgateway/issues/404)
+							// Find a mapping of URL
+							Err(UpstreamError::InvalidMethodWithMultiplexing(
+								r.request.method().to_string(),
+							))
+						}
+					},
+					ClientRequest::CallToolRequest(ctr) => {
+						let name = ctr.params.name.clone();
+						let (service_name, tool) = self.relay.parse_resource_name(&name)?;
+						span.rename_span(format!("{method} {service_name}"));
+						let call_arguments = ctr.params.arguments.clone();
+
+						// ── Pending-approval clear (sentinel short-circuit) ──
+						// If the LLM (i.e. LibreChat) sent the clear sentinel,
+						// strip the sentinel from a clone of the args, re-derive
+						// the same (tool, hash(stripped_args)) key Phase 1 used,
+						// remove the matching pending entry if present, and return
+						// a {cleared: ...} result. NEVER forwards upstream and
+						// bypasses ALL other policy checks (auth, rate-limit,
+						// arg-rewrite, confirmation). See spec §3 + §6.
+						if let Some(args) = call_arguments.as_ref()
+							&& matches!(
+								args.get(crate::mcp::MCP_CLEAR_PENDING_SENTINEL),
+								Some(serde_json::Value::Bool(true))
+							) {
+							// Compute the same lookup key Phase 1 uses.
+							let cleared = if self.is_stateful {
+								let mut stripped = call_arguments.clone();
+								if let Some(map) = stripped.as_mut() {
+									map.remove(crate::mcp::MCP_CLEAR_PENDING_SENTINEL);
+								}
+								let key = self.pending_approval_key(&name, tool, &stripped);
+								let mut approvals = self.pending_approvals.lock().await;
+								approvals.remove(&key).is_some()
+							} else {
+								// Stateless session has no pending_approvals at
+								// all — clear is trivially a no-op.
+								false
+							};
+							let body = if cleared {
+								"{\"cleared\":true}"
+							} else {
+								"{\"cleared\":false}"
+							};
+							let msg = ServerJsonRpcMessage::response(
+								ServerResult::CallToolResult(
+									CallToolResult::success(vec![Content::text(body)]),
+								),
+								r.id.clone(),
+							);
+							use futures_util::stream;
+							return crate::mcp::handler::messages_to_response(
+								r.id,
+								stream::once(async move { Ok(msg) }),
+								None,
+							);
+						}
+						// ── End pending-approval clear ──
+
+						log.non_atomic_mutate(|l| {
+							l.set_tool(service_name.to_string(), tool.to_string());
+							l.capture_call_arguments(call_arguments.clone());
+						});
+						let resource = rbac::ResourceType::Tool(rbac::ResourceId::new(
+							service_name.to_string(),
+							tool.to_string(),
+						));
+						if !self.relay.policies.validate(&resource, &cel) {
+							return Err(UpstreamError::Authorization {
+								resource_type: "tool".to_string(),
+								resource_name: name.to_string(),
+							});
+						}
+
+						// ── Per-session rate limit ───────────────────────────────
+						if self.is_stateful
+							&& self.relay.rate_limit.is_limited(&resource, &cel)
+						{
+							let mut counts = self.tool_call_counts.lock().await;
+							let count = counts
+								.entry(name.to_string())
+								.or_insert_with(RateLimitEntry::new)
+								.increment_or_reset(self.relay.rate_limit.window);
+
+							if count > self.relay.rate_limit.max_calls {
+								drop(counts);
+								let payload = serde_json::json!({
+									"error": "rate_limit_exceeded",
+									"message": format!(
+										"Tool '{}' has been called {} times within the {}s window. Maximum allowed: {}.",
+										tool,
+										count,
+										self.relay.rate_limit.window.as_secs(),
+										self.relay.rate_limit.max_calls,
+									)
+								});
+								let text = serde_json::to_string_pretty(&payload)
+									.unwrap_or_default();
+								let msg = ServerJsonRpcMessage::response(
+									ServerResult::CallToolResult(CallToolResult::success(vec![
+										Content::text(text),
+									])),
+									r.id.clone(),
+								);
+								use futures_util::stream;
+								return crate::mcp::handler::messages_to_response(
+									r.id,
+									stream::once(async move { Ok(msg) }),
+									None,
+								);
+							}
+						}
+						// ── End rate limit ───────────────────────────────────────
+
+						// ── Two-phase confirmation ───────────────────────────────
+						if self.is_stateful
+							&& self.relay.confirmation.requires_confirmation(&resource, &cel)
+						{
+							// Build the call key from (tool name, args hash). Different parallel
+							// calls with different args get separate pending entries; a confirmation
+							// re-call only matches when the LLM re-issues IDENTICAL args.
+							//
+							// Hash a STRIPPED clone of the args so an enrichment-injected
+							// synthetic display field varying between Phase 1 and Phase 2
+							// doesn't break the pending-approval match (spec §6).
+							// build_presentation below still uses the ORIGINAL args (with
+							// the synthetic field present) to populate the modal.
+							let key = self.pending_approval_key(&name, tool, &call_arguments);
+
+							let mut approvals = self.pending_approvals.lock().await;
+
+							if let Some(pending) = approvals.get(&key) {
+								if pending.is_expired() {
+									// Expired → drop it and fall through to Phase 1
+									approvals.remove(&key);
+								} else {
+									// Phase 2: matching pending → consume and execute upstream
+									approvals.remove(&key);
+									drop(approvals);
+									let tn = tool.to_string();
+									ctr.params.name = tn.into();
+									// Strip BEFORE arg_rewrite + upstream forward, so the
+									// upstream MCP server never sees fields it didn't define.
+									self.relay.enrichment.strip(tool, &mut ctr.params.arguments);
+									self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
+									return self
+										.relay
+										.send_single(r, ctx, service_name, Some(log.clone()))
+										.await;
+								}
+							}
+
+							// Phase 1: store pending for this exact (tool, args) call signature
+							let ttl = self.relay.confirmation.ttl;
+							approvals.insert(key, PendingApproval::new(ttl));
+							drop(approvals);
+
+							let preview = build_preview(tool, call_arguments.as_ref());
+							let presentation = self
+								.relay
+								.confirmation
+								.build_presentation(tool, call_arguments.as_ref());
+
+							let mut payload = serde_json::json!({
+								"confirmationRequired": true,
+								"preview": preview,
+								"expiresInSeconds": ttl.as_secs(),
+								"instruction": concat!(
+									"STOP. Do NOT re-call this tool automatically. ",
+									"Show the preview above to the user and ask: ",
+									"\"Do you confirm this operation? (yes/no)\". ",
+									"Only re-call this tool with IDENTICAL arguments after the ",
+									"user explicitly replies \"yes\". ",
+									"Do NOT modify the arguments in any way."
+								)
+							});
+							if let Some(pres) = presentation {
+								if let serde_json::Value::Object(map) = &mut payload {
+									map.insert("presentation".to_string(), pres);
+								}
+							}
+							let text = serde_json::to_string_pretty(&payload)
+								.unwrap_or_default();
+							let msg = ServerJsonRpcMessage::response(
+								ServerResult::CallToolResult(CallToolResult::success(vec![
+									Content::text(text),
+								])),
+								r.id.clone(),
+							);
+							use futures_util::stream;
+							return crate::mcp::handler::messages_to_response(
+								r.id,
+								stream::once(async move { Ok(msg) }),
+								None,
+							);
+						}
+						// ── End two-phase confirmation ───────────────────────────
+
+						let tn = tool.to_string();
+						ctr.params.name = tn.into();
+						// Strip BEFORE arg_rewrite + upstream forward — handles the case
+						// where a tool has enrichment configured but no mcpConfirmation;
+						// the upstream still must not see the synthetic field.
+						self.relay.enrichment.strip(tool, &mut ctr.params.arguments);
+						self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
+						self
+							.relay
+							.send_single(r, ctx, service_name, Some(log.clone()))
+							.await
+					},
+					ClientRequest::GetPromptRequest(gpr) => {
+						let name = gpr.params.name.clone();
+						let (service_name, prompt) = self.relay.parse_resource_name(&name)?;
+						span.rename_span(format!("{method} {service_name}"));
+						log.non_atomic_mutate(|l| {
+							l.set_prompt(service_name.to_string(), prompt.to_string());
+						});
+						if !self.relay.policies.validate(
+							&rbac::ResourceType::Prompt(rbac::ResourceId::new(
+								service_name.to_string(),
+								prompt.to_string(),
+							)),
+							&cel,
+						) {
+							return Err(UpstreamError::Authorization {
+								resource_type: "prompt".to_string(),
+								resource_name: name.to_string(),
+							});
+						}
+						gpr.params.name = prompt.to_string();
+						self.relay.send_single(r, ctx, service_name, None).await
+					},
+					ClientRequest::ReadResourceRequest(rrr) => {
+						if let Some(service_name) = self.relay.default_target_name() {
+							let uri = rrr.params.uri.clone();
+							span.rename_span(format!("{method} {service_name}"));
+							log.non_atomic_mutate(|l| {
+								l.set_resource(service_name.to_string(), uri.to_string());
+							});
+							if !self.relay.policies.validate(
+								&rbac::ResourceType::Resource(rbac::ResourceId::new(
+									service_name.to_string(),
+									uri.to_string(),
+								)),
+								&cel,
+							) {
+								return Err(UpstreamError::Authorization {
+									resource_type: "resource".to_string(),
+									resource_name: uri.to_string(),
+								});
+							}
+							self
+								.relay
+								.send_single_without_multiplexing(r, ctx, None)
+								.await
+						} else {
+							// TODO(https://github.com/agentgateway/agentgateway/issues/404)
+							// Find a mapping of URL
+							Err(UpstreamError::InvalidMethodWithMultiplexing(
+								r.request.method().to_string(),
+							))
+						}
+					},
+
+					ClientRequest::ListTasksRequest(_)
+					| ClientRequest::GetTaskInfoRequest(_)
+					| ClientRequest::GetTaskResultRequest(_)
+					| ClientRequest::CancelTaskRequest(_)
+					| ClientRequest::SubscribeRequest(_)
+					| ClientRequest::UnsubscribeRequest(_)
+					| ClientRequest::CustomRequest(_) => {
+						// TODO(https://github.com/agentgateway/agentgateway/issues/404)
+						Err(UpstreamError::InvalidMethod(r.request.method().to_string()))
+					},
+					ClientRequest::CompleteRequest(_) => {
+						// For now, we don't have a sane mapping of incoming requests to a specific
+						// downstream service when multiplexing. Only forward when we have only one backend.
+						self
+							.relay
+							.send_single_without_multiplexing(r, ctx, None)
+							.await
+					},
+				}
+			},
+			ClientJsonRpcMessage::Notification(r) => {
+				let method = match &r.notification {
+					ClientNotification::CancelledNotification(r) => r.method.as_str(),
+					ClientNotification::ProgressNotification(r) => r.method.as_str(),
+					ClientNotification::InitializedNotification(r) => r.method.as_str(),
+					ClientNotification::RootsListChangedNotification(r) => r.method.as_str(),
+					ClientNotification::CustomNotification(r) => r.method.as_str(),
+				};
+				let ctx = IncomingRequestContext::new(&parts);
+				let (_span, log, _cel) = mcp::handler::setup_request_log(parts, method);
+				let session_id = self.id.to_string();
+				log.non_atomic_mutate(|l| {
+					l.method_name = Some(method.to_string());
+					l.session_id = Some(session_id);
+				});
+				// TODO: the notification needs to be fanned out in some cases and sent to a single one in others
+				// however, we don't have a way to map to the correct service yet
+				self.relay.send_notification(r, ctx).await
+			},
+
+			_ => Err(UpstreamError::InvalidRequest(
+				"unsupported message type".to_string(),
+			)),
+		}
+	}
+
+	fn get_roots_capabilities(&self) -> Option<RootsCapabilities> {
+		None
+	}
+
+	/// Compute the `(tool, args-hash)` key used to track a pending approval.
+	/// Both the Phase-1 store path AND the clear-sentinel evict path MUST go
+	/// through this helper so the two stay in lock-step. If a future change
+	/// adds a normalization step (e.g. dropping nulls, sorting keys), it lands
+	/// here once and both call sites pick it up automatically.
+	///
+	/// The caller is responsible for removing any non-payload sentinel args
+	/// (e.g. `MCP_CLEAR_PENDING_SENTINEL`) from `args` before calling this —
+	/// the helper just runs the standard strip + hash sequence.
+	fn pending_approval_key(
+		&self,
+		name: &str,
+		tool: &str,
+		args: &Option<serde_json::Map<String, serde_json::Value>>,
+	) -> String {
+		let mut for_hash = args.clone();
+		self.relay.enrichment.strip(tool, &mut for_hash);
+		format!("{}|{:016x}", name, hash_args(for_hash.as_ref()))
+	}
+}
+
+#[derive(Debug)]
+pub struct SessionManager {
+	encoder: http::sessionpersistence::Encoder,
+	sessions: RwLock<HashMap<String, Session>>,
+}
+
+fn session_id() -> Arc<str> {
+	uuid::Uuid::new_v4().to_string().into()
+}
+
+impl SessionManager {
+	pub fn new(encoder: http::sessionpersistence::Encoder) -> Self {
+		Self {
+			encoder,
+			sessions: Default::default(),
+		}
+	}
+
+	pub fn get_session(&self, id: &str, builder: RelayInputs) -> Option<Session> {
+		Some(
+			self
+				.sessions
+				.read()
+				.ok()?
+				.get(id)
+				.cloned()?
+				.with_inputs(builder),
+		)
+	}
+
+	pub fn get_or_resume_session(
+		&self,
+		id: &str,
+		builder: RelayInputs,
+	) -> Result<Option<Session>, mcp::Error> {
+		if let Some(s) = self.sessions.read().expect("poisoned").get(id).cloned() {
+			return Ok(Some(s.with_inputs(builder)));
+		}
+		let d = http::sessionpersistence::SessionState::decode(id, &self.encoder)
+			.map_err(|_| mcp::Error::InvalidSessionIdHeader)?;
+		let http::sessionpersistence::SessionState::MCP(state) = d else {
+			return Ok(None);
+		};
+		let relay = builder.build_new_connections()?;
+		if let Err(err) = relay.set_sessions(state.sessions) {
+			warn!("failed to resume session: {err}");
+			return Ok(None);
+		}
+
+		let sess = Session {
+			id: id.into(),
+			relay: Arc::new(relay),
+			tx: None,
+			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
+		};
+		let mut sm = self.sessions.write().expect("write lock");
+		sm.insert(id.to_string(), sess.clone());
+		Ok(Some(sess))
+	}
+
+	/// create_session establishes an MCP session.
+	pub fn create_session(&self, relay: Relay) -> Session {
+		let id = session_id();
+
+		// Do NOT insert yet
+		Session {
+			id: id.clone(),
+			relay: Arc::new(relay),
+			tx: None,
+			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
+		}
+	}
+
+	pub fn insert_session(&self, sess: Session) {
+		let mut sm = self.sessions.write().expect("write lock");
+		sm.insert(sess.id.to_string(), sess);
+	}
+
+	/// create_stateless_session creates a session for stateless mode.
+	/// Unlike create_session, this does NOT register the session in the session manager.
+	/// The caller is responsible for calling session.delete_session() when done
+	/// to clean up upstream resources (e.g., stdio processes).
+	/// NOTE: two-phase confirmation is disabled for stateless sessions because
+	/// the session state is not preserved between requests.
+	pub fn create_stateless_session(&self, relay: Relay) -> Session {
+		let id = session_id();
+		Session {
+			id,
+			relay: Arc::new(relay),
+			tx: None,
+			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: false,
+		}
+	}
+
+	/// create_legacy_session establishes a legacy SSE session.
+	/// These will have the ability to send messages to them via a channel.
+	pub fn create_legacy_session(&self, relay: Relay) -> (Session, Receiver<ServerJsonRpcMessage>) {
+		let (tx, rx) = tokio::sync::mpsc::channel(64);
+		let id = session_id();
+		let sess = Session {
+			id: id.clone(),
+			relay: Arc::new(relay),
+			tx: Some(tx),
+			encoder: self.encoder.clone(),
+			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			is_stateful: true,
+		};
+		let mut sm = self.sessions.write().expect("write lock");
+		sm.insert(id.to_string(), sess.clone());
+		(sess, rx)
+	}
+
+	pub async fn delete_session(&self, id: &str, parts: Parts) -> Option<Response> {
+		let sess = {
+			let mut sm = self.sessions.write().expect("write lock");
+			sm.remove(id)?
+		};
+		// Swallow the error
+		sess.delete_session(parts).await.ok()
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionDropper {
+	sm: Arc<SessionManager>,
+	s: Option<(Session, Parts)>,
+}
+
+/// Dropper returns a handle that, when dropped, removes the session
+pub fn dropper(sm: Arc<SessionManager>, s: Session, parts: Parts) -> SessionDropper {
+	SessionDropper {
+		sm,
+		s: Some((s, parts)),
+	}
+}
+
+impl Drop for SessionDropper {
+	fn drop(&mut self) {
+		let Some((s, parts)) = self.s.take() else {
+			return;
+		};
+		let mut sm = self.sm.sessions.write().expect("write lock");
+		debug!("delete session {}", s.id);
+		sm.remove(s.id.as_ref());
+		tokio::task::spawn(async move { s.delete_session(parts).await });
+	}
+}
+
+pub(crate) fn sse_stream_response(
+	stream: impl futures::Stream<Item = ServerSseMessage> + Send + 'static,
+	keep_alive: Option<Duration>,
+) -> Response {
+	use futures::StreamExt;
+	let stream = SseBody::new(stream.map(|message| {
+		let data = serde_json::to_string(&message.message).expect("valid message");
+		let mut sse = Sse::default().data(data);
+		sse.id = message.event_id;
+		Result::<Sse, Infallible>::Ok(sse)
+	}));
+	let stream = match keep_alive {
+		Some(duration) => {
+			http::Body::new(stream.with_keep_alive::<TokioSseTimer>(KeepAlive::new().interval(duration)))
+		},
+		None => http::Body::new(stream),
+	};
+	::http::Response::builder()
+		.status(StatusCode::OK)
+		.header(http::header::CONTENT_TYPE, EVENT_STREAM_MIME_TYPE)
+		.header(http::header::CACHE_CONTROL, "no-cache")
+		.body(stream)
+		.expect("valid response")
+}
+
+pin_project_lite::pin_project! {
+		struct TokioSseTimer {
+				#[pin]
+				sleep: tokio::time::Sleep,
+		}
+}
+impl Future for TokioSseTimer {
+	type Output = ();
+
+	fn poll(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Self::Output> {
+		let this = self.project();
+		this.sleep.poll(cx)
+	}
+}
+impl sse_stream::Timer for TokioSseTimer {
+	fn from_duration(duration: Duration) -> Self {
+		Self {
+			sleep: tokio::time::sleep(duration),
+		}
+	}
+
+	fn reset(self: std::pin::Pin<&mut Self>, when: std::time::Instant) {
+		let this = self.project();
+		this.sleep.reset(tokio::time::Instant::from_std(when));
+	}
+}
+
+/// Build a human-readable preview string for the confirmation prompt.
+fn build_preview(
+	tool_name: &str,
+	args: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> String {
+	let mut lines = vec![format!("Tool: {tool_name}")];
+	if let Some(map) = args {
+		for (k, v) in map {
+			let display = match v {
+				serde_json::Value::String(s) if s.len() > 200 => {
+					format!("{}…", &s[..200])
+				},
+				other => other.to_string(),
+			};
+			lines.push(format!("  {k}: {display}"));
+		}
+	}
+	lines.join("\n")
+}
+
+fn get_client_info() -> ClientInfo {
+	let mut client_info = ClientInfo::default();
+	client_info.protocol_version = ProtocolVersion::V_2025_06_18;
+	client_info.capabilities = rmcp::model::ClientCapabilities::default();
+	client_info.client_info =
+		Implementation::new("agentgateway", BuildInfo::new().version.to_string());
+	client_info
+}

@@ -1,3 +1,25 @@
-helm/charts/
+.cursor
+/target
+.vscode
+.idea
+.run
+.DS_Store
+.venv
+*.local
+var/
+controller/_output
+controller/_test
 
-*.tgz
+# Next.js build artifacts for the admin UI — produced by `npm run build` and
+# not committed; the Dockerfile rebuilds them.
+ui/.next/
+ui/out/
+ui/node_modules/
+
+# Local-only deployment experiments — not used by the published chart.
+deploy-test/
+deploy/
+deployment/
+
+# LibreChat-side patches kept locally for reference.
+*.patch
