@@ -63,6 +63,11 @@ pub enum JwkError {
 pub struct Jwt {
 	mode: Mode,
 	providers: Vec<Provider>,
+	/// Header to read the bearer token from. `None` = the standard
+	/// `Authorization` header (default). When set, the token is read from
+	/// (and stripped from) this header instead, and `Authorization` is left
+	/// untouched so an unrelated upstream token can pass through.
+	token_header: Option<::http::HeaderName>,
 }
 
 #[derive(Clone)]
@@ -81,10 +86,12 @@ impl serde::Serialize for Jwt {
 		pub struct Serde<'a> {
 			mode: Mode,
 			providers: &'a Vec<Provider>,
+			token_header: Option<&'a str>,
 		}
 		Serde {
 			mode: self.mode,
 			providers: &self.providers,
+			token_header: self.token_header.as_ref().map(|h| h.as_str()),
 		}
 		.serialize(serializer)
 	}
@@ -123,6 +130,9 @@ pub enum LocalJwtConfig {
 		#[serde(default)]
 		mode: Mode,
 		providers: Vec<ProviderConfig>,
+		/// Optional: read the bearer from this header instead of `Authorization`.
+		#[serde(default)]
+		token_header: Option<String>,
 	},
 	#[serde(rename_all = "camelCase")]
 	Single {
@@ -133,6 +143,9 @@ pub enum LocalJwtConfig {
 		jwks: serdes::FileInlineOrRemote,
 		#[serde(default)]
 		jwt_validation_options: JWTValidationOptions,
+		/// Optional: read the bearer from this header instead of `Authorization`.
+		#[serde(default)]
+		token_header: Option<String>,
 	},
 }
 
@@ -217,14 +230,19 @@ impl Default for JWTValidationOptions {
 
 impl LocalJwtConfig {
 	pub async fn try_into(self, client: Client) -> Result<Jwt, JwkError> {
-		let (mode, providers_cfg) = match self {
-			LocalJwtConfig::Multi { mode, providers } => (mode, providers),
+		let (mode, providers_cfg, token_header_str) = match self {
+			LocalJwtConfig::Multi {
+				mode,
+				providers,
+				token_header,
+			} => (mode, providers, token_header),
 			LocalJwtConfig::Single {
 				mode,
 				issuer,
 				audiences,
 				jwks,
 				jwt_validation_options,
+				token_header,
 			} => (
 				mode,
 				vec![ProviderConfig {
@@ -233,8 +251,15 @@ impl LocalJwtConfig {
 					jwks,
 					jwt_validation_options,
 				}],
+				token_header,
 			),
 		};
+		let token_header = token_header_str
+			.map(|h| {
+				::http::HeaderName::from_bytes(h.as_bytes())
+					.map_err(|e| JwkError::JwkLoadError(anyhow::anyhow!("invalid tokenHeader {h:?}: {e}")))
+			})
+			.transpose()?;
 
 		let mut providers = Vec::with_capacity(providers_cfg.len());
 		for pc in providers_cfg {
@@ -246,7 +271,11 @@ impl LocalJwtConfig {
 			let provider = Provider::from_jwks(jwks, pc.issuer, pc.audiences, pc.jwt_validation_options)?;
 			providers.push(provider);
 		}
-		Ok(Jwt { mode, providers })
+		Ok(Jwt {
+			mode,
+			providers,
+			token_header,
+		})
 	}
 }
 
@@ -338,7 +367,11 @@ impl Provider {
 
 impl Jwt {
 	pub fn from_providers(providers: Vec<Provider>, mode: Mode) -> Jwt {
-		Jwt { mode, providers }
+		Jwt {
+			mode,
+			providers,
+			token_header: None,
+		}
 	}
 }
 
@@ -395,10 +428,25 @@ impl Jwt {
 		log: Option<&mut RequestLog>,
 		req: &mut Request,
 	) -> Result<(), TokenError> {
-		let Ok(TypedHeader(Authorization(bearer))) = req
-			.extract_parts::<TypedHeader<Authorization<Bearer>>>()
-			.await
-		else {
+		// Read the raw bearer token, either from a configured custom header
+		// or (default) from the standard `Authorization` header.
+		let token: Option<String> = match &self.token_header {
+			Some(h) => req
+				.headers()
+				.get(h)
+				.and_then(|v| v.to_str().ok())
+				.and_then(|s| {
+					s.strip_prefix("Bearer ")
+						.or_else(|| s.strip_prefix("bearer "))
+				})
+				.map(|t| t.to_string()),
+			None => req
+				.extract_parts::<TypedHeader<Authorization<Bearer>>>()
+				.await
+				.ok()
+				.map(|TypedHeader(Authorization(bearer))| bearer.token().to_string()),
+		};
+		let Some(token) = token else {
 			// In strict mode, we require a token
 			if self.mode == Mode::Strict {
 				return Err(TokenError::Missing);
@@ -406,7 +454,7 @@ impl Jwt {
 			// Otherwise with no, don't attempt to authenticate.
 			return Ok(());
 		};
-		let claims = match self.validate_claims(bearer.token()) {
+		let claims = match self.validate_claims(&token) {
 			Ok(claims) => claims,
 			Err(e) if self.mode == Mode::Permissive => {
 				debug!("token verification failed ({e}), continue due to permissive mode");
@@ -419,8 +467,16 @@ impl Jwt {
 		{
 			log.jwt_sub = Some(sub.to_string());
 		};
-		// Remove the token.
-		req.headers_mut().remove(http::header::AUTHORIZATION);
+		// Strip only the header we consumed, so an unrelated upstream token in
+		// `Authorization` survives when a custom token header is configured.
+		match &self.token_header {
+			Some(h) => {
+				req.headers_mut().remove(h);
+			},
+			None => {
+				req.headers_mut().remove(http::header::AUTHORIZATION);
+			},
+		}
 		// Insert the claims into extensions so we can reference it later
 		req.extensions_mut().insert(claims);
 		Ok(())

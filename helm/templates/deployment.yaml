@@ -38,6 +38,16 @@ spec:
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["-f", "/etc/agentgateway/config.yaml"]
+          {{- with .Values.deployment.sessionKeySecret }}
+          {{- if .name }}
+          env:
+            - name: SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name }}
+                  key: {{ .key | default "SESSION_KEY" | quote }}
+          {{- end }}
+          {{- end }}
           {{- with .Values.deployment.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}

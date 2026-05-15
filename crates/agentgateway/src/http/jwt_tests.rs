@@ -232,6 +232,7 @@ fn setup_test_jwt() -> (Jwt, &'static str, &'static str, &'static str) {
 		Jwt {
 			mode: Mode::Strict,
 			providers: vec![provider],
+			token_header: None,
 		},
 		kid,
 		issuer,
@@ -329,6 +330,7 @@ pub async fn test_apply_strict_missing_token() {
 	let jwt = super::Jwt {
 		mode: super::Mode::Strict,
 		providers: vec![],
+		token_header: None,
 	};
 
 	// Minimal Request without Authorization header
@@ -348,6 +350,7 @@ pub async fn test_apply_permissive_no_token_ok() {
 	let jwt = Jwt {
 		mode: Mode::Permissive,
 		providers: base.providers.clone(),
+		token_header: None,
 	};
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	let mut log = make_min_req_log();
@@ -363,6 +366,7 @@ pub async fn test_apply_permissive_invalid_token_ok_and_keeps_header() {
 	let jwt = Jwt {
 		mode: Mode::Permissive,
 		providers: base.providers.clone(),
+		token_header: None,
 	};
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	req.headers_mut().insert(
@@ -391,6 +395,7 @@ pub async fn test_apply_permissive_valid_token_inserts_claims_and_removes_header
 	let jwt = Jwt {
 		mode: Mode::Permissive,
 		providers: base.providers.clone(),
+		token_header: None,
 	};
 	let now = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -414,6 +419,73 @@ pub async fn test_apply_permissive_valid_token_inserts_claims_and_removes_header
 	assert!(req.extensions().get::<super::Claims>().is_some());
 }
 
+// Custom token_header: strict mode validates the JWT from the configured
+// header, strips ONLY that header, and leaves `Authorization` (an unrelated
+// upstream token) untouched so it passes through to the backend.
+#[tokio::test]
+pub async fn test_apply_custom_token_header_validates_and_preserves_authorization() {
+	use std::time::{SystemTime, UNIX_EPOCH};
+	let (base, kid, issuer, allowed_aud) = setup_test_jwt();
+	let jwt = Jwt {
+		mode: Mode::Strict,
+		providers: base.providers.clone(),
+		token_header: Some(crate::http::HeaderName::from_static("x-id-token")),
+	};
+	let now = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_secs();
+	let token = build_unsigned_token(kid, issuer, allowed_aud, now + 600);
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	req.headers_mut().insert(
+		crate::http::HeaderName::from_static("x-id-token"),
+		crate::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+	);
+	// An unrelated, non-JWT upstream token rides on Authorization.
+	req.headers_mut().insert(
+		crate::http::header::AUTHORIZATION,
+		crate::http::HeaderValue::from_static("Bearer upstream-opaque-token"),
+	);
+	let mut log = make_min_req_log();
+	let res = jwt.apply(Some(&mut log), &mut req).await;
+	assert!(res.is_ok(), "strict validation via custom header should succeed");
+	// Claims extracted from the custom header.
+	assert!(req.extensions().get::<super::Claims>().is_some());
+	// The consumed custom header is stripped.
+	assert!(req.headers().get("x-id-token").is_none());
+	// Authorization (upstream token) is preserved untouched.
+	assert_eq!(
+		req
+			.headers()
+			.get(crate::http::header::AUTHORIZATION)
+			.unwrap(),
+		"Bearer upstream-opaque-token"
+	);
+}
+
+// Custom token_header + strict: a missing custom header is rejected even when
+// Authorization is present (we must not fall back to Authorization).
+#[tokio::test]
+pub async fn test_apply_custom_token_header_strict_missing_is_rejected() {
+	let base = setup_test_jwt().0;
+	let jwt = Jwt {
+		mode: Mode::Strict,
+		providers: base.providers.clone(),
+		token_header: Some(crate::http::HeaderName::from_static("x-id-token")),
+	};
+	let mut req = crate::http::Request::new(crate::http::Body::empty());
+	req.headers_mut().insert(
+		crate::http::header::AUTHORIZATION,
+		crate::http::HeaderValue::from_static("Bearer something"),
+	);
+	let mut log = make_min_req_log();
+	let res = jwt.apply(Some(&mut log), &mut req).await;
+	assert!(
+		matches!(res, Err(super::TokenError::Missing)),
+		"strict must reject when the configured header is absent, not fall back to Authorization"
+	);
+}
+
 // Optional mode: allow requests without a token and do not attach claims
 #[tokio::test]
 pub async fn test_apply_optional_no_token_ok() {
@@ -421,6 +493,7 @@ pub async fn test_apply_optional_no_token_ok() {
 	let jwt = Jwt {
 		mode: Mode::Optional,
 		providers: base.providers.clone(),
+		token_header: None,
 	};
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	let mut log = make_min_req_log();
@@ -436,6 +509,7 @@ pub async fn test_apply_optional_invalid_token_err() {
 	let jwt = Jwt {
 		mode: Mode::Optional,
 		providers: base.providers.clone(),
+		token_header: None,
 	};
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	req.headers_mut().insert(
@@ -455,6 +529,7 @@ pub async fn test_apply_optional_valid_token_inserts_claims_and_removes_header()
 	let jwt = Jwt {
 		mode: Mode::Optional,
 		providers: base.providers.clone(),
+		token_header: None,
 	};
 	let now = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -584,6 +659,7 @@ fn setup_test_multi_jwt() -> (Jwt, ProviderInfo, ProviderInfo) {
 		Jwt {
 			mode: Mode::Strict,
 			providers: vec![provider1, provider2],
+			token_header: None,
 		},
 		(kid1, issuer1, aud1),
 		(kid2, issuer2, aud2),
@@ -678,6 +754,7 @@ pub fn test_empty_required_claims_accepts_token_without_exp() {
 	let jwt = Jwt {
 		mode: Mode::Strict,
 		providers: vec![provider],
+		token_header: None,
 	};
 
 	let token = build_unsigned_token_without_exp(kid, issuer, aud);
@@ -736,6 +813,7 @@ pub fn test_default_required_claims_rejects_token_without_exp() {
 	let jwt = Jwt {
 		mode: Mode::Strict,
 		providers: vec![provider],
+		token_header: None,
 	};
 
 	let token = build_unsigned_token_without_exp(kid, issuer, aud);
@@ -792,6 +870,7 @@ pub fn test_empty_required_claims_still_rejects_expired_tokens() {
 	let jwt = Jwt {
 		mode: Mode::Strict,
 		providers: vec![provider],
+		token_header: None,
 	};
 
 	let token = build_unsigned_token_with_expired_exp(kid, issuer, aud);
@@ -848,6 +927,7 @@ pub fn test_required_claims_with_nbf_rejects_missing_nbf() {
 	let jwt = Jwt {
 		mode: Mode::Strict,
 		providers: vec![provider],
+		token_header: None,
 	};
 
 	// Token with exp but without nbf should be rejected when nbf is required

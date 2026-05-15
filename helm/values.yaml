@@ -27,6 +27,9 @@ deployment:
         - ALL
     seccompProfile:
       type: RuntimeDefault
+  sessionKeySecret:
+    name: ""            
+    key: SESSION_KEY  
 
 service:
   name: kindred-mcp-gateway
