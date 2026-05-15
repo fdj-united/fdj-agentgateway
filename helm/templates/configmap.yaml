@@ -64,6 +64,9 @@ data:
                     {{- with .mode }}
                     mode: {{ . | quote }}
                     {{- end }}
+                    {{- with .tokenHeader }}
+                    tokenHeader: {{ . | quote }}
+                    {{- end }}
                     issuer: {{ .issuer | quote }}
                     {{- with .audiences }}
                     audiences:
@@ -103,6 +106,15 @@ data:
                       {{- end }}
                       {{- with .resourcePolicyUri }}
                       resourcePolicyUri: {{ . | quote }}
+                      {{- end }}
+                    {{- end }}
+                    {{- with .jwtValidationOptions }}
+                    jwtValidationOptions:
+                      {{- with .requiredClaims }}
+                      requiredClaims:
+                        {{- range . }}
+                        - {{ . | quote }}
+                        {{- end }}
                       {{- end }}
                     {{- end }}
                   {{- end }}
@@ -223,3 +235,4 @@ data:
                           {{- end }}
               {{- end }}
       {{- end }}
+
