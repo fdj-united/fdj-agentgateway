@@ -2226,6 +2226,13 @@ pub struct LocalMcpAuthentication {
 	pub mode: McpAuthenticationMode,
 	#[serde(default)]
 	pub jwt_validation_options: http::jwt::JWTValidationOptions,
+	/// Optional: read the bearer token from this header instead of the
+	/// standard `Authorization` header. Use when the client sends a
+	/// gateway-verifiable token (e.g. an Entra ID token) in a side header
+	/// while `Authorization` carries an unrelated upstream token that must
+	/// pass through untouched.
+	#[serde(default)]
+	pub token_header: Option<String>,
 }
 
 impl LocalMcpAuthentication {
@@ -2254,6 +2261,7 @@ impl LocalMcpAuthentication {
 			audiences: Some(self.audiences.clone()),
 			jwks,
 			jwt_validation_options: self.jwt_validation_options.clone(),
+			token_header: self.token_header.clone(),
 		})
 	}
 
