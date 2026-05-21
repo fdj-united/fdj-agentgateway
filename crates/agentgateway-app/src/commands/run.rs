@@ -37,7 +37,7 @@ pub(crate) fn execute(args: RunArgs) -> anyhow::Result<()> {
 			if validate_only {
 				return validate(contents, filename).await;
 			}
-			let mut config = agentgateway::config::parse_config(contents, filename)?;
+			let mut config = agentgateway::config::parse_config(contents.clone(), filename.clone())?;
 			// Capture the admin/runtime handle to ensure some background tasks (e.g., OTLP exporters created from dataplane
 			// policy initialization) run on the admin runtime rather than the dataplane runtime.
 			config.admin_runtime_handle = Some(tokio::runtime::Handle::current());
@@ -45,7 +45,8 @@ pub(crate) fn execute(args: RunArgs) -> anyhow::Result<()> {
 				&config.logging.level,
 				config.logging.format == LoggingFormat::Json,
 			);
-			proxy(Arc::new(config)).await
+			agentgateway::audit::emit_l4_config_loaded(&contents, filename.as_deref());
+			proxy(Arc::new(config), contents, filename).await
 		})
 }
 
@@ -124,13 +125,33 @@ fn spawn_readiness(bound: &Bound) {
 	}
 }
 
-async fn proxy(cfg: Arc<Config>) -> anyhow::Result<()> {
+async fn proxy(
+	cfg: Arc<Config>,
+	config_contents: String,
+	config_filename: Option<PathBuf>,
+) -> anyhow::Result<()> {
 	info!("version: {}", version::BuildInfo::new());
 	info!(
 		"running with config: {}",
 		serdes::yamlviajson::to_string(&cfg)?
 	);
-	let bound = agentgateway::app::run(cfg).await?;
+	let bound = match agentgateway::app::run(cfg).await {
+		Ok(bound) => bound,
+		Err(err) => {
+			agentgateway::audit::emit_l5_dysfunction(format!("startup failed: {err}"));
+			return Err(err);
+		},
+	};
+	agentgateway::audit::emit_l5_startup(&config_contents, config_filename.as_deref());
 	spawn_readiness(&bound);
-	bound.wait_termination().await
+	match bound.wait_termination().await {
+		Ok(()) => {
+			agentgateway::audit::emit_l5_shutdown();
+			Ok(())
+		},
+		Err(err) => {
+			agentgateway::audit::emit_l5_dysfunction(format!("shutdown failed: {err}"));
+			Err(err)
+		},
+	}
 }

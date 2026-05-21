@@ -768,6 +768,7 @@ impl Drop for DropOnLog {
 		let llm_response = log.llm_response.take().map(Into::into);
 
 		let mcp = log.mcp_status.take();
+		crate::audit::emit_l3_mcp_access(&log, mcp.as_ref(), duration);
 		let mcp_cel = mcp.as_ref().filter(|m| !m.is_empty());
 		let cel_end_time = cel::RequestTime(end_time.as_datetime());
 		let cel_exec = log.cel.build(CelLoggingBuildInputs {
