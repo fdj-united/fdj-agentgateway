@@ -617,6 +617,13 @@ impl Session {
 									// Phase 2: matching pending → consume and execute upstream
 									approvals.remove(&key);
 									drop(approvals);
+									crate::audit::emit_l3_tool_confirmation(
+										"tool_confirmed",
+										&self.id,
+										service_name,
+										tool,
+										"success",
+									);
 									let tn = tool.to_string();
 									ctr.params.name = tn.into();
 									// Strip BEFORE arg_rewrite + upstream forward, so the
@@ -634,6 +641,13 @@ impl Session {
 							let ttl = self.relay.confirmation.ttl;
 							approvals.insert(key, PendingApproval::new(ttl));
 							drop(approvals);
+							crate::audit::emit_l3_tool_confirmation(
+								"tool_confirmation_requested",
+								&self.id,
+								service_name,
+								tool,
+								"pending_confirmation",
+							);
 
 							let preview = build_preview(tool, call_arguments.as_ref());
 							let presentation = self
@@ -964,6 +978,7 @@ impl Drop for SessionDropper {
 		let Some((s, parts)) = self.s.take() else {
 			return;
 		};
+		crate::audit::emit_l3_session_closed(&s.id);
 		let mut sm = self.sm.sessions.write().expect("write lock");
 		debug!("delete session {}", s.id);
 		sm.remove(s.id.as_ref());

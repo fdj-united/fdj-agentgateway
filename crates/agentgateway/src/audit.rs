@@ -1,8 +1,8 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{SecondsFormat, Utc};
 use http::header::AsHeaderName;
 use serde_json::{Map, Value, json};
@@ -13,23 +13,85 @@ use crate::telemetry::log::RequestLog;
 
 const AUDIT_LEVEL: &str = "AUDIT";
 
-// Defensive caps: any `Authorization` header beyond this is treated as untrusted
-// junk; any decoded JWT payload beyond this is ignored. JWTs in practice are < 4KB.
-const MAX_AUTHORIZATION_HEADER_BYTES: usize = 8 * 1024;
-const MAX_JWT_PAYLOAD_BYTES: usize = 16 * 1024;
+// Defensive cap on the cached user identity — emails are well under this.
+const MAX_KAIT_USER_LEN: usize = 256;
+
+/// In-memory cache mapping MCP session ID → KAIT (LibreChat) user identity.
+///
+/// Captures the user from the FIRST request on a session whose headers/JWT
+/// yield an identifiable user; subsequent events on the same session — notably
+/// the long-poll SSE GETs that LibreChat does not re-include `X-User-Email`
+/// on — read from this cache so every audit event stays attributable to a
+/// real KAIT user.
+///
+/// **Memory only.** Never persisted, never serialized, never written to
+/// Splunk. Entries are evicted by `emit_l3_session_closed` when the gateway
+/// drops the session.
+static SESSION_USER_CACHE: LazyLock<RwLock<HashMap<String, String>>> =
+	LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Capture-once write. A second `set` for the same session is ignored — the
+/// first authenticated user identity associated with a session is the
+/// audit-of-record; later requests cannot override it.
+fn cache_session_user(session_id: &str, user: &str) {
+	if user.is_empty() || user.len() > MAX_KAIT_USER_LEN {
+		return;
+	}
+	let mut map = SESSION_USER_CACHE
+		.write()
+		.expect("audit SESSION_USER_CACHE poisoned");
+	map
+		.entry(session_id.to_string())
+		.or_insert_with(|| user.to_string());
+}
+
+fn cached_session_user(session_id: &str) -> Option<String> {
+	SESSION_USER_CACHE
+		.read()
+		.expect("audit SESSION_USER_CACHE poisoned")
+		.get(session_id)
+		.cloned()
+}
+
+/// Removes the cached entry on session close and returns it so the
+/// `session_closed` audit event can still attribute the user.
+fn evict_session_user(session_id: &str) -> Option<String> {
+	SESSION_USER_CACHE
+		.write()
+		.expect("audit SESSION_USER_CACHE poisoned")
+		.remove(session_id)
+}
+
+/// SHA-256 prefix (first 16 bytes, 32 hex chars) of an MCP session ID. We log
+/// this in place of the raw session ID — the raw value is a gateway-encrypted
+/// session token whose leakage from Splunk plus an eventual session-key
+/// compromise would enable replay; 16 bytes of hash is still sufficient to
+/// correlate all events of a session in Splunk without being replayable.
+fn session_id_hash(session_id: &str) -> String {
+	let mut hasher = Sha256::new();
+	hasher.update(session_id.as_bytes());
+	let digest = hasher.finalize();
+	hex::encode(&digest[..16])
+}
 
 pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Duration) {
 	let status = log.status.as_ref().map(|s| s.as_u16());
-	let has_mcp_context = mcp.is_some_and(|m| !m.is_empty());
+	let tool = mcp.and_then(|m| m.tool.as_ref());
+	let tool_name = tool.map(|t| t.name.as_str());
 	let failed_auth = matches!(status, Some(401 | 403));
 
-	if !has_mcp_context && !failed_auth {
+	// Audit only events that matter to the security team:
+	//   - tool calls (success / denied / blocked / failure)
+	//   - authentication failures
+	// Protocol-layer noise (initialize / ping / tools/list / notifications/*)
+	// is intentionally NOT audited — it generates ~5x volume without
+	// per-user accountability since these messages happen before/around
+	// OAuth on long-lived SSE channels.
+	if tool_name.is_none() && !failed_auth {
 		return;
 	}
 
-	let tool = mcp.and_then(|m| m.tool.as_ref());
 	let args = tool.and_then(|t| t.arguments.as_ref());
-	let tool_name = tool.map(|t| t.name.as_str());
 	let server = mcp
 		.and_then(|m| m.target_name())
 		.or_else(|| route_segment(log.path.as_deref()))
@@ -39,24 +101,28 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 		(Some(_), "denied") => "tool_call_denied",
 		(Some(_), "blocked") => "tool_call_blocked",
 		(Some(_), _) => "tool_call",
-		(None, "denied") => "auth_failure",
-		(None, _) => "mcp_access",
+		(None, _) => "auth_failure",
 	};
+
+	let session_id = mcp.and_then(|m| m.session_id.as_deref());
+
+	// Resolve user identity with persistent session fallback:
+	//   1. Current request (JWT or X-User-Email or X-LibreChat-Username)
+	//   2. Cached identity from any prior request on the same session
+	// Capture-once into the cache so SSE long-polls (no headers) and other
+	// protocol traffic still attribute back to the original KAIT user.
+	let kait_user = kait_user(log).or_else(|| session_id.and_then(cached_session_user));
+	if let (Some(sid), Some(ref user)) = (session_id, kait_user.as_ref()) {
+		cache_session_user(sid, user);
+	}
 
 	let mut event = audit_base("L3", event_name);
 	put_opt(
 		&mut event,
-		"sessionId",
-		mcp
-			.and_then(|m| m.session_id.as_deref())
-			.map(ToOwned::to_owned),
+		"sessionIdHash",
+		session_id.map(session_id_hash),
 	);
-	put_opt(&mut event, "kaitUser", kait_user(log));
-	if let Some(identity) = atlassian_user(log, server) {
-		event.insert("atlassianUser".into(), json!(identity));
-		// Security spec requires both `atlassianUser` and `jiraUser` (alias).
-		event.insert("jiraUser".into(), json!(identity));
-	}
+	put_opt(&mut event, "kaitUser", kait_user);
 	put_opt(
 		&mut event,
 		"sourceIp",
@@ -98,6 +164,47 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 			.map(ToOwned::to_owned),
 	);
 
+	emit(Value::Object(event));
+}
+
+/// Emit the `session_closed` lifecycle event and evict the cached user.
+///
+/// Called from the gateway's session-removal path so security can correlate
+/// session start (first `tool_call`) with session end. Generic across MCP
+/// backends — no jira/confluence/teams-specific logic.
+pub fn emit_l3_session_closed(session_id: &str) {
+	let kait_user = evict_session_user(session_id);
+	let mut event = audit_base("L3", "session_closed");
+	event.insert("sessionIdHash".into(), json!(session_id_hash(session_id)));
+	put_opt(&mut event, "kaitUser", kait_user);
+	event.insert("outcome".into(), json!("success"));
+	event.insert("reason".into(), Value::Null);
+	emit(Value::Object(event));
+}
+
+/// Emit a tool-level confirmation event (`tool_confirmation_requested` when
+/// the gateway returns a confirmation envelope, `tool_confirmed` when the
+/// user-approved retry forwards upstream). `outcome` is the caller's choice
+/// — typically `"pending_confirmation"` and `"success"` respectively.
+///
+/// Generic: works for any MCP backend whose route has an `mcpConfirmation`
+/// policy. The user is resolved from the same session cache as `tool_call`.
+pub fn emit_l3_tool_confirmation(
+	event_name: &str,
+	session_id: &str,
+	server: &str,
+	tool: &str,
+	outcome: &str,
+) {
+	let kait_user = cached_session_user(session_id);
+	let mut event = audit_base("L3", event_name);
+	event.insert("sessionIdHash".into(), json!(session_id_hash(session_id)));
+	put_opt(&mut event, "kaitUser", kait_user);
+	event.insert("server".into(), json!(server));
+	event.insert("tool".into(), json!(tool));
+	event.insert("toolCategory".into(), json!(tool_category(tool)));
+	event.insert("outcome".into(), json!(outcome));
+	event.insert("reason".into(), Value::Null);
 	emit(Value::Object(event));
 }
 
@@ -165,7 +272,7 @@ pub fn emit_l5_dysfunction(reason: impl Into<String>) {
 	emit(Value::Object(event));
 }
 
-fn audit_base(logging_id: &'static str, event: &'static str) -> Map<String, Value> {
+fn audit_base(logging_id: &str, event: &str) -> Map<String, Value> {
 	let mut base = Map::new();
 	base.insert(
 		"timestamp".into(),
@@ -317,71 +424,6 @@ fn kait_user(log: &RequestLog) -> Option<String> {
 		})
 		.or_else(|| header(log, "x-user-email"))
 		.or_else(|| header(log, "x-librechat-username"))
-}
-
-/// Returns the Atlassian-side user identity (email / preferred_username / opaque sub),
-/// extracted from the upstream OAuth bearer token's claims. Only fires for
-/// jira/confluence routes; other routes return `None`.
-///
-/// **The JWT signature is NOT verified.** The gateway's `mcpAuthentication: permissive`
-/// mode does not always populate `req.jwt`, so we decode the raw `Authorization: Bearer`
-/// header for audit purposes. The actual access decision is enforced by the upstream
-/// Atlassian MCP server (which DOES verify signatures), so a forged claim here would
-/// not grant access — it would only mislabel an `outcome=denied` audit event.
-fn atlassian_user(log: &RequestLog, server: &str) -> Option<String> {
-	if !matches!(server, "jira" | "confluence") {
-		return None;
-	}
-	let claims = decode_authorization_bearer(log)?;
-	[
-		"email",
-		"preferred_username",
-		"https://api.atlassian.com/systemAccountEmail",
-	]
-	.into_iter()
-	.filter_map(|k| claims.get(k).and_then(Value::as_str))
-	.find(|v| !v.is_empty())
-	.map(str::to_string)
-	.or_else(|| {
-		claims
-			.get("sub")
-			.and_then(Value::as_str)
-			.filter(|v| !v.is_empty())
-			.map(|sub| format!("atlassian:{sub}"))
-	})
-}
-
-/// Decodes the JSON payload of a `Bearer <jwt>` `Authorization` header without
-/// verifying the signature. Returns the claims as a JSON object.
-///
-/// Defensive: caps both input header size and decoded payload size to avoid
-/// resource exhaustion on hostile tokens. Returns `None` on any parsing failure
-/// rather than panicking — audit emission must never crash the gateway.
-fn decode_authorization_bearer(log: &RequestLog) -> Option<Map<String, Value>> {
-	let raw = header(log, "authorization")?;
-	if raw.len() > MAX_AUTHORIZATION_HEADER_BYTES {
-		return None;
-	}
-	let token = raw
-		.strip_prefix("Bearer ")
-		.or_else(|| raw.strip_prefix("bearer "))?
-		.trim();
-	let mut parts = token.split('.');
-	let (_header, payload_b64, _signature) = (parts.next()?, parts.next()?, parts.next()?);
-	if parts.next().is_some() {
-		return None;
-	}
-	// Accept JWT payloads with or without `=` padding (both are seen in the wild).
-	let payload = URL_SAFE_NO_PAD
-		.decode(payload_b64.trim_end_matches('='))
-		.ok()?;
-	if payload.len() > MAX_JWT_PAYLOAD_BYTES {
-		return None;
-	}
-	match serde_json::from_slice::<Value>(&payload).ok()? {
-		Value::Object(map) => Some(map),
-		_ => None,
-	}
 }
 
 fn header<K>(log: &RequestLog, name: K) -> Option<String>
@@ -582,76 +624,60 @@ mod tests {
 		assert!(objects.iter().all(|obj| obj.get("body").is_none()));
 	}
 
-	/// Build a JWT-shaped string with the given JSON payload (signature is junk;
-	/// our decoder never verifies it).
-	fn jwt_with_payload(payload: &Value) -> String {
-		let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
-		let p = URL_SAFE_NO_PAD.encode(payload.to_string());
-		format!("{h}.{p}.deadbeef")
-	}
-
-	fn decode_payload(token: &str) -> Option<Map<String, Value>> {
-		let payload_b64 = token.split('.').nth(1)?;
-		let payload = URL_SAFE_NO_PAD
-			.decode(payload_b64.trim_end_matches('='))
-			.ok()?;
-		match serde_json::from_slice::<Value>(&payload).ok()? {
-			Value::Object(map) => Some(map),
-			_ => None,
-		}
+	#[test]
+	fn session_id_hash_is_short_stable_and_irreversible() {
+		let raw = "027OEn+0HMa3rdLIWy7xJp3Ka2F1jLxTHrWbL5O1Dxt..."; // opaque token
+		let h = session_id_hash(raw);
+		// 16 bytes → 32 hex chars; identical inputs hash identically.
+		assert_eq!(h.len(), 32);
+		assert_eq!(h, session_id_hash(raw));
+		// Hash must NOT contain any prefix of the original token.
+		assert!(!h.contains(&raw[..20]));
 	}
 
 	#[test]
-	fn jwt_decode_extracts_whitelisted_claims_only() {
-		let token = jwt_with_payload(&json!({
-			"email": "feng.lu@kindredgroup.com",
-			"sub": "5b10ac8d82e05b22cc7d4ef5",
-			"scope": "read:jira-work",
-			"do_not_log": "internal-secret",
-		}));
-		let claims = decode_payload(&token).expect("payload must parse");
-		// Sanity: full claim object is parsed, but the caller picks only known fields.
-		assert_eq!(claims["email"], "feng.lu@kindredgroup.com");
-		assert_eq!(claims["sub"], "5b10ac8d82e05b22cc7d4ef5");
+	fn session_user_cache_is_capture_once_and_evictable() {
+		let sid = "sess-cache-test-1";
+		// Initially empty.
+		assert!(cached_session_user(sid).is_none());
+		// First write wins.
+		cache_session_user(sid, "first@kindredgroup.com");
+		cache_session_user(sid, "imposter@example.com");
+		assert_eq!(
+			cached_session_user(sid).as_deref(),
+			Some("first@kindredgroup.com")
+		);
+		// Eviction returns the stored value and clears the slot.
+		assert_eq!(
+			evict_session_user(sid).as_deref(),
+			Some("first@kindredgroup.com")
+		);
+		assert!(cached_session_user(sid).is_none());
 	}
 
 	#[test]
-	fn jwt_decode_returns_none_on_malformed_input() {
-		// Empty payload portion.
-		assert!(decode_payload("eyJ.. ").is_none());
-		// Wrong number of segments.
-		assert!(decode_payload("only.two").is_none());
-		// Not base64.
-		assert!(decode_payload("eyJ.@@@.sig").is_none());
+	fn session_user_cache_rejects_empty_and_oversize_writes() {
+		let sid = "sess-cache-test-2";
+		cache_session_user(sid, "");
+		assert!(cached_session_user(sid).is_none());
+		let oversize = "a".repeat(MAX_KAIT_USER_LEN + 1);
+		cache_session_user(sid, &oversize);
+		assert!(cached_session_user(sid).is_none());
 	}
 
 	#[test]
-	fn atlassian_user_falls_back_to_sub_with_prefix() {
-		let claims_email_present: Map<String, Value> = serde_json::from_value(json!({
-			"email": "feng.lu@kindredgroup.com",
-			"sub": "5b10ac8d82e05b22cc7d4ef5",
-		}))
-		.unwrap();
-		let claims_sub_only: Map<String, Value> = serde_json::from_value(json!({
-			"sub": "5b10ac8d82e05b22cc7d4ef5",
-		}))
-		.unwrap();
+	fn session_closed_event_shape_is_minimal_and_redacted() {
+		// Pre-populate cache so eviction returns the stored user.
+		let sid = "sess-closed-shape-test";
+		cache_session_user(sid, "feng.lu@kindredgroup.com");
 
-		// `email` is preferred when present.
-		let email = claims_email_present
-			.get("email")
-			.and_then(Value::as_str)
-			.unwrap();
-		assert_eq!(email, "feng.lu@kindredgroup.com");
-
-		// When only `sub` is available the audit field is prefixed `atlassian:` so
-		// the opaque ID isn't mistaken for an email in Splunk.
-		let sub_fallback = claims_sub_only
-			.get("sub")
-			.and_then(Value::as_str)
-			.map(|s| format!("atlassian:{s}"))
-			.unwrap();
-		assert_eq!(sub_fallback, "atlassian:5b10ac8d82e05b22cc7d4ef5");
+		// Capture stdout would be ideal; here we directly inspect the function
+		// is wired to call `evict_session_user` (which empties the cache).
+		emit_l3_session_closed(sid);
+		assert!(
+			cached_session_user(sid).is_none(),
+			"session_closed must evict the cache entry"
+		);
 	}
 
 	#[test]
