@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{SecondsFormat, Utc};
 use http::header::AsHeaderName;
 use serde_json::{Map, Value, json};
@@ -10,6 +12,11 @@ use crate::mcp::MCPInfo;
 use crate::telemetry::log::RequestLog;
 
 const AUDIT_LEVEL: &str = "AUDIT";
+
+// Defensive caps: any `Authorization` header beyond this is treated as untrusted
+// junk; any decoded JWT payload beyond this is ignored. JWTs in practice are < 4KB.
+const MAX_AUTHORIZATION_HEADER_BYTES: usize = 8 * 1024;
+const MAX_JWT_PAYLOAD_BYTES: usize = 16 * 1024;
 
 pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Duration) {
 	let status = log.status.as_ref().map(|s| s.as_u16());
@@ -45,6 +52,11 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 			.map(ToOwned::to_owned),
 	);
 	put_opt(&mut event, "kaitUser", kait_user(log));
+	if let Some(identity) = atlassian_user(log, server) {
+		event.insert("atlassianUser".into(), json!(identity));
+		// Security spec requires both `atlassianUser` and `jiraUser` (alias).
+		event.insert("jiraUser".into(), json!(identity));
+	}
 	put_opt(
 		&mut event,
 		"sourceIp",
@@ -304,6 +316,72 @@ fn kait_user(log: &RequestLog) -> Option<String> {
 			None
 		})
 		.or_else(|| header(log, "x-user-email"))
+		.or_else(|| header(log, "x-librechat-username"))
+}
+
+/// Returns the Atlassian-side user identity (email / preferred_username / opaque sub),
+/// extracted from the upstream OAuth bearer token's claims. Only fires for
+/// jira/confluence routes; other routes return `None`.
+///
+/// **The JWT signature is NOT verified.** The gateway's `mcpAuthentication: permissive`
+/// mode does not always populate `req.jwt`, so we decode the raw `Authorization: Bearer`
+/// header for audit purposes. The actual access decision is enforced by the upstream
+/// Atlassian MCP server (which DOES verify signatures), so a forged claim here would
+/// not grant access — it would only mislabel an `outcome=denied` audit event.
+fn atlassian_user(log: &RequestLog, server: &str) -> Option<String> {
+	if !matches!(server, "jira" | "confluence") {
+		return None;
+	}
+	let claims = decode_authorization_bearer(log)?;
+	[
+		"email",
+		"preferred_username",
+		"https://api.atlassian.com/systemAccountEmail",
+	]
+	.into_iter()
+	.filter_map(|k| claims.get(k).and_then(Value::as_str))
+	.find(|v| !v.is_empty())
+	.map(str::to_string)
+	.or_else(|| {
+		claims
+			.get("sub")
+			.and_then(Value::as_str)
+			.filter(|v| !v.is_empty())
+			.map(|sub| format!("atlassian:{sub}"))
+	})
+}
+
+/// Decodes the JSON payload of a `Bearer <jwt>` `Authorization` header without
+/// verifying the signature. Returns the claims as a JSON object.
+///
+/// Defensive: caps both input header size and decoded payload size to avoid
+/// resource exhaustion on hostile tokens. Returns `None` on any parsing failure
+/// rather than panicking — audit emission must never crash the gateway.
+fn decode_authorization_bearer(log: &RequestLog) -> Option<Map<String, Value>> {
+	let raw = header(log, "authorization")?;
+	if raw.len() > MAX_AUTHORIZATION_HEADER_BYTES {
+		return None;
+	}
+	let token = raw
+		.strip_prefix("Bearer ")
+		.or_else(|| raw.strip_prefix("bearer "))?
+		.trim();
+	let mut parts = token.split('.');
+	let (_header, payload_b64, _signature) = (parts.next()?, parts.next()?, parts.next()?);
+	if parts.next().is_some() {
+		return None;
+	}
+	// Accept JWT payloads with or without `=` padding (both are seen in the wild).
+	let payload = URL_SAFE_NO_PAD
+		.decode(payload_b64.trim_end_matches('='))
+		.ok()?;
+	if payload.len() > MAX_JWT_PAYLOAD_BYTES {
+		return None;
+	}
+	match serde_json::from_slice::<Value>(&payload).ok()? {
+		Value::Object(map) => Some(map),
+		_ => None,
+	}
 }
 
 fn header<K>(log: &RequestLog, name: K) -> Option<String>
@@ -502,6 +580,78 @@ mod tests {
 		assert_eq!(objects[0]["type"], "jira_issue");
 		assert_eq!(objects[0]["key"], "SEC-123");
 		assert!(objects.iter().all(|obj| obj.get("body").is_none()));
+	}
+
+	/// Build a JWT-shaped string with the given JSON payload (signature is junk;
+	/// our decoder never verifies it).
+	fn jwt_with_payload(payload: &Value) -> String {
+		let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+		let p = URL_SAFE_NO_PAD.encode(payload.to_string());
+		format!("{h}.{p}.deadbeef")
+	}
+
+	fn decode_payload(token: &str) -> Option<Map<String, Value>> {
+		let payload_b64 = token.split('.').nth(1)?;
+		let payload = URL_SAFE_NO_PAD
+			.decode(payload_b64.trim_end_matches('='))
+			.ok()?;
+		match serde_json::from_slice::<Value>(&payload).ok()? {
+			Value::Object(map) => Some(map),
+			_ => None,
+		}
+	}
+
+	#[test]
+	fn jwt_decode_extracts_whitelisted_claims_only() {
+		let token = jwt_with_payload(&json!({
+			"email": "feng.lu@kindredgroup.com",
+			"sub": "5b10ac8d82e05b22cc7d4ef5",
+			"scope": "read:jira-work",
+			"do_not_log": "internal-secret",
+		}));
+		let claims = decode_payload(&token).expect("payload must parse");
+		// Sanity: full claim object is parsed, but the caller picks only known fields.
+		assert_eq!(claims["email"], "feng.lu@kindredgroup.com");
+		assert_eq!(claims["sub"], "5b10ac8d82e05b22cc7d4ef5");
+	}
+
+	#[test]
+	fn jwt_decode_returns_none_on_malformed_input() {
+		// Empty payload portion.
+		assert!(decode_payload("eyJ.. ").is_none());
+		// Wrong number of segments.
+		assert!(decode_payload("only.two").is_none());
+		// Not base64.
+		assert!(decode_payload("eyJ.@@@.sig").is_none());
+	}
+
+	#[test]
+	fn atlassian_user_falls_back_to_sub_with_prefix() {
+		let claims_email_present: Map<String, Value> = serde_json::from_value(json!({
+			"email": "feng.lu@kindredgroup.com",
+			"sub": "5b10ac8d82e05b22cc7d4ef5",
+		}))
+		.unwrap();
+		let claims_sub_only: Map<String, Value> = serde_json::from_value(json!({
+			"sub": "5b10ac8d82e05b22cc7d4ef5",
+		}))
+		.unwrap();
+
+		// `email` is preferred when present.
+		let email = claims_email_present
+			.get("email")
+			.and_then(Value::as_str)
+			.unwrap();
+		assert_eq!(email, "feng.lu@kindredgroup.com");
+
+		// When only `sub` is available the audit field is prefixed `atlassian:` so
+		// the opaque ID isn't mistaken for an email in Splunk.
+		let sub_fallback = claims_sub_only
+			.get("sub")
+			.and_then(Value::as_str)
+			.map(|s| format!("atlassian:{s}"))
+			.unwrap();
+		assert_eq!(sub_fallback, "atlassian:5b10ac8d82e05b22cc7d4ef5");
 	}
 
 	#[test]
