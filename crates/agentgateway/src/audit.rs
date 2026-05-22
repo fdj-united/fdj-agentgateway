@@ -8,7 +8,7 @@ use http::header::AsHeaderName;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::mcp::MCPInfo;
+use crate::mcp::{MCPInfo, MCPTool};
 use crate::telemetry::log::RequestLog;
 
 const AUDIT_LEVEL: &str = "AUDIT";
@@ -372,22 +372,98 @@ fn access_outcome(status: Option<u16>, error: Option<&str>, mcp: Option<&MCPInfo
 	if matches!(status, Some(429)) {
 		return "blocked";
 	}
-	if error.is_some()
-		|| status.is_some_and(|s| s >= 400)
-		|| mcp
-			.and_then(|m| m.tool.as_ref())
-			.and_then(|tool| tool.error.as_ref())
-			.is_some()
+	if let Some(tool) = mcp.and_then(|m| m.tool.as_ref())
+		&& let Some(outcome) = tool_outcome_from_result(tool)
 	{
+		return outcome;
+	}
+	if error.is_some() || status.is_some_and(|s| s >= 400) {
 		return "failure";
 	}
 	"success"
 }
 
+/// Inspect the MCP tool response for application-level outcome signals that
+/// the HTTP and JSON-RPC protocol layers do not surface.
+///
+/// MCP servers (and the gateway itself) routinely return HTTP 200 with a
+/// nominal JSON-RPC success envelope, yet encode an error, a rate-limit, or a
+/// pending-confirmation state inside the result text. Without this check
+/// those events would all be audited as `outcome=success`, which is exactly
+/// the bypass class the security team reported for Atlassian's
+/// `{"error": true, ...}` text-content errors.
+///
+/// Precedence (first match wins):
+///   1. JSON-RPC error envelope (`tool.error`).
+///   2. MCP standard `CallToolResult.isError` flag.
+///   3. Gateway-emitted control envelopes inside `content[].text`:
+///        - `{"error": "rate_limit_exceeded", ...}` → `blocked`
+///        - `{"confirmationRequired": true, ...}`   → `pending_confirmation`
+///   4. Upstream/application-level error pattern: `{"error": true, ...}`
+///      in the text content → `failure`.
+fn tool_outcome_from_result(tool: &MCPTool) -> Option<&'static str> {
+	if tool.error.is_some() {
+		return Some("failure");
+	}
+	let result = tool.result.as_ref()?;
+	if result
+		.get("isError")
+		.and_then(Value::as_bool)
+		.unwrap_or(false)
+	{
+		return Some("failure");
+	}
+	let payload = extract_tool_text_payload(result)?;
+	if payload.get("error").and_then(Value::as_str) == Some("rate_limit_exceeded") {
+		return Some("blocked");
+	}
+	if payload
+		.get("confirmationRequired")
+		.and_then(Value::as_bool)
+		.unwrap_or(false)
+	{
+		return Some("pending_confirmation");
+	}
+	if payload
+		.get("error")
+		.and_then(Value::as_bool)
+		.unwrap_or(false)
+	{
+		return Some("failure");
+	}
+	None
+}
+
+/// Parse the first `text`-typed item of a `CallToolResult.content` array as
+/// JSON. Used to detect outcome signals embedded by upstream MCP servers
+/// (e.g. Atlassian's `{"error": true, "message": ...}`) or by gateway
+/// policies (rate-limit, confirmation envelopes).
+///
+/// Returns `None` when no text content exists or when the text is not valid
+/// JSON — that prevents false positives on tools that legitimately return
+/// prose containing the word "error".
+fn extract_tool_text_payload(result: &Value) -> Option<Value> {
+	result
+		.get("content")?
+		.as_array()?
+		.iter()
+		.find_map(|item| {
+			if item.get("type").and_then(Value::as_str) != Some("text") {
+				return None;
+			}
+			item
+				.get("text")
+				.and_then(Value::as_str)
+				.and_then(|s| serde_json::from_str::<Value>(s).ok())
+		})
+}
+
 fn reason(log: &RequestLog, mcp: Option<&MCPInfo>, status: Option<u16>) -> Option<String> {
-	mcp
-		.and_then(|m| m.tool.as_ref())
-		.and_then(|tool| tool.error.as_ref())
+	let tool = mcp.and_then(|m| m.tool.as_ref());
+
+	// 1. JSON-RPC error envelope message.
+	if let Some(msg) = tool
+		.and_then(|t| t.error.as_ref())
 		.and_then(|err| {
 			err.get("message").and_then(Value::as_str).or_else(|| {
 				err
@@ -397,14 +473,31 @@ fn reason(log: &RequestLog, mcp: Option<&MCPInfo>, status: Option<u16>) -> Optio
 			})
 		})
 		.map(ToOwned::to_owned)
-		.or_else(|| log.error.clone())
-		.or_else(|| match status {
-			Some(401) => Some("Unauthorized".to_string()),
-			Some(403) => Some("Forbidden".to_string()),
-			Some(429) => Some("Rate limited".to_string()),
-			Some(s) if s >= 400 => Some(format!("HTTP {s}")),
-			_ => None,
-		})
+	{
+		return Some(msg);
+	}
+
+	// 2. Message embedded in the tool result text content (Atlassian app
+	//    errors, gateway rate-limit / confirmation envelopes).
+	if let Some(payload) = tool
+		.and_then(|t| t.result.as_ref())
+		.and_then(extract_tool_text_payload)
+		&& let Some(msg) = payload
+			.get("message")
+			.and_then(Value::as_str)
+			.filter(|s| !s.is_empty())
+	{
+		return Some(msg.to_string());
+	}
+
+	// 3. Transport-level fallback (HTTP errors / connection failures).
+	log.error.clone().or_else(|| match status {
+		Some(401) => Some("Unauthorized".to_string()),
+		Some(403) => Some("Forbidden".to_string()),
+		Some(429) => Some("Rate limited".to_string()),
+		Some(s) if s >= 400 => Some(format!("HTTP {s}")),
+		_ => None,
+	})
 }
 
 fn kait_user(log: &RequestLog) -> Option<String> {
@@ -678,6 +771,82 @@ mod tests {
 			cached_session_user(sid).is_none(),
 			"session_closed must evict the cache entry"
 		);
+	}
+
+	fn tool_with_result(result: Value) -> MCPTool {
+		MCPTool {
+			target: "atlassian".into(),
+			name: "createConfluencePage".into(),
+			arguments: None,
+			result: Some(result),
+			error: None,
+		}
+	}
+
+	#[test]
+	fn tool_outcome_detects_is_error_flag() {
+		let tool = tool_with_result(json!({
+			"isError": true,
+			"content": [{ "type": "text", "text": "boom" }],
+		}));
+		assert_eq!(tool_outcome_from_result(&tool), Some("failure"));
+	}
+
+	#[test]
+	fn tool_outcome_detects_application_error_in_text_payload() {
+		// Atlassian-style: success envelope wrapping `{"error": true, ...}`.
+		let tool = tool_with_result(json!({
+			"isError": false,
+			"content": [{
+				"type": "text",
+				"text": "{\"error\":true,\"message\":\"Access denied: write_confluence not authorized.\"}"
+			}],
+		}));
+		assert_eq!(tool_outcome_from_result(&tool), Some("failure"));
+	}
+
+	#[test]
+	fn tool_outcome_detects_rate_limit_envelope() {
+		let tool = tool_with_result(json!({
+			"content": [{
+				"type": "text",
+				"text": "{\"error\":\"rate_limit_exceeded\",\"message\":\"Tool 'X' called 6 times within 60s. Max 5.\"}"
+			}],
+		}));
+		assert_eq!(tool_outcome_from_result(&tool), Some("blocked"));
+	}
+
+	#[test]
+	fn tool_outcome_detects_confirmation_envelope() {
+		let tool = tool_with_result(json!({
+			"content": [{
+				"type": "text",
+				"text": "{\"confirmationRequired\":true,\"preview\":\"...\",\"expiresInSeconds\":120}"
+			}],
+		}));
+		assert_eq!(
+			tool_outcome_from_result(&tool),
+			Some("pending_confirmation")
+		);
+	}
+
+	#[test]
+	fn tool_outcome_does_not_false_positive_on_prose_or_normal_json() {
+		// Prose result that happens to mention the word "error".
+		let prose = tool_with_result(json!({
+			"content": [{ "type": "text", "text": "Found 3 issues mentioning 'error handler'." }],
+		}));
+		assert_eq!(tool_outcome_from_result(&prose), None);
+
+		// Normal JSON success result that has no error-indicating fields.
+		let success = tool_with_result(json!({
+			"content": [{
+				"type": "text",
+				"text": "{\"key\":\"AIE-462\",\"summary\":\"Audit logs\",\"status\":\"In Progress\"}"
+			}],
+			"isError": false,
+		}));
+		assert_eq!(tool_outcome_from_result(&success), None);
 	}
 
 	#[test]
