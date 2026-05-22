@@ -33,16 +33,34 @@ static SESSION_USER_CACHE: LazyLock<RwLock<HashMap<String, String>>> =
 /// Capture-once write. A second `set` for the same session is ignored — the
 /// first authenticated user identity associated with a session is the
 /// audit-of-record; later requests cannot override it.
+///
+/// As a side effect, on the FIRST successful capture for a given session ID
+/// an `loggingId=L1 event=session_authenticated` event is emitted. The
+/// security team's L1 row in the logging guidelines wants per-session login
+/// success events; the first successful identity capture is exactly that
+/// signal. Capturing it here piggy-backs on the existing capture-once
+/// guarantee and keeps L1 emission volume to one per session rather than
+/// one per request.
 fn cache_session_user(session_id: &str, user: &str) {
 	if user.is_empty() || user.len() > MAX_KAIT_USER_LEN {
 		return;
 	}
-	let mut map = SESSION_USER_CACHE
-		.write()
-		.expect("audit SESSION_USER_CACHE poisoned");
-	map
-		.entry(session_id.to_string())
-		.or_insert_with(|| user.to_string());
+	let is_new = {
+		let mut map = SESSION_USER_CACHE
+			.write()
+			.expect("audit SESSION_USER_CACHE poisoned");
+		// `contains_key + insert` under the same write lock is atomic — two
+		// concurrent requests for the same new session cannot both observe
+		// `is_new = true`.
+		let was_present = map.contains_key(session_id);
+		map
+			.entry(session_id.to_string())
+			.or_insert_with(|| user.to_string());
+		!was_present
+	};
+	if is_new {
+		emit_l1_session_authenticated(session_id, user);
+	}
 }
 
 fn cached_session_user(session_id: &str) -> Option<String> {
@@ -103,6 +121,10 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 		(Some(_), _) => "tool_call",
 		(None, _) => "auth_failure",
 	};
+	// Authentication-failure events belong to logging level L1 (Authentication)
+	// per the security team's logging guidelines, not L3 (Access). The rest of
+	// the tool-call event types stay on L3 (Access).
+	let logging_id = if event_name == "auth_failure" { "L1" } else { "L3" };
 
 	let session_id = mcp.and_then(|m| m.session_id.as_deref());
 
@@ -116,7 +138,7 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 		cache_session_user(sid, user);
 	}
 
-	let mut event = audit_base("L3", event_name);
+	let mut event = audit_base(logging_id, event_name);
 	put_opt(
 		&mut event,
 		"sessionIdHash",
@@ -164,6 +186,20 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 			.map(ToOwned::to_owned),
 	);
 
+	emit(Value::Object(event));
+}
+
+/// Emit the `session_authenticated` L1 event the first time the gateway
+/// observes an identifiable user on a session. Fires at most once per session
+/// (driven by the capture-once behaviour of `cache_session_user`). Equivalent
+/// to the security team's "Login success" L1 row for the MCP-proxied
+/// authentication flow.
+pub fn emit_l1_session_authenticated(session_id: &str, kait_user: &str) {
+	let mut event = audit_base("L1", "session_authenticated");
+	event.insert("sessionIdHash".into(), json!(session_id_hash(session_id)));
+	event.insert("kaitUser".into(), json!(kait_user));
+	event.insert("outcome".into(), json!("success"));
+	event.insert("reason".into(), Value::Null);
 	emit(Value::Object(event));
 }
 
@@ -746,6 +782,21 @@ mod tests {
 			Some("first@kindredgroup.com")
 		);
 		assert!(cached_session_user(sid).is_none());
+	}
+
+	#[test]
+	fn cache_session_user_only_caches_first_user_per_session() {
+		// Functional check that the capture-once promise is preserved after
+		// the L1 emission side-effect was added.
+		let sid = "sess-l1-capture-once";
+		cache_session_user(sid, "alice@kindredgroup.com");
+		cache_session_user(sid, "bob@kindredgroup.com");
+		// First user wins regardless of how many subsequent writes happen.
+		assert_eq!(
+			cached_session_user(sid).as_deref(),
+			Some("alice@kindredgroup.com")
+		);
+		evict_session_user(sid);
 	}
 
 	#[test]
