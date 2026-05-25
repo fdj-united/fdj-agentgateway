@@ -41,7 +41,7 @@ static SESSION_USER_CACHE: LazyLock<RwLock<HashMap<String, String>>> =
 /// signal. Capturing it here piggy-backs on the existing capture-once
 /// guarantee and keeps L1 emission volume to one per session rather than
 /// one per request.
-fn cache_session_user(session_id: &str, user: &str) {
+fn cache_session_user(session_id: &str, user: &str, ctx: &AuditContext) {
 	if user.is_empty() || user.len() > MAX_KAIT_USER_LEN {
 		return;
 	}
@@ -59,7 +59,7 @@ fn cache_session_user(session_id: &str, user: &str) {
 		!was_present
 	};
 	if is_new {
-		emit_l1_session_authenticated(session_id, user);
+		emit_l1_session_authenticated(session_id, user, ctx);
 	}
 }
 
@@ -128,6 +128,20 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 
 	let session_id = mcp.and_then(|m| m.session_id.as_deref());
 
+	// Request-context fields shared with the L1 session_authenticated event.
+	// Built before the cache write so the login-success event (emitted from
+	// inside cache_session_user on first capture) carries the same core
+	// fields as every access event.
+	let (platform_user, platform_user_source) = platform_user(log);
+	let ctx = AuditContext {
+		source_ip: Some(log.tcp_info.peer_addr.ip().to_string()),
+		forwarded_for: header(log, "x-forwarded-for"),
+		transport: transport(log),
+		server: server.to_string(),
+		platform_user,
+		platform_user_source,
+	};
+
 	// Resolve user identity with persistent session fallback:
 	//   1. Current request (JWT or X-User-Email or X-LibreChat-Username)
 	//   2. Cached identity from any prior request on the same session
@@ -135,50 +149,50 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 	// protocol traffic still attribute back to the original KAIT user.
 	let kait_user = kait_user(log).or_else(|| session_id.and_then(cached_session_user));
 	if let (Some(sid), Some(ref user)) = (session_id, kait_user.as_ref()) {
-		cache_session_user(sid, user);
+		cache_session_user(sid, user, &ctx);
 	}
 
+	// Canonical schema: every access-family event carries the SAME set of
+	// keys. Absent values serialize as JSON null (via `put`) rather than
+	// being omitted, so a given event type always has a stable field set.
 	let mut event = audit_base(logging_id, event_name);
-	put_opt(
-		&mut event,
-		"sessionIdHash",
-		session_id.map(session_id_hash),
-	);
-	put_opt(&mut event, "kaitUser", kait_user);
-	put_opt(
-		&mut event,
-		"sourceIp",
-		Some(log.tcp_info.peer_addr.ip().to_string()),
-	);
-	put_opt(&mut event, "forwardedFor", header(log, "x-forwarded-for"));
-	event.insert("transport".into(), json!(transport(log)));
+	put(&mut event, "sessionIdHash", session_id.map(session_id_hash));
+	put(&mut event, "kaitUser", kait_user);
+	// Downstream-platform account (Atlassian / MS365 / future), distinct from
+	// the LibreChat kaitUser. Always present (null when unattributable).
+	put(&mut event, "platformUser", ctx.platform_user.clone());
+	event.insert("platformUserSource".into(), json!(ctx.platform_user_source));
+	put(&mut event, "sourceIp", ctx.source_ip.clone());
+	put(&mut event, "forwardedFor", ctx.forwarded_for.clone());
+	event.insert("transport".into(), json!(ctx.transport));
 	event.insert("outcome".into(), json!(outcome));
 	event.insert(
 		"reason".into(),
 		reason(log, mcp, status).map_or(Value::Null, Value::String),
 	);
-	event.insert("server".into(), json!(server));
-	put_opt(
-		&mut event,
-		"siteUrl",
-		first_string(args, &["siteUrl", "site_url"]),
+	event.insert("server".into(), json!(ctx.server));
+	put(&mut event, "siteUrl", first_string(args, &["siteUrl", "site_url"]));
+	put(&mut event, "cloudId", first_string(args, &["cloudId", "cloud_id"]));
+	put(&mut event, "tool", tool_name.map(ToOwned::to_owned));
+	event.insert(
+		"toolCategory".into(),
+		tool_name.map_or(Value::Null, |t| json!(tool_category(t))),
 	);
-	put_opt(
-		&mut event,
-		"cloudId",
-		first_string(args, &["cloudId", "cloud_id"]),
-	);
-	put_opt(&mut event, "tool", tool_name.map(ToOwned::to_owned));
-	if let Some(tool) = tool_name {
-		event.insert("toolCategory".into(), json!(tool_category(tool)));
-	}
 	event.insert(
 		"affectedObjects".into(),
 		Value::Array(affected_objects(tool_name, args)),
 	);
 	event.insert("durationMs".into(), json!(duration_ms(duration)));
-	put_opt(&mut event, "httpStatus", status.map(|s| s.to_string()));
-	put_opt(
+	put(&mut event, "httpStatus", status.map(|s| s.to_string()));
+	// Transport-level `httpStatus` is frequently 200 even when the upstream
+	// API failed (MCP wraps app errors in a successful JSON-RPC envelope).
+	// `upstreamStatus` surfaces the real upstream status code when the result
+	// payload carries one — a number only, never the payload body.
+	event.insert(
+		"upstreamStatus".into(),
+		upstream_status(mcp).map_or(Value::Null, |s| json!(s)),
+	);
+	put(
 		&mut event,
 		"mcpMethod",
 		mcp
@@ -194,10 +208,19 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 /// (driven by the capture-once behaviour of `cache_session_user`). Equivalent
 /// to the security team's "Login success" L1 row for the MCP-proxied
 /// authentication flow.
-pub fn emit_l1_session_authenticated(session_id: &str, kait_user: &str) {
+fn emit_l1_session_authenticated(session_id: &str, kait_user: &str, ctx: &AuditContext) {
 	let mut event = audit_base("L1", "session_authenticated");
 	event.insert("sessionIdHash".into(), json!(session_id_hash(session_id)));
-	event.insert("kaitUser".into(), json!(kait_user));
+	put(&mut event, "kaitUser", Some(kait_user.to_string()));
+	// Downstream-platform account at which the user authenticated.
+	put(&mut event, "platformUser", ctx.platform_user.clone());
+	event.insert("platformUserSource".into(), json!(ctx.platform_user_source));
+	// Same core fields as the L1 auth_failure event so login-success and
+	// login-failure are directly comparable in Splunk.
+	put(&mut event, "sourceIp", ctx.source_ip.clone());
+	put(&mut event, "forwardedFor", ctx.forwarded_for.clone());
+	event.insert("transport".into(), json!(ctx.transport));
+	event.insert("server".into(), json!(ctx.server));
 	event.insert("outcome".into(), json!("success"));
 	event.insert("reason".into(), Value::Null);
 	emit(Value::Object(event));
@@ -225,20 +248,30 @@ pub fn emit_l3_session_closed(session_id: &str) {
 ///
 /// Generic: works for any MCP backend whose route has an `mcpConfirmation`
 /// policy. The user is resolved from the same session cache as `tool_call`.
+///
+/// `args` are the tool-call arguments, used to derive `affectedObjects` so the
+/// confirmation event records WHICH object the pending action targets (e.g.
+/// the Confluence page id, the Teams chat id) — not just the tool name. Only
+/// non-sensitive identifiers are extracted; argument content is never logged.
 pub fn emit_l3_tool_confirmation(
 	event_name: &str,
 	session_id: &str,
 	server: &str,
 	tool: &str,
 	outcome: &str,
+	args: Option<&Map<String, Value>>,
 ) {
 	let kait_user = cached_session_user(session_id);
 	let mut event = audit_base("L3", event_name);
 	event.insert("sessionIdHash".into(), json!(session_id_hash(session_id)));
-	put_opt(&mut event, "kaitUser", kait_user);
+	put(&mut event, "kaitUser", kait_user);
 	event.insert("server".into(), json!(server));
 	event.insert("tool".into(), json!(tool));
 	event.insert("toolCategory".into(), json!(tool_category(tool)));
+	event.insert(
+		"affectedObjects".into(),
+		Value::Array(affected_objects(Some(tool), args)),
+	);
 	event.insert("outcome".into(), json!(outcome));
 	event.insert("reason".into(), Value::Null);
 	emit(Value::Object(event));
@@ -324,6 +357,32 @@ fn put_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
 	if let Some(value) = value {
 		map.insert(key.into(), json!(value));
 	}
+}
+
+/// Insert a canonical-schema field. Unlike [`put_opt`], the key is ALWAYS
+/// present — a missing value serializes as JSON `null` rather than being
+/// omitted. This guarantees every event of a given type carries the same
+/// set of keys, which the security team relies on for stable field
+/// extraction in Splunk (an omitted key and a null key are not equivalent to
+/// a downstream query).
+fn put(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
+	map.insert(key.into(), value.map_or(Value::Null, Value::String));
+}
+
+/// Request-context fields shared by the access-family events and the L1
+/// `session_authenticated` event. Computed once per request and threaded into
+/// the session-user cache so the login-success event carries the same core
+/// fields (sourceIp / forwardedFor / transport / server) as login-failure.
+#[derive(Clone)]
+struct AuditContext {
+	source_ip: Option<String>,
+	forwarded_for: Option<String>,
+	transport: &'static str,
+	server: String,
+	/// Downstream-platform account identity (Atlassian / MS365 / future
+	/// backends), distinct from the LibreChat `kaitUser`. See `platform_user`.
+	platform_user: Option<String>,
+	platform_user_source: &'static str,
 }
 
 fn emit(event: Value) {
@@ -494,6 +553,29 @@ fn extract_tool_text_payload(result: &Value) -> Option<Value> {
 		})
 }
 
+/// Extract the upstream application-level status code embedded in a tool
+/// result payload (e.g. Atlassian's `{"statusCode": 400, ...}`). The
+/// transport-level `httpStatus` is frequently 200 even when the upstream API
+/// rejected the call, because MCP wraps application errors inside a
+/// successful JSON-RPC envelope. This surfaces the real upstream code — a
+/// number only, never the payload body — so the audit reader can tell a
+/// transport success carrying an application error apart from a true success.
+fn upstream_status(mcp: Option<&MCPInfo>) -> Option<u64> {
+	let payload = mcp
+		.and_then(|m| m.tool.as_ref())
+		.and_then(|t| t.result.as_ref())
+		.and_then(extract_tool_text_payload)?;
+	payload
+		.get("statusCode")
+		.and_then(Value::as_u64)
+		.or_else(|| {
+			payload
+				.get("data")
+				.and_then(|d| d.get("statusCode"))
+				.and_then(Value::as_u64)
+		})
+}
+
 fn reason(log: &RequestLog, mcp: Option<&MCPInfo>, status: Option<u16>) -> Option<String> {
 	let tool = mcp.and_then(|m| m.tool.as_ref());
 
@@ -553,6 +635,87 @@ fn kait_user(log: &RequestLog) -> Option<String> {
 		})
 		.or_else(|| header(log, "x-user-email"))
 		.or_else(|| header(log, "x-librechat-username"))
+}
+
+/// Identity claim keys, most human-readable first. Shared by `kait_user` and
+/// `platform_user` so a new MCP backend whose token uses any of these is
+/// picked up with no per-platform code.
+const IDENTITY_CLAIM_KEYS: [&str; 5] = ["email", "preferred_username", "upn", "unique_name", "sub"];
+
+/// Resolve the downstream-platform account identity — the user as known to the
+/// MCP *target* (Atlassian, MS365, and any future backend) — distinct from
+/// `kaitUser` (the LibreChat login). Returns the identity plus a source tag so
+/// the audit reader knows where it came from and how trustworthy it is.
+///
+/// Platform-agnostic by design — there is no Atlassian/MS365-specific branch,
+/// so onboarding a new MCP server requires no change here:
+///   1. Routes whose token the gateway validated (`mcpAuthentication: strict`,
+///      e.g. MS365's Entra ID token) expose verified claims on `req.jwt`; we
+///      take the most human-readable (`email` → … → `sub`).
+///   2. Permissive routes (e.g. Atlassian) are not decoded by the gateway, but
+///      the bearer is present and was validated by the upstream. We base64-
+///      decode the *unverified* payload solely to read its `sub` account id
+///      for attribution — never for authorization.
+///
+/// Mapping a permissive-route `sub` (e.g. an Atlassian account id) to an email
+/// would need an upstream userinfo call; deliberately NOT done here to keep the
+/// audit path free of outbound dependencies and predictable in latency.
+fn platform_user(log: &RequestLog) -> (Option<String>, &'static str) {
+	// 1. Gateway-validated claims (strict routes).
+	if let Some(claims) = log
+		.request_snapshot
+		.as_ref()
+		.and_then(|req| req.jwt.as_ref())
+	{
+		for key in IDENTITY_CLAIM_KEYS {
+			if let Some(value) = claims.inner.get(key).and_then(Value::as_str)
+				&& !value.is_empty()
+			{
+				return (Some(value.to_string()), claim_source(key));
+			}
+		}
+	}
+	// 2. Unverified bearer payload (permissive routes) — `sub` for attribution.
+	if let Some(sub) = bearer_sub(log) {
+		return (Some(sub), "bearer_sub_unverified");
+	}
+	(None, "none")
+}
+
+/// Static source tag for a validated-claim identity, telling the audit reader
+/// whether the value is a human-readable address or an opaque subject id.
+fn claim_source(key: &str) -> &'static str {
+	match key {
+		"email" => "jwt_email",
+		"preferred_username" => "jwt_preferred_username",
+		"upn" => "jwt_upn",
+		"unique_name" => "jwt_unique_name",
+		_ => "jwt_sub",
+	}
+}
+
+/// Extract the `sub` claim from the request's bearer token WITHOUT verifying
+/// the signature. Used only to attribute audit events on permissive routes
+/// where the gateway does not otherwise decode the token; the upstream MCP
+/// server is the one that actually validates it. Returns `None` on any
+/// malformed input — this must never panic or affect request handling.
+fn bearer_sub(log: &RequestLog) -> Option<String> {
+	use base64::Engine as _;
+	use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+	let auth = header(log, "authorization")?;
+	let token = auth
+		.strip_prefix("Bearer ")
+		.or_else(|| auth.strip_prefix("bearer "))?;
+	// JWT = header.payload.signature — decode the payload segment only.
+	let payload_b64 = token.split('.').nth(1)?;
+	let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+	let claims: Value = serde_json::from_slice(&bytes).ok()?;
+	claims
+		.get("sub")
+		.and_then(Value::as_str)
+		.filter(|s| !s.is_empty())
+		.map(ToOwned::to_owned)
 }
 
 fn header<K>(log: &RequestLog, name: K) -> Option<String>
@@ -727,6 +890,69 @@ mod tests {
 
 	use super::*;
 
+	/// Minimal context for cache tests that don't assert on the L1 event body.
+	fn test_ctx() -> AuditContext {
+		AuditContext {
+			source_ip: Some("127.0.0.1".to_string()),
+			forwarded_for: None,
+			transport: "streamable-http",
+			server: "test".to_string(),
+			platform_user: None,
+			platform_user_source: "none",
+		}
+	}
+
+	/// Build a JWT-shaped string `header.payload.signature` whose payload is the
+	/// given JSON claims (base64url, no signature verification — matches how an
+	/// MCP bearer arrives on a permissive route).
+	fn fake_jwt(claims: serde_json::Value) -> String {
+		use base64::Engine as _;
+		use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+		let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+		let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+		format!("{header}.{payload}.sig-not-verified")
+	}
+
+	#[test]
+	fn claim_source_distinguishes_human_readable_from_opaque() {
+		assert_eq!(claim_source("email"), "jwt_email");
+		assert_eq!(claim_source("upn"), "jwt_upn");
+		assert_eq!(claim_source("sub"), "jwt_sub");
+		// Unknown keys fall back to the opaque-subject tag, never a crash.
+		assert_eq!(claim_source("whatever"), "jwt_sub");
+	}
+
+	#[test]
+	fn bearer_sub_decode_is_pure_and_panic_free() {
+		// The decode logic mirrors bearer_sub() but is exercised directly here
+		// since bearer_sub takes a RequestLog. Verifies the base64url+JSON path
+		// extracts sub and tolerates garbage without panicking.
+		use base64::Engine as _;
+		use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+		let decode_sub = |token: &str| -> Option<String> {
+			let payload_b64 = token.split('.').nth(1)?;
+			let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+			let claims: Value = serde_json::from_slice(&bytes).ok()?;
+			claims
+				.get("sub")
+				.and_then(Value::as_str)
+				.filter(|s| !s.is_empty())
+				.map(ToOwned::to_owned)
+		};
+
+		// Atlassian-style account id in sub.
+		let jwt = fake_jwt(json!({ "sub": "712020:fedb54a7-7627-4545-b117-ce6aa03611a8" }));
+		assert_eq!(
+			decode_sub(&jwt).as_deref(),
+			Some("712020:fedb54a7-7627-4545-b117-ce6aa03611a8")
+		);
+		// Garbage / non-JWT inputs return None, never panic.
+		assert_eq!(decode_sub("not-a-jwt"), None);
+		assert_eq!(decode_sub("a.!!!notbase64!!!.c"), None);
+		assert_eq!(decode_sub(""), None);
+	}
+
 	#[test]
 	fn classifies_write_tools() {
 		assert_eq!(tool_category("createJiraIssue"), "write");
@@ -765,13 +991,88 @@ mod tests {
 	}
 
 	#[test]
+	fn put_always_emits_key_even_when_absent() {
+		let mut m = Map::new();
+		put(&mut m, "present", Some("v".to_string()));
+		put(&mut m, "absent", None);
+		// Both keys exist; the absent one is JSON null, not omitted. This is
+		// the canonical-schema guarantee the security team asked for.
+		assert_eq!(m.get("present"), Some(&json!("v")));
+		assert_eq!(m.get("absent"), Some(&Value::Null));
+		assert!(m.contains_key("absent"));
+	}
+
+	#[test]
+	fn upstream_status_extracts_app_code_when_transport_is_200() {
+		// Confluence CQL-style error: MCP transport returns 200 but the
+		// upstream API rejected with 400, encoded as statusCode in the
+		// result payload text. upstream_status must surface the 400.
+		let tool = MCPTool {
+			target: "atlassian".into(),
+			name: "searchConfluenceUsingCql".into(),
+			arguments: None,
+			result: Some(json!({
+				"content": [{
+					"type": "text",
+					"text": "{\"statusCode\":400,\"message\":\"Could not parse cql\"}"
+				}],
+			})),
+			error: None,
+		};
+		let mcp = MCPInfo {
+			tool: Some(tool),
+			..Default::default()
+		};
+		assert_eq!(upstream_status(Some(&mcp)), Some(400));
+	}
+
+	#[test]
+	fn upstream_status_none_for_clean_success() {
+		let tool = MCPTool {
+			target: "atlassian".into(),
+			name: "getJiraIssue".into(),
+			arguments: None,
+			result: Some(json!({
+				"content": [{ "type": "text", "text": "{\"key\":\"AIE-1\"}" }],
+			})),
+			error: None,
+		};
+		let mcp = MCPInfo {
+			tool: Some(tool),
+			..Default::default()
+		};
+		assert_eq!(upstream_status(Some(&mcp)), None);
+	}
+
+	#[test]
+	fn confirmation_affected_objects_derive_only_identifiers() {
+		// emit_l3_tool_confirmation now derives affectedObjects from args so the
+		// confirmation event records WHICH object is pending — identifiers only,
+		// never content. This guards the affected_objects projection used there.
+		let args = json!({
+			"pageId": "63864834",
+			"body": "secret page body must not leak",
+			"title": "My favourite book"
+		})
+		.as_object()
+		.cloned()
+		.unwrap();
+		let objects = affected_objects(Some("updateConfluencePage"), Some(&args));
+		assert_eq!(objects.len(), 1);
+		assert_eq!(objects[0]["type"], "confluence_page");
+		assert_eq!(objects[0]["id"], "63864834");
+		assert!(objects.iter().all(|o| o.get("body").is_none()));
+		assert!(objects.iter().all(|o| o.get("title").is_none()));
+	}
+
+	#[test]
 	fn session_user_cache_is_capture_once_and_evictable() {
 		let sid = "sess-cache-test-1";
 		// Initially empty.
 		assert!(cached_session_user(sid).is_none());
 		// First write wins.
-		cache_session_user(sid, "first@kindredgroup.com");
-		cache_session_user(sid, "imposter@example.com");
+		cache_session_user(sid, "first@kindredgroup.com", &test_ctx());
+		cache_session_user(sid, "imposter@example.com", &test_ctx());
 		assert_eq!(
 			cached_session_user(sid).as_deref(),
 			Some("first@kindredgroup.com")
@@ -789,8 +1090,8 @@ mod tests {
 		// Functional check that the capture-once promise is preserved after
 		// the L1 emission side-effect was added.
 		let sid = "sess-l1-capture-once";
-		cache_session_user(sid, "alice@kindredgroup.com");
-		cache_session_user(sid, "bob@kindredgroup.com");
+		cache_session_user(sid, "alice@kindredgroup.com", &test_ctx());
+		cache_session_user(sid, "bob@kindredgroup.com", &test_ctx());
 		// First user wins regardless of how many subsequent writes happen.
 		assert_eq!(
 			cached_session_user(sid).as_deref(),
@@ -802,10 +1103,10 @@ mod tests {
 	#[test]
 	fn session_user_cache_rejects_empty_and_oversize_writes() {
 		let sid = "sess-cache-test-2";
-		cache_session_user(sid, "");
+		cache_session_user(sid, "", &test_ctx());
 		assert!(cached_session_user(sid).is_none());
 		let oversize = "a".repeat(MAX_KAIT_USER_LEN + 1);
-		cache_session_user(sid, &oversize);
+		cache_session_user(sid, &oversize, &test_ctx());
 		assert!(cached_session_user(sid).is_none());
 	}
 
@@ -813,7 +1114,7 @@ mod tests {
 	fn session_closed_event_shape_is_minimal_and_redacted() {
 		// Pre-populate cache so eviction returns the stored user.
 		let sid = "sess-closed-shape-test";
-		cache_session_user(sid, "feng.lu@kindredgroup.com");
+		cache_session_user(sid, "feng.lu@kindredgroup.com", &test_ctx());
 
 		// Capture stdout would be ideal; here we directly inspect the function
 		// is wired to call `evict_session_user` (which empties the cache).
