@@ -583,10 +583,15 @@ impl Session {
 									r.id.clone(),
 								);
 								use futures_util::stream;
+								// Pass `log` through so messages_to_response captures the
+								// rate-limit envelope into MCPInfo.tool.result; without it
+								// the audit layer's outcome detector cannot see the
+								// `{"error":"rate_limit_exceeded",...}` payload and falls
+								// through to "success" instead of "blocked".
 								return crate::mcp::handler::messages_to_response(
 									r.id,
 									stream::once(async move { Ok(msg) }),
-									None,
+									Some(log.clone()),
 								);
 							}
 						}
@@ -682,10 +687,17 @@ impl Session {
 								r.id.clone(),
 							);
 							use futures_util::stream;
+							// Pass `log` through so messages_to_response captures the
+							// Phase 1 confirmation envelope into MCPInfo.tool.result;
+							// without it the audit layer's outcome detector cannot see
+							// the `{"confirmationRequired":true,...}` payload and falls
+							// through to "success" instead of "pending_confirmation",
+							// which makes the Phase 1 tool_call row look like the
+							// upstream write already succeeded.
 							return crate::mcp::handler::messages_to_response(
 								r.id,
 								stream::once(async move { Ok(msg) }),
-								None,
+								Some(log.clone()),
 							);
 						}
 						// ── End two-phase confirmation ───────────────────────────

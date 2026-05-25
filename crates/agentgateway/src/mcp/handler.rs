@@ -752,6 +752,51 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn messages_to_response_captures_text_content_envelope() {
+		// Regression test: when the gateway synthesizes a CallToolResult with a
+		// text-content envelope (the Phase 1 confirmation envelope built in
+		// session.rs and the rate-limit envelope in the same file), passing
+		// `Some(log)` MUST cause messages_to_response to capture the envelope
+		// into MCPInfo.tool.result. The audit layer's outcome detector
+		// (audit::tool_outcome_from_result) reads from that field; without
+		// capture the detector cannot see the envelope and falls through to
+		// outcome="success", which is what was reported in Splunk for Phase 1
+		// rows even though the upstream write had not yet happened.
+		use rmcp::model::Content;
+
+		let log = AsyncLog::default();
+		let mut info = MCPInfo::default();
+		info.set_tool("atlassian".to_string(), "createConfluencePage".to_string());
+		log.store(Some(info));
+
+		let envelope_text =
+			"{\"confirmationRequired\":true,\"preview\":\"...\",\"expiresInSeconds\":120}";
+		let stream = stream::iter(vec![Ok(ServerJsonRpcMessage::response(
+			ServerResult::CallToolResult(CallToolResult::success(vec![Content::text(
+				envelope_text.to_string(),
+			)])),
+			RequestId::Number(99),
+		))]);
+
+		let response =
+			messages_to_response(RequestId::Number(99), stream, Some(log.clone())).unwrap();
+		let _ = crate::http::read_resp_body(response).await.unwrap();
+
+		let info = log.take().unwrap();
+		let result = info
+			.tool
+			.as_ref()
+			.expect("tool should be set")
+			.result
+			.as_ref()
+			.expect("text-content envelope must be captured into tool.result");
+		let captured_text = result["content"][0]["text"]
+			.as_str()
+			.expect("captured result must expose the envelope text");
+		assert_eq!(captured_text, envelope_text);
+	}
+
+	#[tokio::test]
 	async fn messages_to_response_captures_json_rpc_error() {
 		let log = AsyncLog::default();
 		let mut info = MCPInfo::default();
