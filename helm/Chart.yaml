@@ -4,5 +4,5 @@ description: |
   Standalone deployment of the Kindred MCP Gateway proxy. Renders a ConfigMap
   with the proxy config plus a Deployment and Service.
 type: application
-version: 0.0.45
-appVersion: "v0.0.45"
+version: 0.0.46
+appVersion: "v0.0.46"
