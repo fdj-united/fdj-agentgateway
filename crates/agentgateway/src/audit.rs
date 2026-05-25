@@ -132,11 +132,14 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 	// Built before the cache write so the login-success event (emitted from
 	// inside cache_session_user on first capture) carries the same core
 	// fields as every access event.
+	let (platform_user, platform_user_source) = platform_user(log);
 	let ctx = AuditContext {
 		source_ip: Some(log.tcp_info.peer_addr.ip().to_string()),
 		forwarded_for: header(log, "x-forwarded-for"),
 		transport: transport(log),
 		server: server.to_string(),
+		platform_user,
+		platform_user_source,
 	};
 
 	// Resolve user identity with persistent session fallback:
@@ -155,6 +158,10 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 	let mut event = audit_base(logging_id, event_name);
 	put(&mut event, "sessionIdHash", session_id.map(session_id_hash));
 	put(&mut event, "kaitUser", kait_user);
+	// Downstream-platform account (Atlassian / MS365 / future), distinct from
+	// the LibreChat kaitUser. Always present (null when unattributable).
+	put(&mut event, "platformUser", ctx.platform_user.clone());
+	event.insert("platformUserSource".into(), json!(ctx.platform_user_source));
 	put(&mut event, "sourceIp", ctx.source_ip.clone());
 	put(&mut event, "forwardedFor", ctx.forwarded_for.clone());
 	event.insert("transport".into(), json!(ctx.transport));
@@ -205,6 +212,9 @@ fn emit_l1_session_authenticated(session_id: &str, kait_user: &str, ctx: &AuditC
 	let mut event = audit_base("L1", "session_authenticated");
 	event.insert("sessionIdHash".into(), json!(session_id_hash(session_id)));
 	put(&mut event, "kaitUser", Some(kait_user.to_string()));
+	// Downstream-platform account at which the user authenticated.
+	put(&mut event, "platformUser", ctx.platform_user.clone());
+	event.insert("platformUserSource".into(), json!(ctx.platform_user_source));
 	// Same core fields as the L1 auth_failure event so login-success and
 	// login-failure are directly comparable in Splunk.
 	put(&mut event, "sourceIp", ctx.source_ip.clone());
@@ -369,6 +379,10 @@ struct AuditContext {
 	forwarded_for: Option<String>,
 	transport: &'static str,
 	server: String,
+	/// Downstream-platform account identity (Atlassian / MS365 / future
+	/// backends), distinct from the LibreChat `kaitUser`. See `platform_user`.
+	platform_user: Option<String>,
+	platform_user_source: &'static str,
 }
 
 fn emit(event: Value) {
@@ -623,6 +637,87 @@ fn kait_user(log: &RequestLog) -> Option<String> {
 		.or_else(|| header(log, "x-librechat-username"))
 }
 
+/// Identity claim keys, most human-readable first. Shared by `kait_user` and
+/// `platform_user` so a new MCP backend whose token uses any of these is
+/// picked up with no per-platform code.
+const IDENTITY_CLAIM_KEYS: [&str; 5] = ["email", "preferred_username", "upn", "unique_name", "sub"];
+
+/// Resolve the downstream-platform account identity — the user as known to the
+/// MCP *target* (Atlassian, MS365, and any future backend) — distinct from
+/// `kaitUser` (the LibreChat login). Returns the identity plus a source tag so
+/// the audit reader knows where it came from and how trustworthy it is.
+///
+/// Platform-agnostic by design — there is no Atlassian/MS365-specific branch,
+/// so onboarding a new MCP server requires no change here:
+///   1. Routes whose token the gateway validated (`mcpAuthentication: strict`,
+///      e.g. MS365's Entra ID token) expose verified claims on `req.jwt`; we
+///      take the most human-readable (`email` → … → `sub`).
+///   2. Permissive routes (e.g. Atlassian) are not decoded by the gateway, but
+///      the bearer is present and was validated by the upstream. We base64-
+///      decode the *unverified* payload solely to read its `sub` account id
+///      for attribution — never for authorization.
+///
+/// Mapping a permissive-route `sub` (e.g. an Atlassian account id) to an email
+/// would need an upstream userinfo call; deliberately NOT done here to keep the
+/// audit path free of outbound dependencies and predictable in latency.
+fn platform_user(log: &RequestLog) -> (Option<String>, &'static str) {
+	// 1. Gateway-validated claims (strict routes).
+	if let Some(claims) = log
+		.request_snapshot
+		.as_ref()
+		.and_then(|req| req.jwt.as_ref())
+	{
+		for key in IDENTITY_CLAIM_KEYS {
+			if let Some(value) = claims.inner.get(key).and_then(Value::as_str)
+				&& !value.is_empty()
+			{
+				return (Some(value.to_string()), claim_source(key));
+			}
+		}
+	}
+	// 2. Unverified bearer payload (permissive routes) — `sub` for attribution.
+	if let Some(sub) = bearer_sub(log) {
+		return (Some(sub), "bearer_sub_unverified");
+	}
+	(None, "none")
+}
+
+/// Static source tag for a validated-claim identity, telling the audit reader
+/// whether the value is a human-readable address or an opaque subject id.
+fn claim_source(key: &str) -> &'static str {
+	match key {
+		"email" => "jwt_email",
+		"preferred_username" => "jwt_preferred_username",
+		"upn" => "jwt_upn",
+		"unique_name" => "jwt_unique_name",
+		_ => "jwt_sub",
+	}
+}
+
+/// Extract the `sub` claim from the request's bearer token WITHOUT verifying
+/// the signature. Used only to attribute audit events on permissive routes
+/// where the gateway does not otherwise decode the token; the upstream MCP
+/// server is the one that actually validates it. Returns `None` on any
+/// malformed input — this must never panic or affect request handling.
+fn bearer_sub(log: &RequestLog) -> Option<String> {
+	use base64::Engine as _;
+	use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+	let auth = header(log, "authorization")?;
+	let token = auth
+		.strip_prefix("Bearer ")
+		.or_else(|| auth.strip_prefix("bearer "))?;
+	// JWT = header.payload.signature — decode the payload segment only.
+	let payload_b64 = token.split('.').nth(1)?;
+	let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+	let claims: Value = serde_json::from_slice(&bytes).ok()?;
+	claims
+		.get("sub")
+		.and_then(Value::as_str)
+		.filter(|s| !s.is_empty())
+		.map(ToOwned::to_owned)
+}
+
 fn header<K>(log: &RequestLog, name: K) -> Option<String>
 where
 	K: AsHeaderName,
@@ -802,7 +897,60 @@ mod tests {
 			forwarded_for: None,
 			transport: "streamable-http",
 			server: "test".to_string(),
+			platform_user: None,
+			platform_user_source: "none",
 		}
+	}
+
+	/// Build a JWT-shaped string `header.payload.signature` whose payload is the
+	/// given JSON claims (base64url, no signature verification — matches how an
+	/// MCP bearer arrives on a permissive route).
+	fn fake_jwt(claims: serde_json::Value) -> String {
+		use base64::Engine as _;
+		use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+		let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+		let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+		format!("{header}.{payload}.sig-not-verified")
+	}
+
+	#[test]
+	fn claim_source_distinguishes_human_readable_from_opaque() {
+		assert_eq!(claim_source("email"), "jwt_email");
+		assert_eq!(claim_source("upn"), "jwt_upn");
+		assert_eq!(claim_source("sub"), "jwt_sub");
+		// Unknown keys fall back to the opaque-subject tag, never a crash.
+		assert_eq!(claim_source("whatever"), "jwt_sub");
+	}
+
+	#[test]
+	fn bearer_sub_decode_is_pure_and_panic_free() {
+		// The decode logic mirrors bearer_sub() but is exercised directly here
+		// since bearer_sub takes a RequestLog. Verifies the base64url+JSON path
+		// extracts sub and tolerates garbage without panicking.
+		use base64::Engine as _;
+		use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+		let decode_sub = |token: &str| -> Option<String> {
+			let payload_b64 = token.split('.').nth(1)?;
+			let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+			let claims: Value = serde_json::from_slice(&bytes).ok()?;
+			claims
+				.get("sub")
+				.and_then(Value::as_str)
+				.filter(|s| !s.is_empty())
+				.map(ToOwned::to_owned)
+		};
+
+		// Atlassian-style account id in sub.
+		let jwt = fake_jwt(json!({ "sub": "712020:fedb54a7-7627-4545-b117-ce6aa03611a8" }));
+		assert_eq!(
+			decode_sub(&jwt).as_deref(),
+			Some("712020:fedb54a7-7627-4545-b117-ce6aa03611a8")
+		);
+		// Garbage / non-JWT inputs return None, never panic.
+		assert_eq!(decode_sub("not-a-jwt"), None);
+		assert_eq!(decode_sub("a.!!!notbase64!!!.c"), None);
+		assert_eq!(decode_sub(""), None);
 	}
 
 	#[test]
