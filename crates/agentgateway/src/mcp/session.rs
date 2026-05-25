@@ -628,6 +628,7 @@ impl Session {
 										service_name,
 										tool,
 										"success",
+										call_arguments.as_ref(),
 									);
 									let tn = tool.to_string();
 									ctr.params.name = tn.into();
@@ -652,6 +653,7 @@ impl Session {
 								service_name,
 								tool,
 								"pending_confirmation",
+								call_arguments.as_ref(),
 							);
 
 							let preview = build_preview(tool, call_arguments.as_ref());
