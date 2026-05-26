@@ -134,7 +134,9 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 	// fields as every access event.
 	let ctx = AuditContext {
 		source_ip: Some(log.tcp_info.peer_addr.ip().to_string()),
+		source_port: Some(log.tcp_info.peer_addr.port()),
 		forwarded_for: header(log, "x-forwarded-for"),
+		user_agent: header(log, "user-agent"),
 		transport: transport(log),
 		server: server.to_string(),
 	};
@@ -156,7 +158,12 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 	put(&mut event, "sessionIdHash", session_id.map(session_id_hash));
 	put(&mut event, "kaitUser", kait_user);
 	put(&mut event, "sourceIp", ctx.source_ip.clone());
+	event.insert(
+		"sourcePort".into(),
+		ctx.source_port.map_or(Value::Null, |p| json!(p)),
+	);
 	put(&mut event, "forwardedFor", ctx.forwarded_for.clone());
+	put(&mut event, "userAgent", ctx.user_agent.clone());
 	event.insert("transport".into(), json!(ctx.transport));
 	event.insert("outcome".into(), json!(outcome));
 	event.insert(
@@ -208,7 +215,12 @@ fn emit_l1_session_authenticated(session_id: &str, kait_user: &str, ctx: &AuditC
 	// Same core fields as the L1 auth_failure event so login-success and
 	// login-failure are directly comparable in Splunk.
 	put(&mut event, "sourceIp", ctx.source_ip.clone());
+	event.insert(
+		"sourcePort".into(),
+		ctx.source_port.map_or(Value::Null, |p| json!(p)),
+	);
 	put(&mut event, "forwardedFor", ctx.forwarded_for.clone());
+	put(&mut event, "userAgent", ctx.user_agent.clone());
 	event.insert("transport".into(), json!(ctx.transport));
 	event.insert("server".into(), json!(ctx.server));
 	event.insert("outcome".into(), json!("success"));
@@ -225,7 +237,11 @@ pub fn emit_l3_session_closed(session_id: &str) {
 	let kait_user = evict_session_user(session_id);
 	let mut event = audit_base("L3", "session_closed");
 	event.insert("sessionIdHash".into(), json!(session_id_hash(session_id)));
-	put_opt(&mut event, "kaitUser", kait_user);
+	// `put` (not `put_opt`) so the key is always present — a session dropped
+	// before any user was captured still emits `kaitUser: null` rather than
+	// omitting the field, keeping session_closed field-set-consistent with
+	// every other audit event.
+	put(&mut event, "kaitUser", kait_user);
 	event.insert("outcome".into(), json!("success"));
 	event.insert("reason".into(), Value::Null);
 	emit(Value::Object(event));
@@ -343,18 +359,11 @@ fn audit_base(logging_id: &str, event: &str) -> Map<String, Value> {
 	base
 }
 
-fn put_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
-	if let Some(value) = value {
-		map.insert(key.into(), json!(value));
-	}
-}
-
-/// Insert a canonical-schema field. Unlike [`put_opt`], the key is ALWAYS
-/// present — a missing value serializes as JSON `null` rather than being
-/// omitted. This guarantees every event of a given type carries the same
-/// set of keys, which the security team relies on for stable field
-/// extraction in Splunk (an omitted key and a null key are not equivalent to
-/// a downstream query).
+/// Insert a canonical-schema field. The key is ALWAYS present — a missing
+/// value serializes as JSON `null` rather than being omitted. This guarantees
+/// every event of a given type carries the same set of keys, which the
+/// security team relies on for stable field extraction in Splunk (an omitted
+/// key and a null key are not equivalent to a downstream query).
 fn put(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
 	map.insert(key.into(), value.map_or(Value::Null, Value::String));
 }
@@ -366,7 +375,9 @@ fn put(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
 #[derive(Clone)]
 struct AuditContext {
 	source_ip: Option<String>,
+	source_port: Option<u16>,
 	forwarded_for: Option<String>,
+	user_agent: Option<String>,
 	transport: &'static str,
 	server: String,
 }
@@ -799,7 +810,9 @@ mod tests {
 	fn test_ctx() -> AuditContext {
 		AuditContext {
 			source_ip: Some("127.0.0.1".to_string()),
+			source_port: Some(54321),
 			forwarded_for: None,
+			user_agent: None,
 			transport: "streamable-http",
 			server: "test".to_string(),
 		}
