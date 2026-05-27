@@ -573,6 +573,25 @@ fn upstream_status(mcp: Option<&MCPInfo>) -> Option<u64> {
 		})
 }
 
+/// Raw text of the first `text` content item in a tool result, WITHOUT parsing
+/// it as JSON. Last-resort source for the `reason` of an error result whose
+/// payload is a plain string rather than a `{"message": …}` object.
+fn extract_tool_text_raw(result: &Value) -> Option<String> {
+	result
+		.get("content")?
+		.as_array()?
+		.iter()
+		.find_map(|item| {
+			if item.get("type").and_then(Value::as_str) != Some("text") {
+				return None;
+			}
+			item
+				.get("text")
+				.and_then(Value::as_str)
+				.map(ToOwned::to_owned)
+		})
+}
+
 fn reason(log: &RequestLog, mcp: Option<&MCPInfo>, status: Option<u16>) -> Option<String> {
 	let tool = mcp.and_then(|m| m.tool.as_ref());
 
@@ -603,6 +622,31 @@ fn reason(log: &RequestLog, mcp: Option<&MCPInfo>, status: Option<u16>) -> Optio
 			.filter(|s| !s.is_empty())
 	{
 		return Some(msg.to_string());
+	}
+
+	// 2b. Error result with no top-level `message` — e.g. Microsoft Graph /
+	//     Teams errors returned as `{"error": {"message": …}}`, a bare `error`
+	//     string, or plain non-JSON error text. Guarded to failures ONLY so a
+	//     successful tool's result body is never surfaced; capped to bound the
+	//     log line.
+	if tool.is_some_and(|t| tool_outcome_from_result(t) == Some("failure")) {
+		let result = tool.and_then(|t| t.result.as_ref());
+		if let Some(payload) = result.and_then(extract_tool_text_payload) {
+			let msg = payload
+				.get("error")
+				.and_then(|e| e.get("message").and_then(Value::as_str).or_else(|| e.as_str()))
+				.filter(|s| !s.is_empty())
+				.map(ToOwned::to_owned);
+			if let Some(msg) = msg {
+				return Some(msg);
+			}
+		}
+		if let Some(text) = result.and_then(extract_tool_text_raw) {
+			let trimmed = text.trim();
+			if !trimmed.is_empty() {
+				return Some(trimmed.chars().take(300).collect());
+			}
+		}
 	}
 
 	// 3. Transport-level fallback (HTTP errors / connection failures).
