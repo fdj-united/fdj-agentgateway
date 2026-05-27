@@ -178,10 +178,15 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 		"toolCategory".into(),
 		tool_name.map_or(Value::Null, |t| json!(tool_category(t))),
 	);
-	event.insert(
-		"affectedObjects".into(),
-		Value::Array(affected_objects(tool_name, args)),
-	);
+	// affectedObjects = identifiers from the request args PLUS, for create
+	// operations, the new object's id parsed from the upstream RESULT (e.g. the
+	// issue key Jira assigns on createJiraIssue, which is absent from the args).
+	let mut affected = affected_objects(tool_name, args);
+	affected.extend(affected_objects_from_result(
+		tool_name,
+		tool.and_then(|t| t.result.as_ref()),
+	));
+	event.insert("affectedObjects".into(), Value::Array(affected));
 	event.insert("durationMs".into(), json!(duration_ms(duration)));
 	put(&mut event, "httpStatus", status.map(|s| s.to_string()));
 	// Transport-level `httpStatus` is frequently 200 even when the upstream
@@ -796,6 +801,62 @@ fn affected_objects(tool: Option<&str>, args: Option<&Map<String, Value>>) -> Ve
 		first_string(Some(args), &["channelId"]),
 		operation,
 	);
+	// lookupJiraAccountId: record WHICH user the caller resolved (the search
+	// term — a colleague's name / email / accountId). Guarded to this tool so
+	// the generic candidate keys can't match unrelated tools' args.
+	if tool == Some("lookupJiraAccountId") {
+		push_object(
+			&mut objects,
+			"jira_user",
+			"lookup",
+			first_string(
+				Some(args),
+				&[
+					"query",
+					"searchString",
+					"accountId",
+					"displayName",
+					"emailAddress",
+					"username",
+					"name",
+					"user",
+				],
+			),
+			operation,
+		);
+	}
+	objects
+}
+
+/// Object identifiers derived from the tool RESULT (not the request args).
+/// Used for create operations where the upstream assigns the new object's id
+/// and it only appears in the response — e.g. the issue key Jira returns from
+/// createJiraIssue (the request args carry only the project). Reads only
+/// structured identifier fields, never the result body.
+fn affected_objects_from_result(tool: Option<&str>, result: Option<&Value>) -> Vec<Value> {
+	let mut objects = Vec::new();
+	let Some(tool) = tool else {
+		return objects;
+	};
+	let Some(payload) = result.and_then(extract_tool_text_payload) else {
+		return objects;
+	};
+	let map = payload.as_object();
+	let operation = tool_category(tool);
+	if tool == "createJiraIssue" {
+		let key = first_string(map, &["key", "issueKey"]);
+		let has_key = key.is_some();
+		push_object(&mut objects, "jira_issue", "key", key, operation);
+		if !has_key {
+			push_object(
+				&mut objects,
+				"jira_issue",
+				"id",
+				first_string(map, &["id", "issueId"]),
+				operation,
+			);
+		}
+	}
 	objects
 }
 
