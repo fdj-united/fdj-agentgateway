@@ -320,9 +320,11 @@ pub struct ArgRewriteRule {
 	pub op: RewriteOp,
 	/// The text used by the operation. For `wrap`, may contain `{original}`
 	/// which is substituted with the current value before assignment. Ignored
-	/// (and may be omitted) for `remove`.
+	/// for `remove` — may be omitted or set to `null` in YAML (helm renders
+	/// missing keys as explicit `null`, so the type is `Option<String>` to
+	/// accept either spelling without a deserialization failure at startup).
 	#[serde(default)]
-	pub value: String,
+	pub value: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,13 +418,16 @@ impl McpArgRewriteSet {
 				);
 				continue;
 			};
+			// Non-Remove ops require a string `value`; treat missing/null as the
+			// empty string to preserve the prior `#[serde(default)] String` semantics.
+			let value = rule.value.as_deref().unwrap_or("");
 			match rule.op {
-				RewriteOp::Append => target.push_str(&rule.value),
-				RewriteOp::Prepend => *target = format!("{}{}", rule.value, target),
-				RewriteOp::Replace => *target = rule.value.clone(),
+				RewriteOp::Append => target.push_str(value),
+				RewriteOp::Prepend => *target = format!("{}{}", value, target),
+				RewriteOp::Replace => *target = value.to_string(),
 				RewriteOp::Wrap => {
 					let original = std::mem::take(target);
-					*target = rule.value.replace("{original}", &original);
+					*target = value.replace("{original}", &original);
 				},
 				// Handled above before walk_to_string_mut.
 				RewriteOp::Remove => unreachable!(),
@@ -1193,5 +1198,81 @@ mod presentation_tests {
 			.expect("expected presentation");
 		let fields = result.get("fields").and_then(|v| v.as_array()).unwrap();
 		assert!(fields[0].get("value").unwrap().is_object());
+	}
+}
+
+#[cfg(test)]
+mod argrewrite_tests {
+	use super::*;
+
+	// Regression: v0.0.53 shipped a `remove` op whose YAML form intentionally
+	// omits `value:`. Helm renders missing keys as explicit `null`, which the
+	// previous `value: String` field rejected at startup with
+	//   invalid type: null, expected a string
+	// causing the gateway pod to crash-loop. The field is now `Option<String>`
+	// so both spellings deserialize cleanly.
+	#[test]
+	fn remove_rule_parses_without_value() {
+		let yaml = r#"
+rules:
+  - tools: [send-chat-message]
+    path: excludeResponse
+    op: remove
+"#;
+		let parsed: McpArgRewrite = serde_yaml::from_str(yaml).expect("parse");
+		assert_eq!(parsed.rules.len(), 1);
+		assert_eq!(parsed.rules[0].op, RewriteOp::Remove);
+		assert!(parsed.rules[0].value.is_none());
+	}
+
+	#[test]
+	fn remove_rule_parses_with_null_value() {
+		let yaml = r#"
+rules:
+  - tools: [send-chat-message]
+    path: excludeResponse
+    op: remove
+    value: null
+"#;
+		let parsed: McpArgRewrite = serde_yaml::from_str(yaml).expect("parse");
+		assert!(parsed.rules[0].value.is_none());
+	}
+
+	#[test]
+	fn remove_strips_top_level_key() {
+		let set = McpArgRewriteSet::new(vec![ArgRewriteRule {
+			tools: vec!["send-chat-message".to_string()],
+			path: "excludeResponse".to_string(),
+			op: RewriteOp::Remove,
+			value: None,
+		}]);
+		let mut args = Some(
+			serde_json::json!({"chatId": "x", "excludeResponse": true})
+				.as_object()
+				.unwrap()
+				.clone(),
+		);
+		set.apply("send-chat-message", &mut args);
+		let map = args.unwrap();
+		assert!(!map.contains_key("excludeResponse"));
+		assert!(map.contains_key("chatId"));
+	}
+
+	#[test]
+	fn append_still_works_with_explicit_value() {
+		let set = McpArgRewriteSet::new(vec![ArgRewriteRule {
+			tools: vec!["t".to_string()],
+			path: "body.content".to_string(),
+			op: RewriteOp::Append,
+			value: Some(" suffix".to_string()),
+		}]);
+		let mut args = Some(
+			serde_json::json!({"body": {"content": "hello"}})
+				.as_object()
+				.unwrap()
+				.clone(),
+		);
+		set.apply("t", &mut args);
+		assert_eq!(args.unwrap()["body"]["content"], "hello suffix");
 	}
 }
