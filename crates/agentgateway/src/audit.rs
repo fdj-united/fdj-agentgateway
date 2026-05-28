@@ -187,16 +187,6 @@ pub fn emit_l3_mcp_access(log: &RequestLog, mcp: Option<&MCPInfo>, duration: Dur
 		tool.and_then(|t| t.result.as_ref()),
 	));
 	event.insert("affectedObjects".into(), Value::Array(affected));
-	// TEMP DIAGNOSTIC — describe the SHAPE of tool.result (never its content)
-	// so we can tell from Splunk whether the upstream result is being captured
-	// for tool calls where affected_objects_from_result expects to drill in.
-	// Remove in the follow-up PR once root cause is identified.
-	if tool_name.is_some() {
-		event.insert(
-			"_resultProbe".into(),
-			json!(probe_result_shape(tool.and_then(|t| t.result.as_ref()))),
-		);
-	}
 	event.insert("durationMs".into(), json!(duration_ms(duration)));
 	put(&mut event, "httpStatus", status.map(|s| s.to_string()));
 	// Transport-level `httpStatus` is frequently 200 even when the upstream
@@ -915,60 +905,6 @@ fn affected_objects_from_result(tool: Option<&str>, result: Option<&Value>) -> V
 		);
 	}
 	objects
-}
-
-/// TEMP DIAGNOSTIC — describe the structural shape of a captured tool result
-/// without exposing any of its content. Used only by the `_resultProbe` audit
-/// field added in v0.0.55 to narrow down why ms365 send-* tool calls land in
-/// Splunk with `affectedObjects` missing the new message id even though the
-/// upstream demonstrably returned a full response body. Will be removed in the
-/// follow-up PR once root cause is identified.
-fn probe_result_shape(result: Option<&Value>) -> String {
-	let Some(value) = result else {
-		return "none".to_string();
-	};
-	match value {
-		Value::Null => "null".to_string(),
-		Value::Bool(_) => "bool".to_string(),
-		Value::Number(_) => "number".to_string(),
-		Value::String(_) => "string".to_string(),
-		Value::Array(a) => format!("array(len={})", a.len()),
-		Value::Object(map) => {
-			let keys: Vec<&str> = map.keys().map(String::as_str).collect();
-			let mut s = format!("object[{}]", keys.join(","));
-			// Drill one level into `content[0]` (the MCP CallToolResult shape)
-			// because that's where the upstream JSON-encoded body lives.
-			if let Some(first) = map
-				.get("content")
-				.and_then(Value::as_array)
-				.and_then(|a| a.first())
-				.and_then(Value::as_object)
-			{
-				let inner: Vec<&str> = first.keys().map(String::as_str).collect();
-				s.push_str(&format!(" content[0]={{{}}}", inner.join(",")));
-				if let Some(text) = first.get("text").and_then(Value::as_str) {
-					s.push_str(&format!(" textLen={}", text.len()));
-					// Try to parse the text as JSON and list its top-level keys
-					// (key NAMES only — never values) so we can see whether the
-					// upstream body actually exposes the id field where we
-					// expect it, without leaking any user content.
-					match serde_json::from_str::<Value>(text) {
-						Ok(Value::Object(inner)) => {
-							let inner_keys: Vec<&str> =
-								inner.keys().map(String::as_str).take(20).collect();
-							s.push_str(&format!(" innerKeys=[{}]", inner_keys.join(",")));
-						},
-						Ok(Value::Array(arr)) => {
-							s.push_str(&format!(" innerArray(len={})", arr.len()));
-						},
-						Ok(_) => s.push_str(" innerScalar"),
-						Err(_) => s.push_str(" innerParse=FAIL"),
-					}
-				}
-			}
-			s
-		},
-	}
 }
 
 fn push_object(
