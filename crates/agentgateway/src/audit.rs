@@ -801,6 +801,34 @@ fn affected_objects(tool: Option<&str>, args: Option<&Map<String, Value>>) -> Ve
 		first_string(Some(args), &["channelId"]),
 		operation,
 	);
+	// ms365 team id (get-team / list-team-channels / list-team-members and
+	// every channel/team-scoped operation — MS Graph paths include {team-id}).
+	push_object(
+		&mut objects,
+		"ms365_team",
+		"id",
+		first_string(Some(args), &["teamId", "team-id", "team_id"]),
+		operation,
+	);
+	// ms365 message id (get-channel-message, list-channel-message-replies,
+	// reply-to-channel-message → parent message id; same for chat tools).
+	// For send-* tools args carry no message id (it's assigned by MS Graph on
+	// creation and surfaces via affected_objects_from_result below).
+	push_object(
+		&mut objects,
+		"ms365_message",
+		"id",
+		first_string(
+			Some(args),
+			&[
+				"chatMessage-id",
+				"chatMessageId",
+				"messageId",
+				"message-id",
+			],
+		),
+		operation,
+	);
 	// lookupJiraAccountId: record WHICH user the caller resolved (the search
 	// term — a colleague's name / email / accountId). Guarded to this tool so
 	// the generic candidate keys can't match unrelated tools' args.
@@ -856,6 +884,25 @@ fn affected_objects_from_result(tool: Option<&str>, result: Option<&Value>) -> V
 				operation,
 			);
 		}
+	}
+	// ms365 send / reply tools: the newly created chatMessage's id is assigned
+	// by MS Graph on creation and only appears in the response. The args carry
+	// the chat/channel (and for replies, the parent message id); the *new*
+	// message id is captured here from the result.
+	if matches!(
+		tool,
+		"send-channel-message"
+			| "send-chat-message"
+			| "reply-to-channel-message"
+			| "reply-to-chat-message"
+	) {
+		push_object(
+			&mut objects,
+			"ms365_message",
+			"id",
+			first_string(map, &["id", "chatMessageId", "messageId"]),
+			operation,
+		);
 	}
 	objects
 }
