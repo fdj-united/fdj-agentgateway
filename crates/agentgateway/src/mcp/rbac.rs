@@ -319,7 +319,9 @@ pub struct ArgRewriteRule {
 	#[serde(default)]
 	pub op: RewriteOp,
 	/// The text used by the operation. For `wrap`, may contain `{original}`
-	/// which is substituted with the current value before assignment.
+	/// which is substituted with the current value before assignment. Ignored
+	/// (and may be omitted) for `remove`.
+	#[serde(default)]
 	pub value: String,
 }
 
@@ -331,6 +333,13 @@ pub enum RewriteOp {
 	Prepend,
 	Replace,
 	Wrap,
+	/// Delete a top-level key from the call's `arguments` map. Used to strip
+	/// upstream toggles the agent should not be able to flip — e.g. the
+	/// `excludeResponse` flag exposed by ms365-mcp that, when set, makes the
+	/// upstream drop the response body (and with it the new object id the
+	/// gateway needs for audit). `value` is ignored; `path` must be a
+	/// top-level key (no `.` segments).
+	Remove,
 }
 
 impl Default for RewriteOp {
@@ -382,6 +391,23 @@ impl McpArgRewriteSet {
 			if !rule.tools.iter().any(|t| t == tool_name) {
 				continue;
 			}
+			// `Remove` bypasses walk_to_string_mut because the target can be ANY
+			// type (boolean, object, array, …) — we delete the entry rather than
+			// modify a string. Only top-level keys are supported (no dots);
+			// nested paths are skipped with a debug line to keep behaviour
+			// explicit.
+			if matches!(rule.op, RewriteOp::Remove) {
+				if rule.path.contains('.') {
+					tracing::debug!(
+						"mcpArgRewrite: 'remove' supports only top-level paths, skipping '{}' for tool {}",
+						rule.path,
+						tool_name
+					);
+					continue;
+				}
+				map.remove(&rule.path);
+				continue;
+			}
 			let Some(target) = walk_to_string_mut(map, &rule.path) else {
 				tracing::debug!(
 					"mcpArgRewrite: skipping rule for tool {} — path '{}' not found or not a string",
@@ -398,6 +424,8 @@ impl McpArgRewriteSet {
 					let original = std::mem::take(target);
 					*target = rule.value.replace("{original}", &original);
 				},
+				// Handled above before walk_to_string_mut.
+				RewriteOp::Remove => unreachable!(),
 			}
 		}
 	}
