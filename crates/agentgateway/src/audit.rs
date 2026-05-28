@@ -948,6 +948,22 @@ fn probe_result_shape(result: Option<&Value>) -> String {
 				s.push_str(&format!(" content[0]={{{}}}", inner.join(",")));
 				if let Some(text) = first.get("text").and_then(Value::as_str) {
 					s.push_str(&format!(" textLen={}", text.len()));
+					// Try to parse the text as JSON and list its top-level keys
+					// (key NAMES only — never values) so we can see whether the
+					// upstream body actually exposes the id field where we
+					// expect it, without leaking any user content.
+					match serde_json::from_str::<Value>(text) {
+						Ok(Value::Object(inner)) => {
+							let inner_keys: Vec<&str> =
+								inner.keys().map(String::as_str).take(20).collect();
+							s.push_str(&format!(" innerKeys=[{}]", inner_keys.join(",")));
+						},
+						Ok(Value::Array(arr)) => {
+							s.push_str(&format!(" innerArray(len={})", arr.len()));
+						},
+						Ok(_) => s.push_str(" innerScalar"),
+						Err(_) => s.push_str(" innerParse=FAIL"),
+					}
 				}
 			}
 			s
