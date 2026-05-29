@@ -866,10 +866,17 @@ fn affected_objects_from_result(tool: Option<&str>, result: Option<&Value>) -> V
 	let Some(tool) = tool else {
 		return objects;
 	};
-	let Some(payload) = result.and_then(extract_tool_text_payload) else {
+	let Some(result_val) = result else {
 		return objects;
 	};
-	let map = payload.as_object();
+	// Keep the raw text owned so the TOON fallback (below) can borrow it after
+	// the JSON parse attempt; nested let-borrow on a temporary would not live
+	// long enough.
+	let raw_text = extract_tool_text_raw(result_val);
+	let payload: Option<Value> = raw_text
+		.as_deref()
+		.and_then(|s| serde_json::from_str::<Value>(s).ok());
+	let map = payload.as_ref().and_then(Value::as_object);
 	let operation = tool_category(tool);
 	if tool == "createJiraIssue" {
 		let key = first_string(map, &["key", "issueKey"]);
@@ -889,6 +896,14 @@ fn affected_objects_from_result(tool: Option<&str>, result: Option<&Value>) -> V
 	// by MS Graph on creation and only appears in the response. The args carry
 	// the chat/channel (and for replies, the parent message id); the *new*
 	// message id is captured here from the result.
+	//
+	// Two upstream encodings are handled, in priority order:
+	//   1. JSON   — `first_string(map, ...)` reads `id` from the parsed object.
+	//   2. TOON   — when ms365-mcp is launched with `--toon` the payload is a
+	//               YAML-like dump that fails serde_json::from_str. Fall back
+	//               to a regex that matches the top-level `id:` line; nested
+	//               fields (e.g. `from.user.id`) are indented and excluded by
+	//               the column-0 anchor.
 	if matches!(
 		tool,
 		"send-channel-message"
@@ -896,15 +911,27 @@ fn affected_objects_from_result(tool: Option<&str>, result: Option<&Value>) -> V
 			| "reply-to-channel-message"
 			| "reply-to-chat-message"
 	) {
-		push_object(
-			&mut objects,
-			"ms365_message",
-			"id",
-			first_string(map, &["id", "chatMessageId", "messageId"]),
-			operation,
-		);
+		let id = first_string(map, &["id", "chatMessageId", "messageId"])
+			.or_else(|| raw_text.as_deref().and_then(extract_id_from_toon_top_level));
+		push_object(&mut objects, "ms365_message", "id", id, operation);
 	}
 	objects
+}
+
+/// Last-resort id extractor for ms365 send/reply tool results when ms365-mcp
+/// is configured with `--toon`, returning YAML-like TOON instead of JSON.
+///
+/// TOON top-level scalar: `id: "<value>"` (or unquoted) at column 0. Nested
+/// `id` fields are indented and ignored by the `^` anchor. Quotes around the
+/// value are optional — `@toon-format/toon` quotes long numeric strings but
+/// leaves plain identifiers bare; both spellings are accepted.
+fn extract_id_from_toon_top_level(text: &str) -> Option<String> {
+	use std::sync::OnceLock;
+	static RE: OnceLock<regex::Regex> = OnceLock::new();
+	let re = RE.get_or_init(|| {
+		regex::Regex::new(r#"(?m)^id:\s*['"]?([^\s'"]+)"#).expect("static regex compiles")
+	});
+	re.captures(text)?.get(1).map(|m| m.as_str().to_string())
 }
 
 fn push_object(
@@ -994,6 +1021,82 @@ mod tests {
 		assert_eq!(objects[0]["type"], "jira_issue");
 		assert_eq!(objects[0]["key"], "SEC-123");
 		assert!(objects.iter().all(|obj| obj.get("body").is_none()));
+	}
+
+	// Real TOON output captured by encoding a typical MS Graph ChatMessage
+	// response through the same `@toon-format/toon` package ms365-mcp uses
+	// when launched with `--toon` (verified locally via `npm install
+	// @toon-format/toon && node` — the encoded shape places `id` on line 0
+	// with optional double-quotes around the value).
+	const TOON_SEND_CHANNEL_MESSAGE_RESULT: &str = r#"id: "1780042021373"
+replyToId: null
+etag: "1780042021373"
+messageType: message
+createdDateTime: "2026-05-29T11:30:00Z"
+channelIdentity:
+  teamId: a92189c2-7cf2-429c-9964-257bee842c40
+  channelId: "19:4fcef9c7359d42979b55292e80636b40@thread.tacv2"
+from:
+  user:
+    id: abc-123
+    displayName: Feng Lu
+body:
+  contentType: html
+  content: "hi"
+"#;
+
+	#[test]
+	fn toon_fallback_extracts_top_level_id_for_send_channel_message() {
+		// Wrap the TOON text in the MCP CallToolResult envelope agentgateway
+		// captures from upstream; the JSON parser will fail on the text body
+		// and the function MUST fall back to the TOON regex.
+		let result = json!({
+			"content": [{"type": "text", "text": TOON_SEND_CHANNEL_MESSAGE_RESULT}],
+		});
+		let objects = affected_objects_from_result(Some("send-channel-message"), Some(&result));
+		let msg = objects
+			.iter()
+			.find(|o| o["type"] == "ms365_message")
+			.expect("ms365_message must be extracted from TOON fallback");
+		assert_eq!(msg["id"], "1780042021373");
+	}
+
+	#[test]
+	fn toon_fallback_ignores_nested_id_under_from_user() {
+		// `from.user.id: abc-123` is indented; the `^id:` anchor rejects it,
+		// so the top-level message id wins instead of the nested user id.
+		let id = extract_id_from_toon_top_level(TOON_SEND_CHANNEL_MESSAGE_RESULT)
+			.expect("regex must match top-level id");
+		assert_eq!(id, "1780042021373");
+		assert_ne!(id, "abc-123");
+	}
+
+	#[test]
+	fn toon_fallback_handles_unquoted_id_value() {
+		// Some TOON outputs leave plain ids bare (no surrounding quotes); the
+		// optional `['"]?` group must accept both spellings.
+		let text = "id: PLAIN-IDENTIFIER\nfoo: bar\n";
+		let id = extract_id_from_toon_top_level(text).expect("unquoted id should match");
+		assert_eq!(id, "PLAIN-IDENTIFIER");
+	}
+
+	#[test]
+	fn affected_objects_from_result_prefers_json_when_parseable() {
+		// JSON path stays the default; the TOON fallback only fires when
+		// serde_json::from_str fails. A clean JSON body must continue to
+		// produce the same result as before this PR.
+		let result = json!({
+			"content": [{
+				"type": "text",
+				"text": r#"{"id":"json-12345","body":{"content":"hi"}}"#,
+			}],
+		});
+		let objects = affected_objects_from_result(Some("send-chat-message"), Some(&result));
+		let msg = objects
+			.iter()
+			.find(|o| o["type"] == "ms365_message")
+			.expect("ms365_message must come from the JSON path");
+		assert_eq!(msg["id"], "json-12345");
 	}
 
 	#[test]
