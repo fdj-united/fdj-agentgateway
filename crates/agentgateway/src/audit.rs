@@ -810,23 +810,44 @@ fn affected_objects(tool: Option<&str>, args: Option<&Map<String, Value>>) -> Ve
 		first_string(Some(args), &["teamId", "team-id", "team_id"]),
 		operation,
 	);
-	// ms365 message id (get-channel-message, list-channel-message-replies,
-	// reply-to-channel-message → parent message id; same for chat tools).
+	// ms365 message id from args. The semantic depends on the tool:
+	//
+	//   - get-channel-message / get-chat-message: this IS the target message
+	//     being fetched. Logged as `ms365_message`.
+	//   - reply-to-channel-message / reply-to-chat-message: this is the PARENT
+	//     message under which the new reply is created. The new reply id comes
+	//     from the upstream result (see affected_objects_from_result below) and
+	//     is logged as `ms365_message`. To keep the two distinguishable in
+	//     Splunk (so a reviewer doesn't confuse parent and new-reply), the
+	//     parent goes under `ms365_parent_message`.
+	//   - list-channel-message-replies / list-chat-message-replies: same shape
+	//     — chatMessage-id is the parent whose replies are being listed.
+	//
 	// For send-* tools args carry no message id (it's assigned by MS Graph on
 	// creation and surfaces via affected_objects_from_result below).
+	let message_id_from_args = first_string(
+		Some(args),
+		&[
+			"chatMessage-id",
+			"chatMessageId",
+			"messageId",
+			"message-id",
+		],
+	);
+	let args_message_type = match tool {
+		Some(
+			"reply-to-channel-message"
+			| "reply-to-chat-message"
+			| "list-channel-message-replies"
+			| "list-chat-message-replies",
+		) => "ms365_parent_message",
+		_ => "ms365_message",
+	};
 	push_object(
 		&mut objects,
-		"ms365_message",
+		args_message_type,
 		"id",
-		first_string(
-			Some(args),
-			&[
-				"chatMessage-id",
-				"chatMessageId",
-				"messageId",
-				"message-id",
-			],
-		),
+		message_id_from_args,
 		operation,
 	);
 	// lookupJiraAccountId: record WHICH user the caller resolved (the search
@@ -1097,6 +1118,107 @@ body:
 			.find(|o| o["type"] == "ms365_message")
 			.expect("ms365_message must come from the JSON path");
 		assert_eq!(msg["id"], "json-12345");
+	}
+
+	// Security-team feedback: when a reply-* tool runs, both the parent
+	// message id (from args) and the new reply id (from result) used to share
+	// the `ms365_message` type — Splunk reviewers couldn't tell them apart.
+	// The parent must now be tagged `ms365_parent_message` instead.
+
+	#[test]
+	fn reply_to_channel_message_separates_parent_and_new_message_types() {
+		let args = json!({
+			"teamId": "team-1",
+			"channelId": "channel-1",
+			"chatMessage-id": "PARENT-9999",
+			"body": {"body": {"content": "ok", "contentType": "text"}},
+		})
+		.as_object()
+		.cloned()
+		.unwrap();
+		let objects = affected_objects(Some("reply-to-channel-message"), Some(&args));
+		// chatMessage-id MUST be tagged as parent, not as ms365_message.
+		assert!(
+			objects
+				.iter()
+				.any(|o| o["type"] == "ms365_parent_message" && o["id"] == "PARENT-9999"),
+			"expected ms365_parent_message:PARENT-9999, got {:#?}",
+			objects,
+		);
+		assert!(
+			!objects
+				.iter()
+				.any(|o| o["type"] == "ms365_message" && o["id"] == "PARENT-9999"),
+			"parent must NOT be double-tagged as ms365_message, got {:#?}",
+			objects,
+		);
+	}
+
+	#[test]
+	fn reply_to_chat_message_separates_parent_message_type() {
+		let args = json!({
+			"chatId": "chat-1",
+			"chatMessage-id": "PARENT-7777",
+			"body": {"body": {"content": "ok", "contentType": "text"}},
+		})
+		.as_object()
+		.cloned()
+		.unwrap();
+		let objects = affected_objects(Some("reply-to-chat-message"), Some(&args));
+		assert!(
+			objects
+				.iter()
+				.any(|o| o["type"] == "ms365_parent_message" && o["id"] == "PARENT-7777"),
+			"expected ms365_parent_message:PARENT-7777, got {:#?}",
+			objects,
+		);
+	}
+
+	#[test]
+	fn list_channel_message_replies_tags_parent_message() {
+		let args = json!({
+			"teamId": "team-1",
+			"channelId": "channel-1",
+			"chatMessage-id": "PARENT-LIST-1",
+		})
+		.as_object()
+		.cloned()
+		.unwrap();
+		let objects = affected_objects(Some("list-channel-message-replies"), Some(&args));
+		assert!(
+			objects
+				.iter()
+				.any(|o| o["type"] == "ms365_parent_message" && o["id"] == "PARENT-LIST-1"),
+			"list-channel-message-replies: chatMessage-id should be tagged parent (the message whose replies are listed); got {:#?}",
+			objects,
+		);
+	}
+
+	#[test]
+	fn get_channel_message_keeps_ms365_message_type() {
+		// get-* and send-* tools must NOT be re-tagged as parent — they
+		// operate on the message itself, not on a parent of a reply.
+		let args = json!({
+			"teamId": "team-1",
+			"channelId": "channel-1",
+			"chatMessage-id": "TARGET-MSG-1",
+		})
+		.as_object()
+		.cloned()
+		.unwrap();
+		let objects = affected_objects(Some("get-channel-message"), Some(&args));
+		assert!(
+			objects
+				.iter()
+				.any(|o| o["type"] == "ms365_message" && o["id"] == "TARGET-MSG-1"),
+			"get-channel-message: chatMessage-id is the target message, must stay ms365_message; got {:#?}",
+			objects,
+		);
+		assert!(
+			!objects.iter().any(|o| o["type"] == "ms365_parent_message"),
+			"get-channel-message must NOT introduce ms365_parent_message; got {:#?}",
+			objects,
+		);
 	}
 
 	#[test]
