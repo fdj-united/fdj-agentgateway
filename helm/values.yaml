@@ -104,6 +104,14 @@ redis:
   # confirmation TTL + rate counters). "replication" if you need HA at
   # the Redis layer too.
   architecture: standalone
+  # Bitnami removed the original docker.io/bitnami/* image tags from Docker Hub
+  # (Aug 2025 catalog change), so the subchart's default image no longer pulls.
+  # Default to the public `bitnamilegacy` mirror so `redis.enabled: true` works
+  # out of the box; override `registry`/`repository` to point at a private
+  # registry mirror in environments where docker.io is not reachable.
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/redis
   auth:
     enabled: false
   master:
@@ -121,6 +129,14 @@ redis:
   networkPolicy:
     enabled: true
     allowExternal: false
+
+# Bitnami's chart refuses non-standard images (e.g. the `bitnamilegacy` mirror
+# above, or a private registry proxy) unless this escape hatch is set. Only takes
+# effect when `redis.enabled: true`. Drop it if you point redis.image at a
+# standard Bitnami source.
+global:
+  security:
+    allowInsecureImages: true
 
 # State-store behaviour when the configured backend (currently Redis) is
 # unavailable. "failClosed" surfaces a 5xx — safer when correctness
