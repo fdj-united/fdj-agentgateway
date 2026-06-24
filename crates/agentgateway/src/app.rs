@@ -106,6 +106,10 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	#[cfg(feature = "ui")]
 	info!("serving UI at http://{}/ui", config.admin_addr);
 
+	// Externalised MCP session state (confirmations + rate limits). Backed by Redis
+	// when REDIS_URL is set (required for safe multi-pod scaling), in-memory otherwise.
+	let mcp_state_store = build_mcp_state_store().await?;
+
 	let pi = ProxyInputs {
 		cfg: config.clone(),
 		stores: stores.clone(),
@@ -113,7 +117,11 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 		upstream: client.clone(),
 		ca,
 
-		mcp_state: mcp::App::new(stores.clone(), config.session_encoder.clone()),
+		mcp_state: mcp::App::new(
+			stores.clone(),
+			config.session_encoder.clone(),
+			mcp_state_store,
+		),
 	};
 
 	let gw = proxy::Gateway::new(Arc::new(pi), drain_rx.clone());
@@ -149,6 +157,54 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 		stores,
 		ready,
 	})
+}
+
+/// Construct the MCP state store from the environment.
+///
+/// * `REDIS_URL` — when set (and non-empty), use the shared Redis backend so the
+///   gateway can run with `replicas > 1`. Unset → in-memory (per-pod) backend.
+/// * `STATE_STORE_FAILURE_MODE` — `failOpen` or `failClosed` (default). Governs
+///   what the Redis backend does on a backend error at request time, and whether
+///   a failed connection at startup is fatal (`failClosed`) or degrades to the
+///   in-memory backend (`failOpen`).
+async fn build_mcp_state_store() -> anyhow::Result<Arc<dyn crate::state_store::StateStore>> {
+	use crate::mcp::FailureMode;
+	use crate::state_store::{InMemoryStore, RedisStore};
+
+	let failure_mode = match std::env::var("STATE_STORE_FAILURE_MODE")
+		.unwrap_or_default()
+		.to_ascii_lowercase()
+		.as_str()
+	{
+		"failopen" | "fail_open" => FailureMode::FailOpen,
+		_ => FailureMode::FailClosed,
+	};
+
+	match std::env::var("REDIS_URL") {
+		Ok(url) if !url.trim().is_empty() => match RedisStore::connect(&url, failure_mode).await {
+			Ok(store) => {
+				info!("state_store: Redis backend connected (failure_mode={failure_mode:?})");
+				Ok(Arc::new(store))
+			},
+			Err(e) => match failure_mode {
+				// Fail fast: refuse to start silently degraded to per-pod state.
+				FailureMode::FailClosed => Err(e.context(
+					"REDIS_URL is set but Redis is unreachable and STATE_STORE_FAILURE_MODE=failClosed",
+				)),
+				// Tolerate: degrade to in-memory rather than block startup.
+				FailureMode::FailOpen => {
+					warn!(
+						"state_store: Redis connect failed, falling back to in-memory (failure_mode=FailOpen): {e}"
+					);
+					Ok(Arc::new(InMemoryStore::new()))
+				},
+			},
+		},
+		_ => {
+			info!("state_store: using in-memory backend (REDIS_URL not set)");
+			Ok(Arc::new(InMemoryStore::new()))
+		},
+	}
 }
 
 pub struct Bound {

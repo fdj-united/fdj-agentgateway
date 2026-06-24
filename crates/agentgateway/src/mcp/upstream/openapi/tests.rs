@@ -51,7 +51,11 @@ async fn setup_with_prefix(prefix: &str) -> (MockServer, Handler) {
 		upstream: client.clone(),
 		ca: None,
 
-		mcp_state: mcp::router::App::new(stores.clone(), encoder),
+		mcp_state: mcp::router::App::new(
+			stores.clone(),
+			encoder,
+			std::sync::Arc::new(crate::state_store::InMemoryStore::new()),
+		),
 	});
 
 	let client = PolicyClient { inputs: pi.clone() };

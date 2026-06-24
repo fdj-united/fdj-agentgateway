@@ -38,15 +38,26 @@ spec:
           image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["-f", "/etc/agentgateway/config.yaml"]
-          {{- with .Values.deployment.sessionKeySecret }}
-          {{- if .name }}
+          {{- $hasSessionKey := and .Values.deployment.sessionKeySecret .Values.deployment.sessionKeySecret.name }}
+          {{- if or $hasSessionKey .Values.redis.enabled }}
           env:
+            {{- if $hasSessionKey }}
             - name: SESSION_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .name }}
-                  key: {{ .key | default "SESSION_KEY" | quote }}
-          {{- end }}
+                  name: {{ .Values.deployment.sessionKeySecret.name }}
+                  key: {{ .Values.deployment.sessionKeySecret.key | default "SESSION_KEY" | quote }}
+            {{- end }}
+            {{- if .Values.redis.enabled }}
+            # In-namespace Redis subchart — Bitnami's `standalone` architecture
+            # exposes one Service named `<release>-redis-master`. URL is not
+            # sensitive (no Redis auth, NetworkPolicy is the boundary), so it
+            # lives in values.yaml rather than a SealedSecret.
+            - name: REDIS_URL
+              value: "redis://{{ .Release.Name }}-redis-master.{{ .Release.Namespace }}.svc.cluster.local:6379/0"
+            - name: STATE_STORE_FAILURE_MODE
+              value: {{ .Values.stateStore.failureMode | default "failClosed" | quote }}
+            {{- end }}
           {{- end }}
           {{- with .Values.deployment.containerSecurityContext }}
           securityContext:

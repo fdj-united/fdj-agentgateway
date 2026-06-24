@@ -78,6 +78,8 @@ pub enum UpstreamError {
 	},
 	#[error("invalid request: {0}")]
 	InvalidRequest(String),
+	#[error("state store error: {0}")]
+	StateStore(String),
 	#[error("unsupported method: {0}")]
 	InvalidMethod(String),
 	#[error("method {0} is unsupported with multiplexing")]
