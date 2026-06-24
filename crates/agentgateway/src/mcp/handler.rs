@@ -124,6 +124,11 @@ impl Relay {
 		Some(sessions)
 	}
 
+	// Restores persisted upstream session ids onto freshly-built connections.
+	// Currently unused: a session resumed on another pod re-initializes its
+	// upstreams (see Session::reinitialize_upstreams) instead of restoring the
+	// originating pod's (now dead) session ids. Retained for the inverse capability.
+	#[allow(dead_code)]
 	pub fn set_sessions(&self, sessions: Vec<MCPSession>) -> anyhow::Result<()> {
 		if sessions.iter().all(|session| session.target_name.is_none()) {
 			if sessions.len() != self.upstreams.size() {
