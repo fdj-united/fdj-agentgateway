@@ -1,6 +1,6 @@
 dependencies:
-- name: agentgateway
-  repository: oci://cr.agentgateway.dev/charts
-  version: 1.1.0
-digest: sha256:feddcb37045764dd1d38205d40c9d14b926eb88939c0731c3aac0601f963156b
-generated: "2026-04-23T15:50:15.490399+02:00"
+- name: redis
+  repository: oci://registry-1.docker.io/bitnamicharts
+  version: 20.6.2
+digest: sha256:029c18ad72f8b74fbf04a3f1bee680e838167710533231594f07de4f5419c7b4
+generated: "2026-06-12T12:25:31.720953+02:00"

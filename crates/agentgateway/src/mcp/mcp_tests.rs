@@ -226,13 +226,19 @@ async fn stateless_multiplex_delete_session_skips_uninitialized_targets() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 	)
 	.unwrap();
-	let session_manager =
-		super::session::SessionManager::new(http::sessionpersistence::Encoder::base64());
+	let session_manager = super::session::SessionManager::new(
+		http::sessionpersistence::Encoder::base64(),
+		std::sync::Arc::new(crate::state_store::InMemoryStore::new()),
+	);
 	let mut session = session_manager.create_stateless_session(relay);
 	let parts = ::http::Request::<()>::builder()
 		.method(http::Method::POST)
@@ -279,6 +285,83 @@ async fn stateless_multiplex_delete_session_skips_uninitialized_targets() {
 	let response = session.delete_session(parts).await.unwrap();
 	assert_eq!(response.status(), http::StatusCode::ACCEPTED);
 	assert_eq!(mock_b.init_count().await, 0);
+}
+
+/// A session rebuilt from its encoded id (failover / pod restart) must report
+/// `resumed=true`, re-initialize its upstream exactly once, and serve a (keepalive)
+/// GET stream. A subsequent lookup of the same id is found live in-memory and
+/// reports `resumed=false` (so the re-init does not repeat).
+#[tokio::test]
+async fn resumed_session_reinitializes_upstream_and_flags_resumed() {
+	let mock = mock_streamable_http_server(true).await;
+	assert_eq!(mock.init_count().await, 0);
+
+	let make_inputs = || crate::mcp::handler::RelayInputs {
+		backend: McpBackendGroup {
+			targets: vec![fake_streamable_target("a", mock.addr)],
+			stateful: true,
+			failure_mode: FailureMode::FailClosed,
+		},
+		policies: empty_mcp_policies(),
+		confirmation: crate::mcp::McpConfirmationSet::default(),
+		rate_limit: crate::mcp::McpRateLimitSet::default(),
+		arg_rewrite: crate::mcp::McpArgRewriteSet::default(),
+		enrichment: crate::mcp::McpToolEnrichmentSet::default(),
+		client: PolicyClient {
+			inputs: setup_proxy_test("{}").unwrap().pi,
+		},
+	};
+
+	let encoder = http::sessionpersistence::Encoder::base64();
+	let sm = super::session::SessionManager::new(
+		encoder.clone(),
+		std::sync::Arc::new(crate::state_store::InMemoryStore::new()),
+	);
+
+	// An encoded id for a session NOT live in this manager — what a client sends
+	// after its original pod went away.
+	let id = http::sessionpersistence::SessionState::MCP(
+		http::sessionpersistence::MCPSessionState::new(vec![]),
+	)
+	.encode(&encoder)
+	.unwrap();
+
+	let parts = ::http::Request::<()>::builder()
+		.method(http::Method::GET)
+		.uri("http://example.test/mcp")
+		.body(())
+		.unwrap()
+		.into_parts()
+		.0;
+
+	// First lookup: rebuilt from the id -> resumed.
+	let (session, resumed) = sm
+		.get_or_resume_session(&id, make_inputs())
+		.unwrap()
+		.expect("session resumes");
+	assert!(resumed, "a session rebuilt from its id must report resumed=true");
+
+	// Resuming re-initializes the upstream exactly once.
+	session.reinitialize_upstreams(&parts).await;
+	assert_eq!(
+		mock.init_count().await,
+		1,
+		"resuming must re-initialize the upstream once"
+	);
+
+	// A resumed session serves a keepalive GET stream (200 event-stream), not a 404.
+	let resp = session.get_stream(parts).await.unwrap();
+	assert_eq!(resp.status(), http::StatusCode::OK);
+
+	// Second lookup of the same id: now live in-memory -> NOT resumed (no repeat re-init).
+	let (_session2, resumed2) = sm
+		.get_or_resume_session(&id, make_inputs())
+		.unwrap()
+		.expect("session found");
+	assert!(
+		!resumed2,
+		"a session found live in-memory must report resumed=false"
+	);
 }
 
 #[tokio::test]
@@ -1610,7 +1693,11 @@ async fn mock_streamable_http_server_with_colliding_tool() -> MockServer {
 			.await;
 		info!("colliding mock server stopped");
 	});
-	MockServer { addr, _cancel: tx }
+	MockServer {
+		addr,
+		_cancel: tx,
+		init_counter: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+	}
 }
 
 async fn mock_sse_server() -> MockServer {

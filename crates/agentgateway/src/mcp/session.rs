@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Instant;
 
 use ::http::StatusCode;
 use ::http::header::CONTENT_TYPE;
@@ -18,7 +17,6 @@ use rmcp::model::{
 use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
 use sse_stream::{KeepAlive, Sse, SseBody, SseStream};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::Mutex;
 
 use crate::http::Response;
 use crate::mcp::handler::{Relay, RelayInputs};
@@ -28,55 +26,6 @@ use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
 use crate::mcp::{ClientError, rbac};
 use crate::proxy::ProxyError;
 use crate::{mcp, *};
-
-/// Per-tool call counter for the rate limit window.
-#[derive(Debug, Clone)]
-struct RateLimitEntry {
-	count: u32,
-	window_started_at: Instant,
-}
-
-impl RateLimitEntry {
-	fn new() -> Self {
-		Self { count: 1, window_started_at: Instant::now() }
-	}
-
-	/// Returns whether the window has expired and resets it if so.
-	/// Returns the current count (after incrementing if still in window).
-	fn increment_or_reset(&mut self, window: std::time::Duration) -> u32 {
-		if Instant::now().duration_since(self.window_started_at) >= window {
-			self.count = 1;
-			self.window_started_at = Instant::now();
-		} else {
-			self.count += 1;
-		}
-		self.count
-	}
-}
-
-/// A tool call intercepted by the two-phase confirmation flow.
-/// Stored per-session, keyed by `(tool_name, args_hash)` so that:
-///   - parallel calls with different args each get their own pending entry
-///     (they no longer collide on tool-name alone), and
-///   - a confirmation re-call only matches when the LLM re-issues IDENTICAL
-///     args, defeating attempts to swap recipient/payload after approval.
-/// Single-use: consumed on Phase 2.
-#[derive(Debug, Clone)]
-struct PendingApproval {
-	expires_at: Instant,
-}
-
-impl PendingApproval {
-	fn new(ttl: std::time::Duration) -> Self {
-		Self {
-			expires_at: Instant::now() + ttl,
-		}
-	}
-
-	fn is_expired(&self) -> bool {
-		Instant::now() > self.expires_at
-	}
-}
 
 /// Order-independent hash of a JSON value: object keys are sorted before hashing
 /// so two semantically-equal arg maps produce the same hash regardless of how
@@ -137,16 +86,36 @@ pub struct Session {
 	relay: Arc<Relay>,
 	pub id: Arc<str>,
 	tx: Option<Sender<ServerJsonRpcMessage>>,
-	/// Pending two-phase confirmations, keyed by `<tool-name>|<args-hash>`.
-	/// Arc allows the HashMap to be shared across Session clones (same session, multiple requests).
-	pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
-	/// Per-tool call counters for rate limiting, keyed by fully-qualified tool name.
-	tool_call_counts: Arc<Mutex<HashMap<String, RateLimitEntry>>>,
+	/// Backing store for ephemeral per-session state — pending two-phase
+	/// confirmations and rate-limit counters. Pluggable so the state can live
+	/// either in-process (default) or in a shared Redis instance for multi-pod
+	/// deployments. Shared across Session clones (same session, multiple requests).
+	state: Arc<dyn crate::state_store::StateStore>,
 	/// Whether this session was created in stateful mode (confirmation requires statefulness).
 	is_stateful: bool,
+	/// True when this session was rebuilt from its encoded id (failover / pod
+	/// restart) rather than found live in-process. Such a session's upstream SSE
+	/// notification stream cannot be re-held by the upstream (it was bound to the
+	/// original pod's connection), so `get_stream` serves a keepalive-only stream
+	/// instead of proxying a stream that keeps dying — otherwise the client's MCP
+	/// SDK reconnects in a tight loop. Tool calls / confirmations are unaffected
+	/// (they go over POST). Persisted across `with_inputs` and session clones.
+	resumed: bool,
 }
 
 impl Session {
+	/// State-store key for a pending confirmation: `cf:<session-id>:<tool|args-hash>`.
+	/// Prefixing with the session id keeps one session's approvals from matching
+	/// another's, while letting the shared store be inspected per session.
+	fn confirmation_state_key(&self, call_key: &str) -> String {
+		format!("cf:{}:{}", self.id, call_key)
+	}
+
+	/// State-store key for a rate-limit counter: `rl:<session-id>:<tool-name>`.
+	fn rate_limit_state_key(&self, tool_name: &str) -> String {
+		format!("rl:{}:{}", self.id, tool_name)
+	}
+
 	/// send a message to upstream server(s)
 	pub async fn send(
 		&mut self,
@@ -234,9 +203,66 @@ impl Session {
 		self.send(parts, message).await
 	}
 
+	/// Re-establish fresh upstream MCP sessions for a session that was just resumed
+	/// on THIS instance (failover / pod restart). The resumed session's upstreams
+	/// have no session yet (the persisted ids are dead upstream), which leaves the
+	/// long-lived SSE notification stream coming back dead and the client looping on
+	/// reconnects. Running a fresh `initialize` handshake captures new, live upstream
+	/// session ids.
+	///
+	/// Crucially this calls `relay.send_fanout` DIRECTLY rather than `self.send`:
+	/// `self.send` on an InitializeRequest re-encodes `self.id`, and `self.id` keys
+	/// the Redis-backed confirmation state — changing it would orphan a pending
+	/// confirmation. Here `self.id` is left untouched.
+	///
+	/// Best-effort: a failure here is logged and swallowed rather than failing the
+	/// request. The GET keepalive stream works regardless, and a POST tool call will
+	/// surface the real upstream error itself — so we don't want a transient upstream
+	/// hiccup during failover to turn into a spurious request failure.
+	pub(crate) async fn reinitialize_upstreams(&self, parts: &Parts) {
+		info!(
+			"state_store: re-initializing upstream sessions for a resumed gateway session (failover/restart)"
+		);
+		// 1. initialize — captures fresh upstream session ids. Calls send_fanout
+		//    DIRECTLY (not self.send) so self.id (which keys the Redis confirmation)
+		//    is not re-encoded.
+		let mut init_request = rmcp::model::InitializeRequest::new(get_client_info());
+		init_request.params.capabilities.roots = self.get_roots_capabilities();
+		let pv = init_request.params.protocol_version.clone();
+		let multiplexing = self.relay.is_multiplexing();
+		let merge = self.relay.merge_initialize(pv, multiplexing);
+		let req = JsonRpcRequest::new(RequestId::Number(0), init_request.into());
+		if let Err(e) = self
+			.relay
+			.send_fanout(req, IncomingRequestContext::new(parts), merge)
+			.await
+		{
+			warn!("upstream re-initialize failed on session resume (continuing): {e}");
+			return;
+		}
+		// 2. initialized notification — completes the MCP handshake. Without it the
+		//    upstream serves POSTs but won't hold the long-lived SSE stream open, so
+		//    the client loops reconnecting.
+		let notif = ClientJsonRpcMessage::notification(
+			rmcp::model::InitializedNotification {
+				method: Default::default(),
+				extensions: Default::default(),
+			}
+			.into(),
+		);
+		if let ClientJsonRpcMessage::Notification(n) = notif
+			&& let Err(e) = self
+				.relay
+				.send_notification(n, IncomingRequestContext::new(parts))
+				.await
+		{
+			warn!("upstream initialized-notification failed on session resume (continuing): {e}");
+		}
+	}
+
 	pub fn with_inputs(mut self, inputs: RelayInputs) -> Self {
 		self.relay = Arc::new(self.relay.with_policies(inputs.policies));
-		// pending_approvals and is_stateful are intentionally preserved across with_inputs calls
+		// state (store handle) and is_stateful are intentionally preserved across with_inputs calls
 		self
 	}
 
@@ -306,6 +332,18 @@ impl Session {
 			// NOTE: l.method_name keep None to respect the metrics logic: which do not want to handle GET, DELETE.
 			l.session_id = Some(session_id);
 		});
+		if self.resumed {
+			// Failover/restart: the upstream won't re-hold its SSE stream for a
+			// session it didn't originate on this connection, so proxying it yields a
+			// stream that dies in ~1s and the client's MCP SDK reconnects in a tight
+			// loop (a reconnect storm at scale). Serve a keepalive-only stream that
+			// stays open instead. Server->client notifications are best-effort and
+			// are not used by the two-phase confirmation flow (which is POST-driven).
+			return Ok(sse_stream_response(
+				futures::stream::pending::<ServerSseMessage>(),
+				Some(Duration::from_secs(15)),
+			));
+		}
 		Self::handle_error(None, self.relay.send_fanout_get(ctx).await).await
 	}
 
@@ -510,8 +548,14 @@ impl Session {
 									map.remove(crate::mcp::MCP_CLEAR_PENDING_SENTINEL);
 								}
 								let key = self.pending_approval_key(&name, tool, &stripped);
-								let mut approvals = self.pending_approvals.lock().await;
-								approvals.remove(&key).is_some()
+								let state_key = self.confirmation_state_key(&key);
+								// take_confirmation removes the pending sentinel and reports whether
+								// it existed — exactly the clear semantics, now Redis-backed.
+								self
+									.state
+									.take_confirmation(&state_key)
+									.await
+									.map_err(|e| UpstreamError::StateStore(e.to_string()))?
 							} else {
 								// Stateless session has no pending_approvals at
 								// all — clear is trivially a no-op.
@@ -553,17 +597,15 @@ impl Session {
 						}
 
 						// ── Per-session rate limit ───────────────────────────────
-						if self.is_stateful
-							&& self.relay.rate_limit.is_limited(&resource, &cel)
-						{
-							let mut counts = self.tool_call_counts.lock().await;
-							let count = counts
-								.entry(name.to_string())
-								.or_insert_with(RateLimitEntry::new)
-								.increment_or_reset(self.relay.rate_limit.window);
+						if self.is_stateful && self.relay.rate_limit.is_limited(&resource, &cel) {
+							let rl_key = self.rate_limit_state_key(&name);
+							let count = self
+								.state
+								.increment_rate_limit(&rl_key, self.relay.rate_limit.window)
+								.await
+								.map_err(|e| UpstreamError::StateStore(e.to_string()))?;
 
 							if count > self.relay.rate_limit.max_calls {
-								drop(counts);
 								let payload = serde_json::json!({
 									"error": "rate_limit_exceeded",
 									"message": format!(
@@ -574,12 +616,9 @@ impl Session {
 										self.relay.rate_limit.max_calls,
 									)
 								});
-								let text = serde_json::to_string_pretty(&payload)
-									.unwrap_or_default();
+								let text = serde_json::to_string_pretty(&payload).unwrap_or_default();
 								let msg = ServerJsonRpcMessage::response(
-									ServerResult::CallToolResult(CallToolResult::success(vec![
-										Content::text(text),
-									])),
+									ServerResult::CallToolResult(CallToolResult::success(vec![Content::text(text)])),
 									r.id.clone(),
 								);
 								use futures_util::stream;
@@ -599,7 +638,10 @@ impl Session {
 
 						// ── Two-phase confirmation ───────────────────────────────
 						if self.is_stateful
-							&& self.relay.confirmation.requires_confirmation(&resource, &cel)
+							&& self
+								.relay
+								.confirmation
+								.requires_confirmation(&resource, &cel)
 						{
 							// Build the call key from (tool name, args hash). Different parallel
 							// calls with different args get separate pending entries; a confirmation
@@ -611,42 +653,44 @@ impl Session {
 							// build_presentation below still uses the ORIGINAL args (with
 							// the synthetic field present) to populate the modal.
 							let key = self.pending_approval_key(&name, tool, &call_arguments);
+							let state_key = self.confirmation_state_key(&key);
 
-							let mut approvals = self.pending_approvals.lock().await;
-
-							if let Some(pending) = approvals.get(&key) {
-								if pending.is_expired() {
-									// Expired → drop it and fall through to Phase 1
-									approvals.remove(&key);
-								} else {
-									// Phase 2: matching pending → consume and execute upstream
-									approvals.remove(&key);
-									drop(approvals);
-									crate::audit::emit_l3_tool_confirmation(
-										"tool_confirmed",
-										&self.id,
-										service_name,
-										tool,
-										"success",
-										call_arguments.as_ref(),
-									);
-									let tn = tool.to_string();
-									ctr.params.name = tn.into();
-									// Strip BEFORE arg_rewrite + upstream forward, so the
-									// upstream MCP server never sees fields it didn't define.
-									self.relay.enrichment.strip(tool, &mut ctr.params.arguments);
-									self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
-									return self
-										.relay
-										.send_single(r, ctx, service_name, Some(log.clone()))
-										.await;
-								}
+							// Phase 2: a matching, non-expired pending approval exists. The store
+							// consumes it atomically (single-use) and handles expiry, so a stale
+							// sentinel reads as absent and falls through to Phase 1.
+							let matched = self
+								.state
+								.take_confirmation(&state_key)
+								.await
+								.map_err(|e| UpstreamError::StateStore(e.to_string()))?;
+							if matched {
+								crate::audit::emit_l3_tool_confirmation(
+									"tool_confirmed",
+									&self.id,
+									service_name,
+									tool,
+									"success",
+									call_arguments.as_ref(),
+								);
+								let tn = tool.to_string();
+								ctr.params.name = tn.into();
+								// Strip BEFORE arg_rewrite + upstream forward, so the
+								// upstream MCP server never sees fields it didn't define.
+								self.relay.enrichment.strip(tool, &mut ctr.params.arguments);
+								self.relay.arg_rewrite.apply(tool, &mut ctr.params.arguments);
+								return self
+									.relay
+									.send_single(r, ctx, service_name, Some(log.clone()))
+									.await;
 							}
 
 							// Phase 1: store pending for this exact (tool, args) call signature
 							let ttl = self.relay.confirmation.ttl;
-							approvals.insert(key, PendingApproval::new(ttl));
-							drop(approvals);
+							self
+								.state
+								.put_confirmation(&state_key, ttl)
+								.await
+								.map_err(|e| UpstreamError::StateStore(e.to_string()))?;
 							crate::audit::emit_l3_tool_confirmation(
 								"tool_confirmation_requested",
 								&self.id,
@@ -683,9 +727,7 @@ impl Session {
 							let text = serde_json::to_string_pretty(&payload)
 								.unwrap_or_default();
 							let msg = ServerJsonRpcMessage::response(
-								ServerResult::CallToolResult(CallToolResult::success(vec![
-									Content::text(text),
-								])),
+								ServerResult::CallToolResult(CallToolResult::success(vec![Content::text(text)])),
 								r.id.clone(),
 							);
 							use futures_util::stream;
@@ -845,6 +887,9 @@ impl Session {
 pub struct SessionManager {
 	encoder: http::sessionpersistence::Encoder,
 	sessions: RwLock<HashMap<String, Session>>,
+	/// Backing store handed to every `Session` this manager constructs. A single
+	/// shared instance (e.g. one Redis connection pool) is reused across sessions.
+	state_store: Arc<dyn crate::state_store::StateStore>,
 }
 
 fn session_id() -> Arc<str> {
@@ -852,10 +897,14 @@ fn session_id() -> Arc<str> {
 }
 
 impl SessionManager {
-	pub fn new(encoder: http::sessionpersistence::Encoder) -> Self {
+	pub fn new(
+		encoder: http::sessionpersistence::Encoder,
+		state_store: Arc<dyn crate::state_store::StateStore>,
+	) -> Self {
 		Self {
 			encoder,
 			sessions: Default::default(),
+			state_store,
 		}
 	}
 
@@ -871,37 +920,45 @@ impl SessionManager {
 		)
 	}
 
+	/// Returns `(session, resumed)`. `resumed` is true when the session was rebuilt
+	/// from its encoded id (not found live in-memory) — e.g. after a failover or
+	/// pod restart. A resumed session's upstream connections are fresh and have NO
+	/// upstream session yet: the persisted upstream session ids belong to the
+	/// original pod's (now dead) connection and the upstream no longer honours
+	/// them, so we deliberately do NOT restore them. The caller must re-initialize
+	/// the upstreams (see [`Session::reinitialize_upstreams`]) so the SSE stream and
+	/// tool calls run on a live upstream session. The gateway session id (`self.id`,
+	/// which keys the Redis-backed confirmation state) is preserved either way.
 	pub fn get_or_resume_session(
 		&self,
 		id: &str,
 		builder: RelayInputs,
-	) -> Result<Option<Session>, mcp::Error> {
+	) -> Result<Option<(Session, bool)>, mcp::Error> {
 		if let Some(s) = self.sessions.read().expect("poisoned").get(id).cloned() {
-			return Ok(Some(s.with_inputs(builder)));
+			return Ok(Some((s.with_inputs(builder), false)));
 		}
 		let d = http::sessionpersistence::SessionState::decode(id, &self.encoder)
 			.map_err(|_| mcp::Error::InvalidSessionIdHeader)?;
-		let http::sessionpersistence::SessionState::MCP(state) = d else {
+		let http::sessionpersistence::SessionState::MCP(_state) = d else {
 			return Ok(None);
 		};
+		// Intentionally do NOT restore `_state.sessions` (the persisted upstream
+		// session ids): they are dead on the upstream after the original pod went
+		// away. reinitialize_upstreams() establishes fresh ones on first use.
 		let relay = builder.build_new_connections()?;
-		if let Err(err) = relay.set_sessions(state.sessions) {
-			warn!("failed to resume session: {err}");
-			return Ok(None);
-		}
 
 		let sess = Session {
 			id: id.into(),
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
-			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			state: self.state_store.clone(),
 			is_stateful: true,
+			resumed: true,
 		};
 		let mut sm = self.sessions.write().expect("write lock");
 		sm.insert(id.to_string(), sess.clone());
-		Ok(Some(sess))
+		Ok(Some((sess, true)))
 	}
 
 	/// create_session establishes an MCP session.
@@ -914,9 +971,9 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
-			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			state: self.state_store.clone(),
 			is_stateful: true,
+			resumed: false,
 		}
 	}
 
@@ -938,9 +995,9 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: None,
 			encoder: self.encoder.clone(),
-			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			state: self.state_store.clone(),
 			is_stateful: false,
+			resumed: false,
 		}
 	}
 
@@ -954,9 +1011,9 @@ impl SessionManager {
 			relay: Arc::new(relay),
 			tx: Some(tx),
 			encoder: self.encoder.clone(),
-			pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-			tool_call_counts: Arc::new(Mutex::new(HashMap::new())),
+			state: self.state_store.clone(),
 			is_stateful: true,
+			resumed: false,
 		};
 		let mut sm = self.sessions.write().expect("write lock");
 		sm.insert(id.to_string(), sess.clone());

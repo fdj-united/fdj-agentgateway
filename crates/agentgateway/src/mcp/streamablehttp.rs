@@ -131,12 +131,24 @@ impl StreamableHttpService {
 			.and_then(|v| v.to_str().ok());
 
 		if let Some(session_id) = session_id {
-			let Some(mut session) = self
+			let Some((mut session, resumed)) = self
 				.session_manager
 				.get_or_resume_session(session_id, inputs)?
 			else {
 				return mcp::Error::UnknownSession.into();
 			};
+
+			// A session resumed on this instance has fresh, uninitialized upstreams.
+			// Re-establish a live upstream session before forwarding anything other
+			// than the client's own initialize (which initializes them itself).
+			let is_initialize = matches!(
+				&message,
+				ClientJsonRpcMessage::Request(r)
+					if matches!(r.request, ClientRequest::InitializeRequest(_))
+			);
+			if resumed && !is_initialize {
+				session.reinitialize_upstreams(&part).await;
+			}
 
 			return session.send(part, message).await;
 		}
@@ -182,11 +194,26 @@ impl StreamableHttpService {
 			return mcp::Error::SessionIdRequired.into();
 		};
 
-		let Some(session) = self.session_manager.get_session(session_id, inputs) else {
+		// Resume the session from its (encrypted) id if it isn't live on THIS
+		// instance — mirrors handle_post. Without this, an SSE stream that
+		// fails over to another pod (or a restarted pod) gets a 404, which makes
+		// the client re-initialize with a brand-new session id and orphans any
+		// Redis-backed pending confirmation keyed by the old id. Resuming keeps
+		// the session id stable across pods so the shared state stays reachable.
+		let Some((session, resumed)) = self
+			.session_manager
+			.get_or_resume_session(session_id, inputs)?
+		else {
 			return mcp::Error::UnknownSession.into();
 		};
 
 		let (parts, _) = request.into_parts();
+		// If this instance just rebuilt the session (failover/restart), establish a
+		// fresh upstream session so the SSE notification stream is live rather than a
+		// dead stream the client keeps trying to recover.
+		if resumed {
+			session.reinitialize_upstreams(&parts).await;
+		}
 		session.get_stream(parts).await
 	}
 

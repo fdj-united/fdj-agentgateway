@@ -87,3 +87,60 @@ cors:
   exposeHeaders: []
 
 listeners: []
+
+# Shared state for mcpConfirmation pending approvals and mcpRateLimit
+# counters. With `redis.enabled: true` (recommended for multi-pod
+# deployments) the Bitnami Redis subchart is rendered into the same
+# namespace and the gateway picks up REDIS_URL automatically. With
+# `redis.enabled: false` the gateway falls back to its per-pod in-memory
+# StateStore, which is fine for single-pod / local-dev deployments.
+#
+# In-cluster Redis URL is not sensitive (NetworkPolicy is the boundary),
+# so it lives in this values file rather than a SealedSecret. Toggle
+# `auth.enabled: true` below if you need password-protected Redis.
+redis:
+  enabled: false
+  # Architecture: "standalone" for one master pod (cheapest, fine for
+  # confirmation TTL + rate counters). "replication" if you need HA at
+  # the Redis layer too.
+  architecture: standalone
+  # Bitnami removed the original docker.io/bitnami/* image tags from Docker Hub
+  # (Aug 2025 catalog change), so the subchart's default image no longer pulls.
+  # Default to the public `bitnamilegacy` mirror so `redis.enabled: true` works
+  # out of the box; override `registry`/`repository` to point at a private
+  # registry mirror in environments where docker.io is not reachable.
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/redis
+  auth:
+    enabled: false
+  master:
+    persistence:
+      enabled: true
+      size: 1Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+  # Network exposure stays cluster-local; combine with a NetworkPolicy
+  # restricting ingress to the gateway pod selector.
+  networkPolicy:
+    enabled: true
+    allowExternal: false
+
+# Bitnami's chart refuses non-standard images (e.g. the `bitnamilegacy` mirror
+# above, or a private registry proxy) unless this escape hatch is set. Only takes
+# effect when `redis.enabled: true`. Drop it if you point redis.image at a
+# standard Bitnami source.
+global:
+  security:
+    allowInsecureImages: true
+
+# State-store behaviour when the configured backend (currently Redis) is
+# unavailable. "failClosed" surfaces a 5xx — safer when correctness
+# matters more than availability. "failOpen" silently lets the request
+# through (rate counters are skipped, pending confirmations re-prompt).
+stateStore:
+  failureMode: failClosed

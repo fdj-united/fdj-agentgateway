@@ -29,8 +29,13 @@ pub struct App {
 }
 
 impl App {
-	pub fn new(state: Stores, encoder: Encoder) -> Self {
-		let session: Arc<SessionManager> = Arc::new(crate::mcp::session::SessionManager::new(encoder));
+	pub fn new(
+		state: Stores,
+		encoder: Encoder,
+		state_store: Arc<dyn crate::state_store::StateStore>,
+	) -> Self {
+		let session: Arc<SessionManager> =
+			Arc::new(crate::mcp::session::SessionManager::new(encoder, state_store));
 		Self { state, session }
 	}
 
