@@ -2,7 +2,20 @@ apiVersion: v2
 name: kindred-mcp-gateway
 description: |
   Standalone deployment of the Kindred MCP Gateway proxy. Renders a ConfigMap
-  with the proxy config plus a Deployment and Service.
+  with the proxy config plus a Deployment and Service. Optionally bundles a
+  Redis instance as a subchart for shared mcpConfirmation / mcpRateLimit state
+  across multiple gateway pods.
 type: application
-version: 0.0.59
-appVersion: "v0.0.59"
+version: 0.0.58
+appVersion: "v0.0.58"
+
+# Redis is shipped as an OPTIONAL subchart. With `redis.enabled: false`
+# (default) the chart renders exactly as before — single-pod tenants
+# don't pay for the Bitnami chart they don't use. With `redis.enabled: true`
+# the gateway picks up `REDIS_URL` automatically and switches to the
+# Redis-backed StateStore, making multi-pod deployments safe.
+dependencies:
+  - name: redis
+    version: "20.6.2"
+    repository: "oci://registry-1.docker.io/bitnamicharts"
+    condition: redis.enabled

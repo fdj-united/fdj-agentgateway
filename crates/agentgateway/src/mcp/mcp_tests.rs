@@ -226,13 +226,19 @@ async fn stateless_multiplex_delete_session_skips_uninitialized_targets() {
 			failure_mode: FailureMode::FailClosed,
 		},
 		empty_mcp_policies(),
+		crate::mcp::McpConfirmationSet::default(),
+		crate::mcp::McpRateLimitSet::default(),
+		crate::mcp::McpArgRewriteSet::default(),
+		crate::mcp::McpToolEnrichmentSet::default(),
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 	)
 	.unwrap();
-	let session_manager =
-		super::session::SessionManager::new(http::sessionpersistence::Encoder::base64());
+	let session_manager = super::session::SessionManager::new(
+		http::sessionpersistence::Encoder::base64(),
+		std::sync::Arc::new(crate::state_store::InMemoryStore::new()),
+	);
 	let mut session = session_manager.create_stateless_session(relay);
 	let parts = ::http::Request::<()>::builder()
 		.method(http::Method::POST)
@@ -1610,7 +1616,11 @@ async fn mock_streamable_http_server_with_colliding_tool() -> MockServer {
 			.await;
 		info!("colliding mock server stopped");
 	});
-	MockServer { addr, _cancel: tx }
+	MockServer {
+		addr,
+		_cancel: tx,
+		init_counter: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+	}
 }
 
 async fn mock_sse_server() -> MockServer {

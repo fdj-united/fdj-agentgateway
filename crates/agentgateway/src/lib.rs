@@ -37,6 +37,7 @@ pub mod parse;
 pub mod proxy;
 pub mod serdes;
 pub mod state_manager;
+pub mod state_store;
 pub mod store;
 pub mod telemetry;
 #[cfg(any(test, feature = "internal_benches"))]
