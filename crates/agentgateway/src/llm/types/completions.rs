@@ -321,7 +321,32 @@ impl super::RequestType for Request {
 	}
 
 	fn set_messages(&mut self, messages: Vec<SimpleChatCompletionMessage>) {
-		self.messages = messages.into_iter().map(convert_message).collect();
+		// Two call sites feed this:
+		//
+		//  1. Regex-guardrail masking (llm/policy/mod.rs:596). The masked
+		//     messages come from `get_messages()`, which is 1:1 with
+		//     `self.messages` — only content changed. In that case we mutate
+		//     in place so that tool_call_id, tool_calls, name, and the
+		//     `rest` catch-all are preserved. Without this preservation, a
+		//     regex hit on ANY message text collapses the whole conversation
+		//     to text-only, destroying tool_use / tool_result correlation and
+		//     breaking multi-turn agent flows (surfaces as
+		//     `missing field 'tool_call_id'` at the strict async_openai
+		//     parse). See agentgateway/agentgateway#2403.
+		//
+		//  2. Webhook-guardrail masking (llm/policy/mod.rs:649). The webhook
+		//     may add, remove, or reorder messages — length is not guaranteed
+		//     to match. In that case we fall back to reconstruction; tool
+		//     metadata is lost but that is acceptable because the webhook
+		//     took explicit control of the conversation shape.
+		if messages.len() == self.messages.len() {
+			for (existing, new_msg) in self.messages.iter_mut().zip(messages.into_iter()) {
+				existing.role = new_msg.role.to_string();
+				existing.content = Some(Content::Text(new_msg.content.to_string()));
+			}
+		} else {
+			self.messages = messages.into_iter().map(convert_message).collect();
+		}
 	}
 }
 

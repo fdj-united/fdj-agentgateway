@@ -42,6 +42,112 @@ pub use types::SimpleChatCompletionMessage;
 #[cfg(test)]
 mod tests;
 
+/// Sanitize an OpenAI-shaped chat completion request so that tool-use
+/// follow-up calls succeed when extended thinking is enabled.
+///
+/// **The problem.** When a Bedrock/Anthropic model with extended thinking
+/// produces a `tool_use`, its response contains a signed `thinking` block
+/// adjacent to the tool_use. On the follow-up call (after the tool result),
+/// Bedrock requires that same thinking block to be present WITH its
+/// signature — otherwise it rejects with:
+/// `"messages.N.content.M.thinking.signature: Field required"`.
+///
+/// The OpenAI-compat wire format does not carry the signature (it surfaces
+/// only `reasoning_content` as text). LibreChat and other clients therefore
+/// cannot round-trip a signed thinking block. This means every tool-use
+/// follow-up would 400.
+///
+/// **The pragmatic fix.** When the request history contains an assistant
+/// message with `tool_calls`, we know we are on a tool-use follow-up. Thinking
+/// already happened in the prior turn (the one that produced the tool_use);
+/// the follow-up turn is just producing the final answer from the tool
+/// result and does not strictly need thinking. So we:
+///
+///   1. Drop `reasoning_effort` from the top-level request (thinking off
+///      for this turn).
+///   2. Drop `reasoning_content` from every assistant message (Bedrock will
+///      not validate a thinking block that is not there).
+///
+/// The initial turn still uses thinking as normal. Only tool-use follow-ups
+/// silently downgrade.
+///
+/// **When signature preservation lands** (outbound response + client + inbound
+/// parse all cooperating), this workaround can be removed in favor of a real
+/// ReasoningContent block re-injection.
+fn sanitize_tool_use_followup(bytes: &bytes::Bytes) -> bytes::Bytes {
+	let mut value: serde_json::Value = match serde_json::from_slice(bytes.as_ref()) {
+		Ok(v) => v,
+		Err(_) => return bytes.clone(),
+	};
+
+	let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
+		return bytes.clone();
+	};
+
+	let has_prior_tool_use = messages.iter().any(|m| {
+		let is_assistant = m
+			.get("role")
+			.and_then(|r| r.as_str())
+			.map(|r| r == "assistant")
+			.unwrap_or(false);
+		let has_tool_calls = m
+			.get("tool_calls")
+			.and_then(|v| v.as_array())
+			.map(|a| !a.is_empty())
+			.unwrap_or(false);
+		is_assistant && has_tool_calls
+	});
+
+	if !has_prior_tool_use {
+		return bytes.clone();
+	}
+
+	// Mutate: drop reasoning_effort at the top level.
+	let obj = value.as_object_mut();
+	let dropped_effort = obj
+		.as_ref()
+		.map(|o| o.contains_key("reasoning_effort"))
+		.unwrap_or(false);
+	if let Some(o) = obj {
+		o.remove("reasoning_effort");
+	}
+
+	// Mutate: drop reasoning_content on every assistant message.
+	let mut dropped_reasoning = 0usize;
+	if let Some(msgs) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+		for m in msgs.iter_mut() {
+			let is_assistant = m
+				.get("role")
+				.and_then(|r| r.as_str())
+				.map(|r| r == "assistant")
+				.unwrap_or(false);
+			if !is_assistant {
+				continue;
+			}
+			if let Some(o) = m.as_object_mut()
+				&& o.remove("reasoning_content").is_some()
+			{
+				dropped_reasoning += 1;
+			}
+		}
+	}
+
+	if !dropped_effort && dropped_reasoning == 0 {
+		return bytes.clone();
+	}
+
+	tracing::debug!(
+		target: "agentgateway::llm",
+		"tool-use follow-up detected: dropped reasoning_effort={} reasoning_content_count={}",
+		dropped_effort, dropped_reasoning
+	);
+
+	match serde_json::to_vec(&value) {
+		Ok(v) => bytes::Bytes::from(v),
+		Err(_) => bytes.clone(),
+	}
+}
+
 fn normalize_sse_response_headers(mut resp: Response) -> Response {
 	resp.headers_mut().insert(
 		header::CONTENT_TYPE,
@@ -719,6 +825,15 @@ impl AIProvider {
 			return Err(AIError::RequestTooLarge);
 		};
 
+		// Rewrite `reasoning_content` on assistant tool-use messages into a
+		// marker inside `content` so it survives the async_openai typed parse.
+		// See `sanitize_tool_use_followup` for the rationale.
+		let bytes = if is_json {
+			sanitize_tool_use_followup(&bytes)
+		} else {
+			bytes
+		};
+
 		let req = if is_json {
 			if let Some(p) = policies {
 				p.unmarshal_request(&bytes, log)
@@ -1302,6 +1417,9 @@ impl AIProvider {
 		let Ok(bytes) = http::read_body_with_limit(body, buffer).await else {
 			return Err(AIError::RequestTooLarge);
 		};
+		// Strip reasoning_effort/reasoning_content on tool-use follow-up calls.
+		// See `sanitize_tool_use_followup` for the rationale.
+		let bytes = sanitize_tool_use_followup(&bytes);
 		let mut req: T = if let Some(p) = policies {
 			p.unmarshal_request(&bytes, log)?
 		} else {
