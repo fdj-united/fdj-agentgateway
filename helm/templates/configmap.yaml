@@ -209,6 +209,11 @@ data:
                         value: {{ .value | quote }}
                       {{- end }}
                   {{- end }}
+                  {{- with $backend.promptGuard }}
+                  ai:
+                    promptGuard:
+                      {{- toYaml . | nindent 22 }}
+                  {{- end }}
                 {{- if not $catchAll }}
                 matches:
                   - path:
@@ -223,6 +228,12 @@ data:
                   {{- end }}
                 {{- end }}
                 backends:
+                  {{- if $backend.llm }}
+                  - ai:
+                      name: {{ $backend.name | quote }}
+                      provider:
+                        {{- toYaml $backend.llm.provider | nindent 24 }}
+                  {{- else }}
                   - mcp:
                       targets:
                         - name: {{ $backend.name }}
@@ -233,6 +244,7 @@ data:
                             backendTLS:
                               insecure: true
                           {{- end }}
+                  {{- end }}
               {{- end }}
       {{- end }}
 
