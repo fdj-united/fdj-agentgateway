@@ -42,7 +42,8 @@ pub use types::SimpleChatCompletionMessage;
 #[cfg(test)]
 mod tests;
 
-/// Sanitize an OpenAI-shaped chat completion request so that tool-use
+/// Sanitize an OpenAI-shaped chat completion request destined for an
+/// Anthropic-shaped backend (Bedrock, Anthropic native) so that tool-use
 /// follow-up calls succeed when extended thinking is enabled.
 ///
 /// **The problem.** When a Bedrock/Anthropic model with extended thinking
@@ -57,19 +58,26 @@ mod tests;
 /// cannot round-trip a signed thinking block. This means every tool-use
 /// follow-up would 400.
 ///
-/// **The pragmatic fix.** When the request history contains an assistant
-/// message with `tool_calls`, we know we are on a tool-use follow-up. Thinking
-/// already happened in the prior turn (the one that produced the tool_use);
-/// the follow-up turn is just producing the final answer from the tool
-/// result and does not strictly need thinking. So we:
+/// **The pragmatic fix.** When the request is an *active tool-result
+/// follow-up* — i.e. the caller has just delivered a `role: "tool"` message
+/// and is asking the model to compose the next assistant turn — we know
+/// thinking cannot survive the round-trip. Thinking already happened in the
+/// prior turn (the one that produced the tool_use); the follow-up turn is
+/// just producing the final answer from the tool result and does not
+/// strictly need thinking. So we:
 ///
 ///   1. Drop `reasoning_effort` from the top-level request (thinking off
 ///      for this turn).
 ///   2. Drop `reasoning_content` from every assistant message (Bedrock will
 ///      not validate a thinking block that is not there).
 ///
-/// The initial turn still uses thinking as normal. Only tool-use follow-ups
-/// silently downgrade.
+/// The initial tool-call turn, unrelated chat turns after a tool cycle has
+/// resolved, and non-Anthropic providers are all unaffected.
+///
+/// **Scope.** Only Bedrock and Anthropic providers require this workaround.
+/// OpenAI/Azure/Gemini reasoning models do not enforce a signed thinking
+/// block adjacent to tool_use. Callers therefore gate invocation on the
+/// AIProvider variant.
 ///
 /// **When signature preservation lands** (outbound response + client + inbound
 /// parse all cooperating), this workaround can be removed in favor of a real
@@ -84,21 +92,20 @@ fn sanitize_tool_use_followup(bytes: &bytes::Bytes) -> bytes::Bytes {
 		return bytes.clone();
 	};
 
-	let has_prior_tool_use = messages.iter().any(|m| {
-		let is_assistant = m
-			.get("role")
-			.and_then(|r| r.as_str())
-			.map(|r| r == "assistant")
-			.unwrap_or(false);
-		let has_tool_calls = m
-			.get("tool_calls")
-			.and_then(|v| v.as_array())
-			.map(|a| !a.is_empty())
-			.unwrap_or(false);
-		is_assistant && has_tool_calls
-	});
+	// Only fire on an *active* tool-result follow-up: the last message must be
+	// a `role: "tool"` block. That is precisely the turn on which Bedrock
+	// validates the adjacent thinking block against the preceding assistant
+	// tool_use. If the last message is anything else (user text after the
+	// cycle resolved, a fresh chat turn, etc.), we leave the request alone so
+	// thinking is preserved.
+	let is_active_tool_followup = messages
+		.last()
+		.and_then(|m| m.get("role"))
+		.and_then(|r| r.as_str())
+		.map(|r| r == "tool")
+		.unwrap_or(false);
 
-	if !has_prior_tool_use {
+	if !is_active_tool_followup {
 		return bytes.clone();
 	}
 
@@ -825,10 +832,13 @@ impl AIProvider {
 			return Err(AIError::RequestTooLarge);
 		};
 
-		// Rewrite `reasoning_content` on assistant tool-use messages into a
-		// marker inside `content` so it survives the async_openai typed parse.
+		// Bedrock and Anthropic backends require a signed thinking block
+		// adjacent to any tool_use when extended thinking is enabled. Since
+		// the OpenAI-compat wire format cannot round-trip the signature, we
+		// strip reasoning parameters on the active tool-result follow-up for
+		// those two providers only. Other providers are unaffected.
 		// See `sanitize_tool_use_followup` for the rationale.
-		let bytes = if is_json {
+		let bytes = if is_json && matches!(self, AIProvider::Bedrock(_) | AIProvider::Anthropic(_)) {
 			sanitize_tool_use_followup(&bytes)
 		} else {
 			bytes
@@ -1417,9 +1427,15 @@ impl AIProvider {
 		let Ok(bytes) = http::read_body_with_limit(body, buffer).await else {
 			return Err(AIError::RequestTooLarge);
 		};
-		// Strip reasoning_effort/reasoning_content on tool-use follow-up calls.
-		// See `sanitize_tool_use_followup` for the rationale.
-		let bytes = sanitize_tool_use_followup(&bytes);
+		// Bedrock and Anthropic backends require a signed thinking block
+		// adjacent to any tool_use; strip reasoning params on active tool-
+		// result follow-ups for those two providers only. Other providers
+		// are unaffected. See `sanitize_tool_use_followup` for the rationale.
+		let bytes = if matches!(self, AIProvider::Bedrock(_) | AIProvider::Anthropic(_)) {
+			sanitize_tool_use_followup(&bytes)
+		} else {
+			bytes
+		};
 		let mut req: T = if let Some(p) = policies {
 			p.unmarshal_request(&bytes, log)?
 		} else {

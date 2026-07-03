@@ -335,13 +335,22 @@ impl super::RequestType for Request {
 		//     parse). See agentgateway/agentgateway#2403.
 		//
 		//  2. Webhook-guardrail masking (llm/policy/mod.rs:649). The webhook
-		//     may add, remove, or reorder messages — length is not guaranteed
-		//     to match. In that case we fall back to reconstruction; tool
-		//     metadata is lost but that is acceptable because the webhook
-		//     took explicit control of the conversation shape.
-		if messages.len() == self.messages.len() {
+		//     may add, remove, reorder, or role-change messages — the shape
+		//     is under the webhook's control.
+		//
+		// Safety: matching length alone is not enough to prove the caller
+		// preserved ordering (a same-length webhook could reorder). We
+		// additionally require the role sequence to match; otherwise we
+		// fall back to reconstruction so tool metadata is not silently
+		// re-parented onto the wrong messages.
+		let same_shape = messages.len() == self.messages.len()
+			&& self
+				.messages
+				.iter()
+				.zip(messages.iter())
+				.all(|(existing, new_msg)| existing.role == new_msg.role.as_str());
+		if same_shape {
 			for (existing, new_msg) in self.messages.iter_mut().zip(messages.into_iter()) {
-				existing.role = new_msg.role.to_string();
 				existing.content = Some(Content::Text(new_msg.content.to_string()));
 			}
 		} else {
