@@ -832,18 +832,12 @@ impl AIProvider {
 			return Err(AIError::RequestTooLarge);
 		};
 
-		// Bedrock and Anthropic backends require a signed thinking block
-		// adjacent to any tool_use when extended thinking is enabled. Since
-		// the OpenAI-compat wire format cannot round-trip the signature, we
-		// strip reasoning parameters on the active tool-result follow-up for
-		// those two providers only. Other providers are unaffected.
-		// See `sanitize_tool_use_followup` for the rationale.
-		let bytes = if is_json && matches!(self, AIProvider::Bedrock(_) | AIProvider::Anthropic(_)) {
-			sanitize_tool_use_followup(&bytes)
-		} else {
-			bytes
-		};
-
+		// NOTE: sanitize_tool_use_followup is intentionally NOT called on this
+		// (Detect) path. The workaround is only defined for the OpenAI-shape
+		// chat completions request; Detect processes arbitrary JSON bodies
+		// and applying the sanitizer here would risk mis-mutating unrelated
+		// wire formats. The sanitize call lives in read_body_and_default_model
+		// on the Completions-typed call site only.
 		let req = if is_json {
 			if let Some(p) = policies {
 				p.unmarshal_request(&bytes, log)
@@ -1431,6 +1425,12 @@ impl AIProvider {
 		// adjacent to any tool_use; strip reasoning params on active tool-
 		// result follow-ups for those two providers only. Other providers
 		// are unaffected. See `sanitize_tool_use_followup` for the rationale.
+		//
+		// TODO: Vertex-hosted Claude has the same wire-format constraint but
+		// is not gated here. Extend when we adopt Vertex — the check needs
+		// to peek the `model` field from the raw bytes and compare against
+		// `p.is_anthropic_model(...)`. Not needed today because we only
+		// route Anthropic traffic through Bedrock and Anthropic native.
 		let bytes = if matches!(self, AIProvider::Bedrock(_) | AIProvider::Anthropic(_)) {
 			sanitize_tool_use_followup(&bytes)
 		} else {

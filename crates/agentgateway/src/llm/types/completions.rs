@@ -343,6 +343,17 @@ impl super::RequestType for Request {
 		// additionally require the role sequence to match; otherwise we
 		// fall back to reconstruction so tool metadata is not silently
 		// re-parented onto the wrong messages.
+		//
+		// TODO: role-sequence matching is still a heuristic — parallel
+		// tool_result messages ("tool", "tool") could be reordered by a
+		// webhook without changing the role sequence, silently mis-parenting
+		// content onto the wrong tool_call_id. When webhook guardrails are
+		// adopted this should be replaced by splitting the API into
+		// `mask_message_contents` (trusted regex path, positional in-place
+		// content mutation only) and `set_messages` (untrusted webhook
+		// path, full replacement). Not needed today because only regex
+		// guardrails are enabled, which mutate content in-place and cannot
+		// reorder messages.
 		let same_shape = messages.len() == self.messages.len()
 			&& self
 				.messages
