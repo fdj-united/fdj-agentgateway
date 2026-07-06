@@ -504,22 +504,30 @@ impl Policy {
 		}
 	}
 
-	// Note on mask substitution: the current implementation projects request
-	// messages to text via `get_messages()` and writes them back via
-	// `set_messages()`. Non-text content parts (images in User messages,
-	// tool_use / tool_result blocks in Messages/Responses formats) round-trip
-	// through `SimpleChatCompletionMessage` which carries only role + text.
-	// For `completions::Request` the in-place-mutation path preserves
-	// tool_call_id/tool_calls metadata but multipart Content::Array collapses
-	// to Content::Text. For `messages::Request` and `responses::Request` the
-	// reconstruction is more destructive.
+	// Scope of Bedrock guardrail mask substitution in this release:
+	// TEXT-ONLY REQUESTS.
 	//
-	// TODO: extend `RequestType` with a format-specific
-	// `substitute_text_content(indexed_replacements)` method that mutates only
-	// the text parts and leaves images / tool blocks intact. Until then, this
-	// mask path is safe for text-only conversations (KAIT's current traffic)
-	// and degrades multipart content — the length-mismatch fail-closed check
-	// below limits the blast radius when the shape changes unexpectedly.
+	// The mask substitution projects request messages to text via
+	// `get_messages()` and writes them back via `set_messages()`. Non-text
+	// content parts (images in User messages, tool_use / tool_result
+	// blocks in Messages/Responses formats) round-trip through
+	// `SimpleChatCompletionMessage` which carries only role + text.
+	//
+	//   - `completions::Request`: the in-place-mutation path in set_messages
+	//     preserves tool_call_id/tool_calls but multipart Content::Array
+	//     content collapses to Content::Text on mask.
+	//   - `messages::Request` / `responses::Request`: reconstruction is more
+	//     destructive — image, tool_use, tool_result, and structured input
+	//     items are discarded on mask.
+	//
+	// Text-only conversations are safe; multipart / structured content is
+	// degraded. The length-mismatch fail-closed check below bounds the
+	// blast radius when AWS returns a shape we cannot map back.
+	//
+	// TODO: before enabling this policy on any non-text-only traffic, extend
+	// `RequestType` with a format-specific
+	// `substitute_text_content(indexed_replacements)` method that mutates
+	// only text parts and leaves images / tool blocks intact.
 	async fn apply_bedrock_guardrails_request(
 		req: &mut dyn RequestType,
 		claims: Option<Claims>,

@@ -99,58 +99,84 @@ pub struct ApplyGuardrailResponse {
 }
 
 impl ApplyGuardrailResponse {
-	/// True when the guardrail truly blocked the content.
+	/// True when the guardrail's response must be surfaced to the caller as
+	/// a rejection.
 	///
-	/// The primary discriminator is per-entry `action=BLOCKED` inside
-	/// `assessments` — not the mere presence of the `outputs` field, which
-	/// AWS populates for masks and blocks alike (a canned rejection string
-	/// for blocks, sanitized text for masks).
+	/// The classification is fail-closed: only an intervention with
+	/// **explicit** `ANONYMIZED` evidence in assessments AND at least one
+	/// output block is treated as a mask. Everything else that intervenes —
+	/// explicit `BLOCKED`, ambiguous / unknown assessment shape, missing
+	/// assessments, or empty outputs — is treated as a block.
 	///
-	/// As a defensive fallback, an intervened response with no sanitized
-	/// outputs to forward is also treated as a block: there is nothing to
-	/// substitute in and forwarding the empty text would silently drop the
-	/// user's message.
+	/// AWS returns a non-empty `outputs` array for blocks too (containing
+	/// the canned rejection string), so presence of outputs is NOT a
+	/// reliable mask signal on its own.
 	pub fn is_blocked(&self) -> bool {
 		if self.action != GuardrailAction::GuardrailIntervened {
 			return false;
 		}
+		// Any explicit BLOCKED evidence → block.
 		if self.assessments.iter().any(Self::contains_blocked_action) {
 			return true;
 		}
-		self.outputs.is_empty()
+		// No explicit ANONYMIZED evidence or no outputs to substitute →
+		// block (fail closed on ambiguous responses).
+		!self.has_anonymized_evidence() || self.outputs.is_empty()
 	}
 
 	/// If the guardrail intervened by masking (anonymizing), returns the
 	/// sanitized text for each input content block in order. Callers should
 	/// substitute these back into the request/response and forward.
 	///
-	/// Returns None when the guardrail did not intervene, when it truly
-	/// blocked (per [`is_blocked`]), or when no outputs were returned.
+	/// Returns `None` unless the response passes [`is_blocked`]'s inverse:
+	/// intervened, at least one `ANONYMIZED` assessment, no `BLOCKED`
+	/// assessment, and outputs present.
 	pub fn masked_outputs(&self) -> Option<Vec<String>> {
-		if self.action != GuardrailAction::GuardrailIntervened
-			|| self.is_blocked()
-			|| self.outputs.is_empty()
-		{
+		if self.is_blocked() {
+			return None;
+		}
+		if self.action != GuardrailAction::GuardrailIntervened || self.outputs.is_empty() {
 			return None;
 		}
 		Some(self.outputs.iter().map(|o| o.text.clone()).collect())
 	}
 
+	/// True when any assessment entry carries `action=ANONYMIZED`.
+	fn has_anonymized_evidence(&self) -> bool {
+		self
+			.assessments
+			.iter()
+			.any(Self::contains_anonymized_action)
+	}
+
 	/// Recursively walk a JSON value looking for any object with
-	/// `{"action": "BLOCKED"}`. AWS uses the same string across policy
-	/// types (content, sensitive info, word, topic, etc.), so this
-	/// generic walk covers all of them without modelling each policy.
+	/// `{"action": "BLOCKED"}` (or `"BLOCK"`). AWS uses the same string
+	/// across policy types (content, sensitive info, word, topic, etc.), so
+	/// this generic walk covers all of them without modelling each policy.
 	fn contains_blocked_action(v: &serde_json::Value) -> bool {
+		Self::contains_action_matching(v, |s| matches!(s, "BLOCKED" | "BLOCK"))
+	}
+
+	/// Same as [`contains_blocked_action`] but for `ANONYMIZED`.
+	fn contains_anonymized_action(v: &serde_json::Value) -> bool {
+		Self::contains_action_matching(v, |s| s == "ANONYMIZED")
+	}
+
+	fn contains_action_matching(v: &serde_json::Value, matches_action: fn(&str) -> bool) -> bool {
 		match v {
 			serde_json::Value::Object(map) => {
 				if let Some(s) = map.get("action").and_then(|v| v.as_str())
-					&& matches!(s, "BLOCKED" | "BLOCK")
+					&& matches_action(s)
 				{
 					return true;
 				}
-				map.values().any(Self::contains_blocked_action)
+				map
+					.values()
+					.any(|v| Self::contains_action_matching(v, matches_action))
 			},
-			serde_json::Value::Array(arr) => arr.iter().any(Self::contains_blocked_action),
+			serde_json::Value::Array(arr) => arr
+				.iter()
+				.any(|v| Self::contains_action_matching(v, matches_action)),
 			_ => false,
 		}
 	}
@@ -298,12 +324,14 @@ async fn send_guardrail_request(
 			guardrail_id = %guardrails.guardrail_identifier,
 			guardrail_version = %guardrails.guardrail_version,
 			source = ?source,
+			reason = resp.action_reason.as_deref().unwrap_or(""),
 			"Bedrock guardrail blocked content"
 		),
 		(false, true) => tracing::debug!(
 			guardrail_id = %guardrails.guardrail_identifier,
 			guardrail_version = %guardrails.guardrail_version,
 			source = ?source,
+			reason = resp.action_reason.as_deref().unwrap_or(""),
 			"Bedrock guardrail masked content"
 		),
 		_ => {},

@@ -465,19 +465,20 @@ mod bedrock_guardrails_tests {
 	}
 
 	#[test]
-	fn test_apply_guardrail_response_intervened_no_assessments_defaults_to_mask() {
-		// Defensive default: if AWS returns intervened + outputs but no
-		// assessments telling us BLOCK, we treat as mask and forward the
-		// sanitized text. This preserves the invariant that a request only
-		// gets rejected when we have evidence of a block; ambiguous payloads
-		// fall on the side of forwarding sanitized content.
+	fn test_apply_guardrail_response_intervened_ambiguous_fails_closed() {
+		// Fail-closed default: an intervened response without explicit
+		// ANONYMIZED evidence in assessments is treated as a block, even if
+		// outputs are present. AWS returns non-empty outputs for blocks too
+		// (containing a canned rejection string), so forwarding them as if
+		// they were sanitized text would leak the canned response into the
+		// model prompt. When we cannot prove it was a mask, we must block.
 		let json = json!({
 			"action": "GUARDRAIL_INTERVENED",
-			"outputs": [{"text": "sanitized"}]
+			"outputs": [{"text": "sanitized-or-canned?"}]
 		});
 		let response: ApplyGuardrailResponse = serde_json::from_value(json).unwrap();
-		assert!(!response.is_blocked());
-		assert!(response.masked_outputs().is_some());
+		assert!(response.is_blocked());
+		assert!(response.masked_outputs().is_none());
 	}
 }
 
