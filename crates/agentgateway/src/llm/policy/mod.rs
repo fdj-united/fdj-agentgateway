@@ -2,7 +2,7 @@ use crate::http::filters::HeaderModifier;
 use crate::http::jwt::Claims;
 use crate::http::{Response, StatusCode, auth};
 use crate::llm::policy::webhook::{MaskActionBody, RequestAction, ResponseAction};
-use crate::llm::{AIError, RequestType, ResponseType};
+use crate::llm::{AIError, RequestType, ResponseType, SimpleChatCompletionMessage};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::log::RequestLog;
 use crate::types::agent::{BackendPolicy, HeaderMatch, HeaderValueMatch, SimpleBackendReference};
@@ -432,22 +432,37 @@ impl Policy {
 					}
 				},
 				RequestGuardKind::BedrockGuardrails(bg) => {
-					if let Some(res) =
-						Self::apply_bedrock_guardrails_request(req, claims.clone(), &client, &g.rejection, bg)
-							.await?
+					match Self::apply_bedrock_guardrails_request(
+						req,
+						claims.clone(),
+						&client,
+						&g.rejection,
+						bg,
+					)
+					.await?
 					{
-						Self::record_guardrail_trip(
-							&client,
-							crate::telemetry::metrics::GuardrailPhase::Request,
-							crate::telemetry::metrics::GuardrailAction::Reject,
-						);
-						return Ok(Some(res));
-					} else {
-						Self::record_guardrail_trip(
-							&client,
-							crate::telemetry::metrics::GuardrailPhase::Request,
-							crate::telemetry::metrics::GuardrailAction::Allow,
-						);
+						GuardrailOutcome::Rejected(res) => {
+							Self::record_guardrail_trip(
+								&client,
+								crate::telemetry::metrics::GuardrailPhase::Request,
+								crate::telemetry::metrics::GuardrailAction::Reject,
+							);
+							return Ok(Some(res));
+						},
+						GuardrailOutcome::Masked => {
+							Self::record_guardrail_trip(
+								&client,
+								crate::telemetry::metrics::GuardrailPhase::Request,
+								crate::telemetry::metrics::GuardrailAction::Mask,
+							);
+						},
+						GuardrailOutcome::None => {
+							Self::record_guardrail_trip(
+								&client,
+								crate::telemetry::metrics::GuardrailPhase::Request,
+								crate::telemetry::metrics::GuardrailAction::Allow,
+							);
+						},
 					}
 				},
 				RequestGuardKind::GoogleModelArmor(gma) => {
@@ -489,18 +504,63 @@ impl Policy {
 		}
 	}
 
+	// Note on mask substitution: the current implementation projects request
+	// messages to text via `get_messages()` and writes them back via
+	// `set_messages()`. Non-text content parts (images in User messages,
+	// tool_use / tool_result blocks in Messages/Responses formats) round-trip
+	// through `SimpleChatCompletionMessage` which carries only role + text.
+	// For `completions::Request` the in-place-mutation path preserves
+	// tool_call_id/tool_calls metadata but multipart Content::Array collapses
+	// to Content::Text. For `messages::Request` and `responses::Request` the
+	// reconstruction is more destructive.
+	//
+	// TODO: extend `RequestType` with a format-specific
+	// `substitute_text_content(indexed_replacements)` method that mutates only
+	// the text parts and leaves images / tool blocks intact. Until then, this
+	// mask path is safe for text-only conversations (KAIT's current traffic)
+	// and degrades multipart content — the length-mismatch fail-closed check
+	// below limits the blast radius when the shape changes unexpectedly.
 	async fn apply_bedrock_guardrails_request(
 		req: &mut dyn RequestType,
 		claims: Option<Claims>,
 		client: &PolicyClient,
 		rej: &RequestRejection,
 		guardrails: &BedrockGuardrails,
-	) -> anyhow::Result<Option<Response>> {
+	) -> anyhow::Result<GuardrailOutcome> {
 		let resp = bedrock_guardrails::send_request(req, claims.clone(), client, guardrails).await?;
+
+		// Mask (anonymize) path: substitute sanitized text back into messages.
+		// Preserve the original role sequence so RequestType::set_messages can
+		// mutate content in place (for completions::Request; see its impl for
+		// in-place invariants).
+		if let Some(masked) = resp.masked_outputs() {
+			let existing_roles: Vec<_> = req.get_messages().into_iter().map(|m| m.role).collect();
+			if masked.len() != existing_roles.len() {
+				// Length mismatch — fail closed rather than mis-align content
+				// with roles and lose tool_call_id / tool_calls metadata.
+				tracing::warn!(
+					sent = existing_roles.len(),
+					got = masked.len(),
+					"Bedrock guardrail mask output length mismatch — falling back to block"
+				);
+				return Ok(GuardrailOutcome::Rejected(rej.as_response()));
+			}
+			let new_msgs: Vec<SimpleChatCompletionMessage> = existing_roles
+				.into_iter()
+				.zip(masked.into_iter())
+				.map(|(role, content)| SimpleChatCompletionMessage {
+					role,
+					content: content.into(),
+				})
+				.collect();
+			req.set_messages(new_msgs);
+			return Ok(GuardrailOutcome::Masked);
+		}
+
 		if resp.is_blocked() {
-			Ok(Some(rej.as_response()))
+			Ok(GuardrailOutcome::Rejected(rej.as_response()))
 		} else {
-			Ok(None)
+			Ok(GuardrailOutcome::None)
 		}
 	}
 
@@ -510,24 +570,40 @@ impl Policy {
 		client: &PolicyClient,
 		rej: &RequestRejection,
 		guardrails: &BedrockGuardrails,
-	) -> anyhow::Result<Option<Response>> {
-		// Extract text content from response choices
-		let content: Vec<String> = resp
-			.to_webhook_choices()
-			.into_iter()
+	) -> anyhow::Result<GuardrailOutcome> {
+		let mut choices = resp.to_webhook_choices();
+		let content: Vec<String> = choices
+			.iter()
 			.map(|c| c.message.content.to_string())
 			.collect();
 
 		if content.is_empty() {
-			return Ok(None);
+			return Ok(GuardrailOutcome::None);
 		}
 
 		let guardrail_resp =
 			bedrock_guardrails::send_response(content, claims, client, guardrails).await?;
+
+		if let Some(masked) = guardrail_resp.masked_outputs() {
+			if masked.len() != choices.len() {
+				tracing::warn!(
+					sent = choices.len(),
+					got = masked.len(),
+					"Bedrock guardrail mask output length mismatch on response — falling back to block"
+				);
+				return Ok(GuardrailOutcome::Rejected(rej.as_response()));
+			}
+			for (choice, new_content) in choices.iter_mut().zip(masked.into_iter()) {
+				choice.message.content = new_content.into();
+			}
+			resp.set_webhook_choices(choices)?;
+			return Ok(GuardrailOutcome::Masked);
+		}
+
 		if guardrail_resp.is_blocked() {
-			Ok(Some(rej.as_response()))
+			Ok(GuardrailOutcome::Rejected(rej.as_response()))
 		} else {
-			Ok(None)
+			Ok(GuardrailOutcome::None)
 		}
 	}
 
@@ -933,21 +1009,30 @@ impl Policy {
 					}
 				},
 				ResponseGuardKind::BedrockGuardrails(bg) => {
-					if let Some(res) =
-						Self::apply_bedrock_guardrails_response(resp, None, client, &g.rejection, bg).await?
+					match Self::apply_bedrock_guardrails_response(resp, None, client, &g.rejection, bg).await?
 					{
-						Self::record_guardrail_trip(
-							client,
-							crate::telemetry::metrics::GuardrailPhase::Response,
-							crate::telemetry::metrics::GuardrailAction::Reject,
-						);
-						return Ok(Some(res));
-					} else {
-						Self::record_guardrail_trip(
-							client,
-							crate::telemetry::metrics::GuardrailPhase::Response,
-							crate::telemetry::metrics::GuardrailAction::Allow,
-						);
+						GuardrailOutcome::Rejected(res) => {
+							Self::record_guardrail_trip(
+								client,
+								crate::telemetry::metrics::GuardrailPhase::Response,
+								crate::telemetry::metrics::GuardrailAction::Reject,
+							);
+							return Ok(Some(res));
+						},
+						GuardrailOutcome::Masked => {
+							Self::record_guardrail_trip(
+								client,
+								crate::telemetry::metrics::GuardrailPhase::Response,
+								crate::telemetry::metrics::GuardrailAction::Mask,
+							);
+						},
+						GuardrailOutcome::None => {
+							Self::record_guardrail_trip(
+								client,
+								crate::telemetry::metrics::GuardrailPhase::Response,
+								crate::telemetry::metrics::GuardrailAction::Allow,
+							);
+						},
 					}
 				},
 				ResponseGuardKind::GoogleModelArmor(gma) => {

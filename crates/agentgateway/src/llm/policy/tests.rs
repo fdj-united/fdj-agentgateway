@@ -405,11 +405,23 @@ mod bedrock_guardrails_tests {
 	}
 
 	#[test]
-	fn test_apply_guardrail_response_roundtrip() {
-		// Simulate a realistic AWS Bedrock Guardrails API response
+	fn test_apply_guardrail_response_realistic_block() {
+		// Realistic AWS block: `outputs` carries the canned rejection message
+		// AND at least one assessment entry has `action=BLOCKED`. Presence of
+		// `outputs` alone is NOT the discriminator (AWS returns outputs for
+		// both block and mask). See `is_blocked` docs.
 		let json = json!({
 			"action": "GUARDRAIL_INTERVENED",
 			"outputs": [{"text": "I can't help with that request."}],
+			"assessments": [{
+				"topicPolicy": {
+					"topics": [{
+						"name": "Investment Advice",
+						"type": "DENY",
+						"action": "BLOCKED"
+					}]
+				}
+			}],
 			"usage": {
 				"topicPolicyUnits": 1,
 				"contentPolicyUnits": 0,
@@ -417,10 +429,55 @@ mod bedrock_guardrails_tests {
 			}
 		});
 
-		// Our struct only cares about the action field
 		let response: ApplyGuardrailResponse = serde_json::from_value(json).unwrap();
 		assert!(response.is_blocked());
+		assert!(response.masked_outputs().is_none());
 		assert_eq!(response.action, GuardrailAction::GuardrailIntervened);
+	}
+
+	#[test]
+	fn test_apply_guardrail_response_realistic_mask() {
+		// Realistic AWS mask: intervened, `outputs` carries the sanitized
+		// text, and no assessment entry has `action=BLOCKED` — all matched
+		// entities were `ANONYMIZED`.
+		let json = json!({
+			"action": "GUARDRAIL_INTERVENED",
+			"actionReason": "Guardrail masked.",
+			"outputs": [{"text": "My name is {NAME}."}],
+			"assessments": [{
+				"sensitiveInformationPolicy": {
+					"piiEntities": [{
+						"action": "ANONYMIZED",
+						"detected": true,
+						"match": "John Smith",
+						"type": "NAME"
+					}]
+				}
+			}]
+		});
+
+		let response: ApplyGuardrailResponse = serde_json::from_value(json).unwrap();
+		assert!(!response.is_blocked());
+		assert_eq!(
+			response.masked_outputs(),
+			Some(vec!["My name is {NAME}.".to_string()])
+		);
+	}
+
+	#[test]
+	fn test_apply_guardrail_response_intervened_no_assessments_defaults_to_mask() {
+		// Defensive default: if AWS returns intervened + outputs but no
+		// assessments telling us BLOCK, we treat as mask and forward the
+		// sanitized text. This preserves the invariant that a request only
+		// gets rejected when we have evidence of a block; ambiguous payloads
+		// fall on the side of forwarding sanitized content.
+		let json = json!({
+			"action": "GUARDRAIL_INTERVENED",
+			"outputs": [{"text": "sanitized"}]
+		});
+		let response: ApplyGuardrailResponse = serde_json::from_value(json).unwrap();
+		assert!(!response.is_blocked());
+		assert!(response.masked_outputs().is_some());
 	}
 }
 
