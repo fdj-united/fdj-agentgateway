@@ -96,6 +96,10 @@ pub(crate) async fn handle_mcp_request(
 				.into_response(),
 		)),
 		path if path.ends_with("/oauth/token") && auth.upstream_token_endpoint.is_some() => {
+			// Handle CORS preflight inline — avoids forwarding an empty POST upstream.
+			if req.method() == Method::OPTIONS {
+				return Ok(Some(token_proxy_preflight()));
+			}
 			Ok(Some(
 				token_proxy(req, auth, client.clone())
 					.await
@@ -404,8 +408,27 @@ pub(super) async fn token_proxy(
 	);
 	headers.insert(
 		"access-control-allow-headers",
-		"content-type".parse().unwrap(),
+		"content-type, authorization".parse().unwrap(),
 	);
 
 	Ok(upstream)
+}
+
+fn token_proxy_preflight() -> Response {
+	::http::Response::builder()
+		.status(StatusCode::NO_CONTENT)
+		.header("access-control-allow-origin", "*")
+		.header("access-control-allow-methods", "POST, OPTIONS")
+		.header(
+			"access-control-allow-headers",
+			"content-type, authorization",
+		)
+		.header("access-control-max-age", "86400")
+		.body(axum::body::Body::empty())
+		.unwrap_or_else(|_| {
+			::http::Response::builder()
+				.status(StatusCode::INTERNAL_SERVER_ERROR)
+				.body(axum::body::Body::empty())
+				.unwrap()
+		})
 }
