@@ -56,6 +56,7 @@ pub struct ApplyGuardrailRequest {
 	/// The content blocks to evaluate
 	pub content: Vec<GuardrailContentBlock>,
 	/// Return one output per input block so masked substitution never misaligns.
+	#[serde(rename = "outputScope")]
 	pub output_scope: GuardrailOutputScope,
 }
 

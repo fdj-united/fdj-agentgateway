@@ -2150,7 +2150,12 @@ impl JwtAuthentication {
 		req: &mut crate::http::Request,
 	) -> Result<(), crate::proxy::ProxyResponse> {
 		if let Some(auth) = &self.mcp {
-			if !crate::mcp::auth::is_well_known_endpoint(req.uri().path()) {
+			let path = req.uri().path();
+			// Skip JWT validation for OAuth discovery endpoints and for the token proxy
+			// path — a token cannot exist before the code exchange completes.
+			let skip_jwt = crate::mcp::auth::is_well_known_endpoint(path)
+				|| (path.ends_with("/oauth/token") && auth.upstream_token_endpoint.is_some());
+			if !skip_jwt {
 				self.jwt.apply(log, req).await.map_err(|e| {
 					crate::proxy::ProxyResponse::from(crate::mcp::auth::create_auth_required_response(
 						crate::proxy::ProxyError::JwtAuthenticationFailure(e),
