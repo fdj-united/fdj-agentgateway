@@ -32,6 +32,21 @@ pub struct GuardrailContentBlock {
 	pub text: GuardrailTextBlock,
 }
 
+/// Output scope for ApplyGuardrail API.
+///
+/// AWS default (`INTERVENED_ONLY`) returns outputs only for content where the
+/// guardrail intervened. `FULL` returns one output block per input block
+/// regardless of intervention — required when we need to substitute masked
+/// text back into a multi-message request (length must equal input count).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GuardrailOutputScope {
+	/// Return outputs only for blocks where the guardrail intervened (AWS default).
+	IntervenedOnly,
+	/// Return one output block for every input block.
+	Full,
+}
+
 /// Request body for ApplyGuardrail API
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +55,8 @@ pub struct ApplyGuardrailRequest {
 	pub source: GuardrailSource,
 	/// The content blocks to evaluate
 	pub content: Vec<GuardrailContentBlock>,
+	/// Return one output per input block so masked substitution never misaligns.
+	pub output_scope: GuardrailOutputScope,
 }
 
 /// Action taken by the guardrail
@@ -140,7 +157,11 @@ async fn send_guardrail_request(
 	source: GuardrailSource,
 	content: Vec<GuardrailContentBlock>,
 ) -> anyhow::Result<ApplyGuardrailResponse> {
-	let request_body = ApplyGuardrailRequest { source, content };
+	let request_body = ApplyGuardrailRequest {
+		source,
+		content,
+		output_scope: GuardrailOutputScope::Full,
+	};
 	let host = strng::format!("bedrock-runtime.{}.amazonaws.com", guardrails.region);
 	let path = format!(
 		"/guardrail/{}/version/{}/apply",
