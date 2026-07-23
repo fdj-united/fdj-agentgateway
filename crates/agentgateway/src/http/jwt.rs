@@ -115,7 +115,7 @@ impl Debug for Jwt {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(untagged)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub enum LocalJwtConfig {
 	#[serde(rename_all = "camelCase")]

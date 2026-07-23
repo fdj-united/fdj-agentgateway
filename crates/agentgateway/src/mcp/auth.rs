@@ -3,6 +3,7 @@ use axum::response::Response;
 use axum_core::response::IntoResponse;
 use bytes::Bytes;
 use http::Method;
+use http::header::CONTENT_TYPE;
 use http::uri::PathAndQuery;
 use tracing::{debug, warn};
 
@@ -90,6 +91,17 @@ pub(crate) async fn handle_mcp_request(
 				})
 				.into_response(),
 		)),
+		path if path.ends_with("/oauth/token") && auth.upstream_token_endpoint.is_some() => {
+			Ok(Some(
+				token_proxy(req, auth, client.clone())
+					.await
+					.map_err(|e| {
+						warn!("token_proxy error: {}", e);
+						StatusCode::INTERNAL_SERVER_ERROR
+					})
+					.into_response(),
+			))
+		},
 		_ => {
 			// Not handled
 			Ok(None)
@@ -254,6 +266,30 @@ pub(super) async fn authorization_server_metadata(
 		_ => {},
 	}
 
+	// When a token proxy is configured, rewrite token_endpoint to the gateway-local path so
+	// LibreChat sends token requests here instead of directly to the upstream IdP.
+	if auth.upstream_token_endpoint.is_some() {
+		let current_uri = req
+			.extensions()
+			.get::<filters::OriginalUrl>()
+			.map(|u| u.0.clone())
+			.unwrap_or_else(|| req.uri().clone());
+		// Derive the base URL: strip the /.well-known/... path suffix
+		let base = {
+			let path = current_uri.path();
+			let base_path = if let Some(pos) = path.find("/.well-known/") {
+				&path[..pos]
+			} else {
+				""
+			};
+			current_uri.to_string().replace(path, base_path)
+		};
+		let proxy_token_endpoint = format!("{base}/oauth/token");
+		if let Some(te) = json::traverse_mut(&mut resp, &["token_endpoint"]) {
+			*te = serde_json::Value::String(proxy_token_endpoint);
+		}
+	}
+
 	let response = ::http::Response::builder()
 		.status(StatusCode::OK)
 		.header("content-type", "application/json")
@@ -283,6 +319,60 @@ pub(super) async fn client_registration(
 	let mut upstream = client.simple_call(ureq).await?;
 
 	// Add CORS headers to the response
+	let headers = upstream.headers_mut();
+	headers.insert("access-control-allow-origin", "*".parse().unwrap());
+	headers.insert(
+		"access-control-allow-methods",
+		"POST, OPTIONS".parse().unwrap(),
+	);
+	headers.insert(
+		"access-control-allow-headers",
+		"content-type".parse().unwrap(),
+	);
+
+	Ok(upstream)
+}
+
+/// Proxy a token request to the upstream IdP, rewriting the `resource` parameter so the
+/// upstream mints a token with the correct audience rather than the gateway's own URL.
+pub(super) async fn token_proxy(
+	req: &mut Request,
+	auth: &McpAuthentication,
+	client: PolicyClient,
+) -> Result<Response, ProxyError> {
+	let Some(upstream_token_endpoint) = &auth.upstream_token_endpoint else {
+		return Err(ProxyError::ProcessingString(
+			"upstream_token_endpoint not configured".to_string(),
+		));
+	};
+
+	let limit = crate::http::buffer_limit(req);
+	let body_bytes = crate::http::read_body_with_limit(std::mem::take(req.body_mut()), limit)
+		.await
+		.map_err(ProxyError::Body)?;
+
+	// Parse application/x-www-form-urlencoded body and rewrite `resource` if configured
+	let rewritten: Bytes = if let Some(upstream_resource) = &auth.upstream_resource {
+		let mut params: Vec<(String, String)> =
+			serde_urlencoded::from_bytes(&body_bytes).unwrap_or_default();
+		if let Some(pos) = params.iter().position(|(k, _)| k == "resource") {
+			params[pos].1 = upstream_resource.clone();
+		} else {
+			params.push(("resource".to_string(), upstream_resource.clone()));
+		}
+		Bytes::from(serde_urlencoded::to_string(&params).unwrap_or_default())
+	} else {
+		body_bytes
+	};
+
+	let ureq = ::http::Request::builder()
+		.uri(upstream_token_endpoint.as_str())
+		.method(Method::POST)
+		.header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+		.body(axum::body::Body::from(rewritten))?;
+
+	let mut upstream = client.simple_call(ureq).await?;
+
 	let headers = upstream.headers_mut();
 	headers.insert("access-control-allow-origin", "*".parse().unwrap());
 	headers.insert(

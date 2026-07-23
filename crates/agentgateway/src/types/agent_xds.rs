@@ -287,6 +287,8 @@ fn build_mcp_authentication(
 		resource_metadata,
 		jwt_validator,
 		mode,
+		upstream_token_endpoint: None,
+		upstream_resource: None,
 	}
 }
 

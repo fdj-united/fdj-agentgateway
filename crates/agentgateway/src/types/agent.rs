@@ -2185,6 +2185,10 @@ pub struct McpAuthentication {
 	pub resource_metadata: ResourceMetadata,
 	pub jwt_validator: Arc<crate::http::jwt::Jwt>,
 	pub mode: McpAuthenticationMode,
+	/// Upstream token endpoint to proxy `/oauth/token` requests to, rewriting `resource`.
+	pub upstream_token_endpoint: Option<String>,
+	/// The `resource` value to inject into proxied token requests (replaces the gateway URL).
+	pub upstream_resource: Option<String>,
 }
 
 #[apply(schema_enum!)]
@@ -2226,6 +2230,12 @@ pub struct LocalMcpAuthentication {
 	pub mode: McpAuthenticationMode,
 	#[serde(default)]
 	pub jwt_validation_options: http::jwt::JWTValidationOptions,
+	/// Upstream token endpoint to proxy `/oauth/token` requests to, rewriting `resource`.
+	#[serde(default)]
+	pub upstream_token_endpoint: Option<String>,
+	/// The `resource` value to inject into proxied token requests (replaces the gateway URL).
+	#[serde(default)]
+	pub upstream_resource: Option<String>,
 }
 
 impl LocalMcpAuthentication {
@@ -2271,6 +2281,8 @@ impl LocalMcpAuthentication {
 			resource_metadata: self.resource_metadata.clone(),
 			jwt_validator: Arc::new(jwt),
 			mode: self.mode,
+			upstream_token_endpoint: self.upstream_token_endpoint.clone(),
+			upstream_resource: self.upstream_resource.clone(),
 		})
 	}
 }

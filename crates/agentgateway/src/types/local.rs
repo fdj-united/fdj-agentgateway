@@ -1055,7 +1055,7 @@ impl From<LocalGatewayPolicy> for FilterOrPolicy {
 		} = val;
 		FilterOrPolicy {
 			oidc,
-			jwt_auth,
+			jwt_auth: jwt_auth.map(|jwt| LocalJwtAuthConfig { jwt, mcp: None }),
 			ext_authz,
 			ext_proc,
 			transformations,
@@ -1375,9 +1375,11 @@ pub struct FilterOrPolicy {
 	/// Rate limit incoming requests. State is managed by a remote server.
 	#[serde(default)]
 	remote_rate_limit: Option<crate::http::remoteratelimit::RemoteRateLimit>,
-	/// Authenticate incoming JWT requests.
+	/// Authenticate incoming JWT requests. Optionally nests an `mcp:` block
+	/// to serve OAuth protected-resource metadata when the route fronts an
+	/// MCP backend that uses a different IdP than the user identity provider.
 	#[serde(default)]
-	jwt_auth: Option<crate::http::jwt::LocalJwtConfig>,
+	jwt_auth: Option<LocalJwtAuthConfig>,
 	/// Authenticate incoming browser requests with OIDC authorization code flow.
 	#[serde(default)]
 	oidc: Option<crate::http::oidc::LocalOidcConfig>,
@@ -1420,6 +1422,22 @@ struct TCPFilterOrPolicy {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[serde(rename = "backendTLS")]
 	backend_tls: Option<LocalBackendTLS>,
+}
+
+/// Route-level `jwtAuth:` policy with an optional nested `mcp:` block.
+///
+/// The outer fields configure the JWT validator that protects the route
+/// (e.g. an Entra ID token in a side header). The optional `mcp:` block
+/// configures OAuth metadata serving for `/.well-known/oauth-protected-resource`
+/// and `/.well-known/oauth-authorization-server` — useful when the route's
+/// upstream uses a different IdP than the one validating user identity.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LocalJwtAuthConfig {
+	#[serde(flatten)]
+	pub jwt: crate::http::jwt::LocalJwtConfig,
+	#[serde(default)]
+	pub mcp: Option<crate::types::agent::LocalMcpAuthentication>,
 }
 
 async fn convert(
@@ -2583,9 +2601,13 @@ pub(crate) async fn split_policies(
 		route_policies.push(TrafficPolicy::AI(Arc::new(p)))
 	}
 	if let Some(p) = jwt_auth {
+		let mcp = match p.mcp {
+			Some(m) => Some(m.translate(client.clone()).await?),
+			None => None,
+		};
 		route_policies.push(TrafficPolicy::JwtAuth(JwtAuthentication {
-			jwt: p.try_into(client.clone()).await?,
-			mcp: None,
+			jwt: p.jwt.try_into(client.clone()).await?,
+			mcp,
 		}));
 	}
 	let compiled_oidc = if let Some(oidc) = oidc_config {
