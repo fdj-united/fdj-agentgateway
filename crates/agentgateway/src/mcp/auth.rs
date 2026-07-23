@@ -55,8 +55,12 @@ pub(crate) async fn enforce_authentication(
 	auth: &McpAuthentication,
 	client: &PolicyClient,
 ) -> Result<Option<Response>, ProxyError> {
-	// skip well-known OAuth endpoints for authn
-	if !is_well_known_endpoint(req.uri().path()) {
+	let path = req.uri().path();
+	// Skip JWT validation for well-known OAuth discovery endpoints and for the
+	// token proxy path (which is reached before a token exists).
+	let skip_validation = is_well_known_endpoint(path)
+		|| (path.ends_with("/oauth/token") && auth.upstream_token_endpoint.is_some());
+	if !skip_validation {
 		apply_token_validation(req, auth).await?;
 	}
 
@@ -266,25 +270,40 @@ pub(super) async fn authorization_server_metadata(
 		_ => {},
 	}
 
-	// When a token proxy is configured, rewrite token_endpoint to the gateway-local path so
-	// LibreChat sends token requests here instead of directly to the upstream IdP.
+	// When a token proxy is configured, rewrite token_endpoint in the AS metadata to the
+	// gateway-local path so LibreChat sends token requests here instead of directly to the IdP.
+	// The path is {origin}{route_path}/oauth/token — e.g.
+	//   request:  http://gateway:8085/.well-known/oauth-authorization-server/monday
+	//   rewritten: http://gateway:8085/monday/oauth/token
+	// This matches the extraMatches entry `exact: /monday/oauth/token` in the Helm config,
+	// ensuring only the correct per-backend policy handles the request.
 	if auth.upstream_token_endpoint.is_some() {
 		let current_uri = req
 			.extensions()
 			.get::<filters::OriginalUrl>()
 			.map(|u| u.0.clone())
 			.unwrap_or_else(|| req.uri().clone());
-		// Derive the base URL: strip the /.well-known/... path suffix
-		let base = {
-			let path = current_uri.path();
-			let base_path = if let Some(pos) = path.find("/.well-known/") {
-				&path[..pos]
-			} else {
-				""
-			};
-			current_uri.to_string().replace(path, base_path)
+		let path = current_uri.path();
+		// Extract the route-path suffix that follows /.well-known/oauth-authorization-server
+		// e.g. "/.well-known/oauth-authorization-server/monday" → "/monday"
+		// e.g. "/.well-known/oauth-authorization-server"         → ""
+		const AS_PREFIX: &str = "/.well-known/oauth-authorization-server";
+		let route_suffix = path
+			.strip_prefix(AS_PREFIX)
+			.unwrap_or("")
+			.to_string();
+		// Build origin (scheme + authority, no path)
+		let origin = {
+			let mut parts = current_uri.clone().into_parts();
+			parts.path_and_query = None;
+			Uri::from_parts(parts)
+				.ok()
+				.map(|u| u.to_string())
+				.unwrap_or_default()
+				.trim_end_matches('/')
+				.to_string()
 		};
-		let proxy_token_endpoint = format!("{base}/oauth/token");
+		let proxy_token_endpoint = format!("{origin}{route_suffix}/oauth/token");
 		if let Some(te) = json::traverse_mut(&mut resp, &["token_endpoint"]) {
 			*te = serde_json::Value::String(proxy_token_endpoint);
 		}
@@ -365,11 +384,15 @@ pub(super) async fn token_proxy(
 		body_bytes
 	};
 
-	let ureq = ::http::Request::builder()
+	let mut rb = ::http::Request::builder()
 		.uri(upstream_token_endpoint.as_str())
 		.method(Method::POST)
-		.header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-		.body(axum::body::Body::from(rewritten))?;
+		.header(CONTENT_TYPE, "application/x-www-form-urlencoded");
+	// Forward client auth headers (e.g. Authorization: Basic ... for client_secret_basic).
+	if let Some(auth_val) = req.headers().get(::http::header::AUTHORIZATION) {
+		rb = rb.header(::http::header::AUTHORIZATION, auth_val);
+	}
+	let ureq = rb.body(axum::body::Body::from(rewritten))?;
 
 	let mut upstream = client.simple_call(ureq).await?;
 
